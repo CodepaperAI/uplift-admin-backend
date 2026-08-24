@@ -71,15 +71,28 @@ jobs:
           scan_digest=$(jq -er \
             '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest' \
             <<<"$index_manifest")
-          for attempt in $(seq 1 30); do
+          # Basic scan-on-push needs longer than the old 30x5s window on an
+          # image this size. When it overran, the loop fell through and the
+          # findings call below crashed the AWS CLI with "'NoneType' object does
+          # not support item assignment" — a closed gate, but an unreadable one,
+          # and unrepeatable because the tag is immutable and already pushed.
+          status=""
+          for attempt in $(seq 1 60); do
             status=$(aws ecr describe-image-scan-findings \
               --repository-name "$ECR_REPOSITORY" \
               --image-id imageDigest="$scan_digest" \
               --query 'imageScanStatus.status' --output text 2>/dev/null || true)
-            if [[ "$status" == "COMPLETE" ]]; then break; fi
-            if [[ "$status" == "FAILED" ]]; then exit 1; fi
-            sleep 5
+            if [[ "$status" == "COMPLETE" || "$status" == "ACTIVE" ]]; then break; fi
+            if [[ "$status" == "FAILED" ]]; then
+              echo "::error::ECR image scan reported FAILED for $scan_digest"
+              exit 1
+            fi
+            sleep 10
           done
+          if [[ "$status" != "COMPLETE" && "$status" != "ACTIVE" ]]; then
+            echo "::error::ECR image scan did not finish within 10 minutes (last status: ${status:-unknown}). Refusing to deploy an unscanned image."
+            exit 1
+          fi
           critical=$(aws ecr describe-image-scan-findings \
             --repository-name "$ECR_REPOSITORY" \
             --image-id imageDigest="$scan_digest" \
