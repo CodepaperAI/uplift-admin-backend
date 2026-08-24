@@ -1,0 +1,6 @@
+bucket         = "uplift-ai-terraform-state-574521704327-us-east-1"
+key            = "production/admin-api/terraform.tfstate"
+region         = "us-east-1"
+encrypt        = true
+use_lockfile   = true
+profile        = "uplift-dev"

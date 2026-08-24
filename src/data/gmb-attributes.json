@@ -1,0 +1,548 @@
+{
+  "version": "2026-05-14",
+  "source": "manual-curated-seed",
+  "completeness": "partial",
+  "note": "Curated seed of ~85 GMB business attributes that move the needle for local ranking and customer signals. applicableGroups uses the same group names as gmb-categories.json (or \"*\" for universal). requiredForGroups marks attributes that should be set when the business's primary category falls in that group — health check uses this to flag missing high-impact attributes.",
+  "attributes": [
+    {
+      "id": "has_wheelchair_accessible_entrance",
+      "displayName": "Wheelchair accessible entrance",
+      "group": "Accessibility",
+      "valueType": "BOOL",
+      "applicableGroups": ["*"]
+    },
+    {
+      "id": "has_wheelchair_accessible_parking",
+      "displayName": "Wheelchair accessible parking lot",
+      "group": "Accessibility",
+      "valueType": "BOOL",
+      "applicableGroups": ["*"]
+    },
+    {
+      "id": "has_wheelchair_accessible_restroom",
+      "displayName": "Wheelchair accessible restroom",
+      "group": "Accessibility",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink", "Retail", "Health & Medical", "Beauty & Personal Care", "Entertainment", "Travel & Lodging", "Fitness & Recreation"]
+    },
+    {
+      "id": "has_wheelchair_accessible_seating",
+      "displayName": "Wheelchair accessible seating",
+      "group": "Accessibility",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink", "Entertainment", "Travel & Lodging"]
+    },
+
+    {
+      "id": "serves_dine_in",
+      "displayName": "Dine-in",
+      "group": "Service options",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"],
+      "requiredForGroups": ["Food & Drink"]
+    },
+    {
+      "id": "serves_takeout",
+      "displayName": "Takeout",
+      "group": "Service options",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"],
+      "requiredForGroups": ["Food & Drink"]
+    },
+    {
+      "id": "serves_delivery",
+      "displayName": "Delivery",
+      "group": "Service options",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"],
+      "requiredForGroups": ["Food & Drink"]
+    },
+    {
+      "id": "serves_curbside_pickup",
+      "displayName": "Curbside pickup",
+      "group": "Service options",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink", "Retail"]
+    },
+    {
+      "id": "serves_no_contact_delivery",
+      "displayName": "No-contact delivery",
+      "group": "Service options",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"]
+    },
+    {
+      "id": "in_store_shopping",
+      "displayName": "In-store shopping",
+      "group": "Service options",
+      "valueType": "BOOL",
+      "applicableGroups": ["Retail"]
+    },
+    {
+      "id": "in_store_pickup",
+      "displayName": "In-store pickup",
+      "group": "Service options",
+      "valueType": "BOOL",
+      "applicableGroups": ["Retail"]
+    },
+    {
+      "id": "same_day_delivery",
+      "displayName": "Same-day delivery",
+      "group": "Service options",
+      "valueType": "BOOL",
+      "applicableGroups": ["Retail", "Food & Drink"]
+    },
+    {
+      "id": "in_home_service",
+      "displayName": "On-site / in-home service",
+      "group": "Service options",
+      "valueType": "BOOL",
+      "applicableGroups": ["Home Services", "Beauty & Personal Care"],
+      "requiredForGroups": ["Home Services"]
+    },
+    {
+      "id": "online_appointments",
+      "displayName": "Online appointments",
+      "group": "Service options",
+      "valueType": "BOOL",
+      "applicableGroups": ["Health & Medical", "Beauty & Personal Care", "Professional Services", "Fitness & Recreation"]
+    },
+    {
+      "id": "by_appointment_only",
+      "displayName": "By appointment only",
+      "group": "Service options",
+      "valueType": "BOOL",
+      "applicableGroups": ["Health & Medical", "Beauty & Personal Care", "Professional Services"]
+    },
+    {
+      "id": "walk_ins_accepted",
+      "displayName": "Walk-ins welcome",
+      "group": "Service options",
+      "valueType": "BOOL",
+      "applicableGroups": ["Health & Medical", "Beauty & Personal Care"]
+    },
+    {
+      "id": "accepts_reservations",
+      "displayName": "Accepts reservations",
+      "group": "Service options",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink", "Travel & Lodging"]
+    },
+    {
+      "id": "emergency_service",
+      "displayName": "24/7 emergency service",
+      "group": "Service options",
+      "valueType": "BOOL",
+      "applicableGroups": ["Home Services", "Automotive"]
+    },
+    {
+      "id": "offers_free_estimates",
+      "displayName": "Free estimates",
+      "group": "Service options",
+      "valueType": "BOOL",
+      "applicableGroups": ["Home Services", "Automotive"]
+    },
+
+    {
+      "id": "has_wifi",
+      "displayName": "Wi-Fi",
+      "group": "Amenities",
+      "valueType": "ENUM",
+      "enumOptions": [
+        { "value": "FREE", "label": "Free Wi-Fi" },
+        { "value": "PAID", "label": "Paid Wi-Fi" }
+      ],
+      "applicableGroups": ["Food & Drink", "Travel & Lodging", "Entertainment", "Fitness & Recreation"]
+    },
+    {
+      "id": "has_restroom",
+      "displayName": "Restroom",
+      "group": "Amenities",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink", "Retail", "Entertainment", "Travel & Lodging", "Fitness & Recreation"]
+    },
+    {
+      "id": "has_air_conditioning",
+      "displayName": "Air conditioning",
+      "group": "Amenities",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink", "Retail", "Entertainment", "Travel & Lodging"]
+    },
+    {
+      "id": "has_outdoor_seating",
+      "displayName": "Outdoor seating",
+      "group": "Amenities",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"]
+    },
+    {
+      "id": "has_live_music",
+      "displayName": "Live music",
+      "group": "Amenities",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink", "Entertainment"]
+    },
+    {
+      "id": "has_television",
+      "displayName": "Televisions",
+      "group": "Amenities",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"]
+    },
+    {
+      "id": "has_parking",
+      "displayName": "Parking",
+      "group": "Amenities",
+      "valueType": "REPEATED_ENUM",
+      "enumOptions": [
+        { "value": "FREE_PARKING_LOT", "label": "Free parking lot" },
+        { "value": "FREE_STREET_PARKING", "label": "Free street parking" },
+        { "value": "PAID_PARKING_LOT", "label": "Paid parking lot" },
+        { "value": "PAID_STREET_PARKING", "label": "Paid street parking" },
+        { "value": "VALET_PARKING", "label": "Valet parking" },
+        { "value": "FREE_GARAGE_PARKING", "label": "Free garage parking" },
+        { "value": "PAID_GARAGE_PARKING", "label": "Paid garage parking" }
+      ],
+      "applicableGroups": ["*"]
+    },
+    {
+      "id": "has_changing_table",
+      "displayName": "Baby changing table",
+      "group": "Amenities",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink", "Retail", "Travel & Lodging"]
+    },
+    {
+      "id": "has_high_chairs",
+      "displayName": "High chairs",
+      "group": "Amenities",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"]
+    },
+
+    {
+      "id": "payment_methods",
+      "displayName": "Payments accepted",
+      "group": "Payments",
+      "valueType": "REPEATED_ENUM",
+      "enumOptions": [
+        { "value": "CASH", "label": "Cash" },
+        { "value": "CREDIT_CARD", "label": "Credit cards" },
+        { "value": "DEBIT_CARD", "label": "Debit cards" },
+        { "value": "NFC_MOBILE_PAYMENTS", "label": "NFC mobile payments" },
+        { "value": "CHECK", "label": "Checks" }
+      ],
+      "applicableGroups": ["*"],
+      "requiredForGroups": ["Food & Drink", "Retail", "Home Services", "Automotive"]
+    },
+    {
+      "id": "cash_only",
+      "displayName": "Cash only",
+      "group": "Payments",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink", "Retail"]
+    },
+
+    {
+      "id": "offers_breakfast",
+      "displayName": "Serves breakfast",
+      "group": "Menu",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"]
+    },
+    {
+      "id": "offers_brunch",
+      "displayName": "Serves brunch",
+      "group": "Menu",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"]
+    },
+    {
+      "id": "offers_lunch",
+      "displayName": "Serves lunch",
+      "group": "Menu",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"]
+    },
+    {
+      "id": "offers_dinner",
+      "displayName": "Serves dinner",
+      "group": "Menu",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"]
+    },
+    {
+      "id": "offers_late_night_food",
+      "displayName": "Late-night food",
+      "group": "Menu",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"]
+    },
+    {
+      "id": "offers_dessert",
+      "displayName": "Dessert",
+      "group": "Menu",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"]
+    },
+    {
+      "id": "offers_organic_food",
+      "displayName": "Organic options",
+      "group": "Menu",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"]
+    },
+    {
+      "id": "offers_vegan_food",
+      "displayName": "Vegan options",
+      "group": "Menu",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"]
+    },
+    {
+      "id": "offers_vegetarian_food",
+      "displayName": "Vegetarian options",
+      "group": "Menu",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"]
+    },
+    {
+      "id": "offers_gluten_free_food",
+      "displayName": "Gluten-free options",
+      "group": "Menu",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"]
+    },
+    {
+      "id": "offers_halal_food",
+      "displayName": "Halal options",
+      "group": "Menu",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"]
+    },
+    {
+      "id": "offers_kosher_food",
+      "displayName": "Kosher options",
+      "group": "Menu",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"]
+    },
+    {
+      "id": "offers_kids_menu",
+      "displayName": "Kids' menu",
+      "group": "Menu",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"]
+    },
+    {
+      "id": "menu_url",
+      "displayName": "Menu URL",
+      "group": "Menu",
+      "valueType": "URL",
+      "applicableGroups": ["Food & Drink"]
+    },
+
+    {
+      "id": "serves_beer",
+      "displayName": "Serves beer",
+      "group": "Drinks",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"]
+    },
+    {
+      "id": "serves_wine",
+      "displayName": "Serves wine",
+      "group": "Drinks",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"]
+    },
+    {
+      "id": "serves_cocktails",
+      "displayName": "Serves cocktails",
+      "group": "Drinks",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"]
+    },
+    {
+      "id": "serves_hard_liquor",
+      "displayName": "Serves hard liquor",
+      "group": "Drinks",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"]
+    },
+    {
+      "id": "serves_coffee",
+      "displayName": "Serves coffee",
+      "group": "Drinks",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"]
+    },
+
+    {
+      "id": "good_for_groups",
+      "displayName": "Good for groups",
+      "group": "Atmosphere",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink", "Entertainment"]
+    },
+    {
+      "id": "good_for_kids",
+      "displayName": "Good for kids",
+      "group": "Atmosphere",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink", "Entertainment", "Travel & Lodging"]
+    },
+    {
+      "id": "good_for_working",
+      "displayName": "Good for working alone",
+      "group": "Atmosphere",
+      "valueType": "BOOL",
+      "applicableGroups": ["Food & Drink"]
+    },
+
+    {
+      "id": "accepts_new_patients",
+      "displayName": "Accepts new patients",
+      "group": "Health",
+      "valueType": "BOOL",
+      "applicableGroups": ["Health & Medical"],
+      "requiredForGroups": ["Health & Medical"]
+    },
+    {
+      "id": "accepts_insurance",
+      "displayName": "Accepts insurance",
+      "group": "Health",
+      "valueType": "BOOL",
+      "applicableGroups": ["Health & Medical"],
+      "requiredForGroups": ["Health & Medical"]
+    },
+    {
+      "id": "offers_telehealth",
+      "displayName": "Offers telehealth",
+      "group": "Health",
+      "valueType": "BOOL",
+      "applicableGroups": ["Health & Medical"]
+    },
+    {
+      "id": "offers_house_calls",
+      "displayName": "Makes house calls",
+      "group": "Health",
+      "valueType": "BOOL",
+      "applicableGroups": ["Health & Medical", "Beauty & Personal Care"]
+    },
+
+    {
+      "id": "has_free_breakfast",
+      "displayName": "Free breakfast",
+      "group": "Hotel amenities",
+      "valueType": "BOOL",
+      "applicableGroups": ["Travel & Lodging"]
+    },
+    {
+      "id": "has_pool",
+      "displayName": "Swimming pool",
+      "group": "Hotel amenities",
+      "valueType": "BOOL",
+      "applicableGroups": ["Travel & Lodging", "Fitness & Recreation"]
+    },
+    {
+      "id": "has_fitness_center",
+      "displayName": "Fitness center",
+      "group": "Hotel amenities",
+      "valueType": "BOOL",
+      "applicableGroups": ["Travel & Lodging"]
+    },
+    {
+      "id": "has_business_center",
+      "displayName": "Business center",
+      "group": "Hotel amenities",
+      "valueType": "BOOL",
+      "applicableGroups": ["Travel & Lodging"]
+    },
+    {
+      "id": "pets_allowed",
+      "displayName": "Pets allowed",
+      "group": "Hotel amenities",
+      "valueType": "BOOL",
+      "applicableGroups": ["Travel & Lodging"]
+    },
+    {
+      "id": "has_room_service",
+      "displayName": "Room service",
+      "group": "Hotel amenities",
+      "valueType": "BOOL",
+      "applicableGroups": ["Travel & Lodging"]
+    },
+
+    {
+      "id": "women_owned",
+      "displayName": "Women-owned",
+      "group": "From the owner",
+      "valueType": "BOOL",
+      "applicableGroups": ["*"]
+    },
+    {
+      "id": "veteran_owned",
+      "displayName": "Veteran-owned",
+      "group": "From the owner",
+      "valueType": "BOOL",
+      "applicableGroups": ["*"]
+    },
+    {
+      "id": "lgbtq_owned",
+      "displayName": "LGBTQ+ owned",
+      "group": "From the owner",
+      "valueType": "BOOL",
+      "applicableGroups": ["*"]
+    },
+    {
+      "id": "lgbtq_friendly",
+      "displayName": "LGBTQ+ friendly",
+      "group": "From the owner",
+      "valueType": "BOOL",
+      "applicableGroups": ["*"]
+    },
+    {
+      "id": "transgender_safespace",
+      "displayName": "Transgender safespace",
+      "group": "From the owner",
+      "valueType": "BOOL",
+      "applicableGroups": ["*"]
+    },
+    {
+      "id": "black_owned",
+      "displayName": "Black-owned",
+      "group": "From the owner",
+      "valueType": "BOOL",
+      "applicableGroups": ["*"]
+    },
+    {
+      "id": "asian_owned",
+      "displayName": "Asian-owned",
+      "group": "From the owner",
+      "valueType": "BOOL",
+      "applicableGroups": ["*"]
+    },
+    {
+      "id": "latino_owned",
+      "displayName": "Latino-owned",
+      "group": "From the owner",
+      "valueType": "BOOL",
+      "applicableGroups": ["*"]
+    },
+    {
+      "id": "family_owned",
+      "displayName": "Family-owned",
+      "group": "From the owner",
+      "valueType": "BOOL",
+      "applicableGroups": ["*"]
+    },
+    {
+      "id": "identifies_as_small_business",
+      "displayName": "Identifies as small business",
+      "group": "From the owner",
+      "valueType": "BOOL",
+      "applicableGroups": ["*"]
+    }
+  ]
+}

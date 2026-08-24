@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+dnf update -y
+dnf install -y docker jq amazon-cloudwatch-agent
+systemctl enable --now docker
+systemctl enable --now amazon-ssm-agent
+
+install -d -m 0700 /opt/uplift-admin-api/runtime
+install -d -m 0755 /usr/local/lib/docker/cli-plugins
+
+curl --fail --show-error --silent --location \
+  "https://github.com/docker/compose/releases/download/v2.39.2/docker-compose-linux-x86_64" \
+  --output /usr/local/lib/docker/cli-plugins/docker-compose
+chmod 0755 /usr/local/lib/docker/cli-plugins/docker-compose
+
+cat >/opt/uplift-admin-api/infrastructure.env <<'EOF'
+AWS_REGION=${aws_region}
+ADMIN_API_DOMAIN=${admin_api_domain}
+ECR_REPOSITORY_URL=${ecr_repository_url}
+RUNTIME_SECRET_ARN=${runtime_secret_arn}
+ADMIN_LOG_GROUP=${admin_log_group}
+CADDY_LOG_GROUP=${caddy_log_group}
+EOF
+chmod 0600 /opt/uplift-admin-api/infrastructure.env
+
+cat >/opt/uplift-admin-api/runtime/docker-compose.yml <<'COMPOSE'
+services:
+  admin-api:
+    image: $${ADMIN_IMAGE}
+    restart: unless-stopped
+    env_file:
+      - ./admin.env
+    expose:
+      - "3000"
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: $${AWS_REGION}
+        awslogs-group: $${ADMIN_LOG_GROUP}
+        awslogs-create-group: "false"
+
+  caddy:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    depends_on:
+      admin-api:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: $${AWS_REGION}
+        awslogs-group: $${CADDY_LOG_GROUP}
+        awslogs-create-group: "false"
+
+volumes:
+  caddy_data:
+  caddy_config:
+COMPOSE
+
+cat >/opt/uplift-admin-api/runtime/Caddyfile <<'CADDY'
+${admin_api_domain} {
+  encode zstd gzip
+  reverse_proxy admin-api:3000
+  log {
+    output stdout
+    format json
+  }
+}
+CADDY
+
+cat >/opt/uplift-admin-api/deploy.sh <<'DEPLOY'
+#!/usr/bin/env bash
+set -euo pipefail
+
+image_tag="$${1:?immutable image tag required}"
+source /opt/uplift-admin-api/infrastructure.env
+runtime_dir=/opt/uplift-admin-api/runtime
+registry="$${ECR_REPOSITORY_URL%%/*}"
+new_image="$${ECR_REPOSITORY_URL}:$${image_tag}"
+previous_image=""
+if [[ -f "$${runtime_dir}/image.env" ]]; then
+  previous_image="$(sed -n 's/^ADMIN_IMAGE=//p' "$${runtime_dir}/image.env" | head -1)"
+fi
+
+secret_tmp="$(mktemp /opt/uplift-admin-api/admin.env.XXXXXX)"
+trap 'rm -f "$${secret_tmp}"' EXIT
+aws secretsmanager get-secret-value \
+  --region "$${AWS_REGION}" \
+  --secret-id "$${RUNTIME_SECRET_ARN}" \
+  --query SecretString \
+  --output text \
+  | jq -r 'to_entries[] | select(.value != null) | "\(.key)=\(.value|tostring)"' \
+  >"$${secret_tmp}"
+chmod 0600 "$${secret_tmp}"
+install -m 0600 "$${secret_tmp}" "$${runtime_dir}/admin.env"
+
+aws ecr get-login-password --region "$${AWS_REGION}" \
+  | docker login --username AWS --password-stdin "$${registry}"
+docker pull "$${new_image}"
+printf 'ADMIN_IMAGE=%s\n' "$${new_image}" >"$${runtime_dir}/image.env"
+chmod 0600 "$${runtime_dir}/image.env"
+
+cd "$${runtime_dir}"
+set -a
+source /opt/uplift-admin-api/infrastructure.env
+source ./image.env
+set +a
+docker compose --env-file ./image.env up -d --remove-orphans
+
+container_id="$(docker compose ps -q admin-api)"
+for attempt in $(seq 1 30); do
+  status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$${container_id}")"
+  if [[ "$${status}" == "healthy" ]]; then
+    docker image prune -f >/dev/null
+    exit 0
+  fi
+  if [[ "$${status}" == "unhealthy" || "$${status}" == "exited" ]]; then
+    break
+  fi
+  sleep 2
+done
+
+docker compose logs --tail=100 admin-api
+if [[ -n "$${previous_image}" ]]; then
+  printf 'ADMIN_IMAGE=%s\n' "$${previous_image}" >"$${runtime_dir}/image.env"
+  export ADMIN_IMAGE="$${previous_image}"
+  docker compose --env-file ./image.env up -d --remove-orphans
+fi
+exit 1
+DEPLOY
+chmod 0700 /opt/uplift-admin-api/deploy.sh
+
+cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'CWAGENT'
+{
+  "agent": {"metrics_collection_interval": 60, "run_as_user": "root"},
+  "metrics": {
+    "namespace": "Uplift/Production/AdminApi",
+    "append_dimensions": {"InstanceId": "$${aws:InstanceId}"},
+    "aggregation_dimensions": [["InstanceId"]],
+    "metrics_collected": {
+      "mem": {"measurement": [{"name": "mem_used_percent", "rename": "MemoryUsedPercent", "unit": "Percent"}]},
+      "disk": {
+        "measurement": [{"name": "used_percent", "rename": "DiskUsedPercent", "unit": "Percent"}],
+        "resources": ["/"],
+        "drop_device": true,
+        "ignore_file_system_types": ["sysfs", "devtmpfs", "tmpfs", "overlay", "squashfs"]
+      }
+    }
+  }
+}
+CWAGENT
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config -m ec2 -s \
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json

@@ -1,0 +1,5187 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  USER
+  ADMIN
+  SUPERADMIN
+  AGENCY_ADMIN
+  SALES
+}
+
+model User {
+  id       String     @id @default(uuid())
+  email    String     @unique
+  business Business[]
+
+  onboarding      Boolean @default(false)
+  backlinkEnabled Boolean @default(true)
+
+  // 🆕 NEW: Keyword generation status tracking
+  keywordGenerationStatus      String    @default("idle") // "idle", "pending", "processing", "completed", "failed"
+  keywordGenerationStartedAt   DateTime?
+  keywordGenerationCompletedAt DateTime?
+
+  // 🆕 NEW: Trial system tracking
+  trialStartDate DateTime?
+  trialEndDate   DateTime?
+  trialStatus    String?   @default("none") // "none", "active", "expired", "converted"
+  trialUsed      Boolean   @default(false) // Prevent multiple trials
+
+  // 🆕 NEW: Phone number for trial enrollment
+  phone String?
+
+  termsAcceptedAt       DateTime?
+  termsVersion          String?
+  privacyAcceptedAt     DateTime?
+  privacyVersion        String?
+  legalConsentIp        String?
+  legalConsentUserAgent String?
+
+  role Role @default(USER)
+
+  // Explicit opt-in for the internal Command Panel. SUPERADMIN bypasses this
+  // gate; normal product users must never gain internal access by role alone.
+  commandPanelEnabled Boolean @default(false)
+  twoFactorEnabled    Boolean @default(false)
+
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+  businessId String?
+  Blog       Blog[]
+  BlogLinks  SitemapUrls[]
+  Plan       Plan[]
+
+  WordPressintegration           WordPressintegration?
+  Subscription                   Subscription?
+  PublishingIntegrations         PublishingIntegration[]   @relation("PublishingIntegrations")
+  GuestPostPublishers            GuestPostPublisher[]
+  GuestPostCampaigns             GuestPostCampaign[]
+  GuestPostSubmissions           GuestPostSubmission[]
+  name                           String
+  emailVerified                  Boolean                   @default(false)
+  image                          String?
+  sessions                       Session[]
+  accounts                       Account[]
+  ApiTokens                      ApiToken[]                @relation("ApiTokens")
+  SeoAuditRuns                   SeoAuditRun[]             @relation("SeoAuditRuns")
+  AgencyMemberships              AgencyMembership[]        @relation("UserAgencyMemberships")
+  AdminAuditLogs                 AdminAuditLog[]           @relation("AdminAuditLogs")
+  SuperAdminSalesRecords         SuperAdminSalesRecord[]   @relation("SuperAdminSalesRecords")
+  SalesCustomerAssignments       SalesCustomerAssignment[] @relation("SalespersonAssignments")
+  SalesCustomerNotes             SalesCustomerNote[]       @relation("SalesNotesAuthor")
+  SalesEntries                   SalesEntry[]              @relation("SalesEntriesSalesperson")
+  LlmUsageEvents                 LlmUsageEvent[]           @relation("LlmUsageEventsUser")
+  SocialCreativeRuns             SocialCreativeRun[]       @relation("SocialCreativeRunsUser")
+  SocialTopicPlans               SocialTopicPlan[]
+  LegacySocialPosts              SocialPost[]
+  ContentClusters                ContentCluster[]
+  RequestedAiVisibilityJobs      AiVisibilityJob[]         @relation("AiVisibilityJobRequestedBy")
+  RequestedAiVisibilityTrialRuns AiVisibilityTrialRun[]    @relation("AiVisibilityTrialRunRequestedBy")
+  RewardfulAttribution           RewardfulAttribution?
+  CommandRepProfile              CommandRepProfile?        @relation("CommandRepProfileUser")
+  CommandCapabilityUpdates       CommandRoleCapability[]   @relation("CommandCapabilityUpdatedBy")
+  TwoFactor                      TwoFactor?
+
+  @@map("user")
+}
+
+model Subscription {
+  id                String    @id @default(uuid())
+  userId            String    @unique
+  user              User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  planId            String?
+  planName          String?
+  status            String
+  startDate         DateTime
+  currentPeriodEnd  DateTime?
+  cancelAtPeriodEnd Boolean   @default(false)
+  canceledAt        DateTime?
+
+  stripeCustomerId        String?   @unique
+  stripeSubscriptionId    String?   @unique
+  stripePriceId           String?
+  stripeCurrentPeriodEnd  DateTime?
+  stripeCancelAtPeriodEnd Boolean   @default(false)
+  stripeStatus            String?
+
+  // 🆕 NEW: Multi-website support
+  websiteCount Int @default(1) // Number of active websites
+  maxWebsites  Int @default(1) // Maximum websites allowed in plan
+
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+}
+
+model WebsiteSubscription {
+  id         String   @id @default(uuid())
+  businessId String   @unique
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  stripeSubscriptionId     String?
+  stripeSubscriptionItemId String?         @unique
+  stripePriceId            String?
+  planTier                 WebsitePlanTier @default(SEO)
+
+  // Downgrades retain the current paid entitlement until Stripe moves the
+  // subscription schedule into its next phase. Provider identifiers remain
+  // backend-only and are never returned by the billing status API.
+  stripePlanScheduleId     String?
+  scheduledPlanPriceId     String?
+  scheduledPlanTier        WebsitePlanTier?
+  scheduledBillingInterval String?
+  scheduledPlanChangeAt    DateTime?
+
+  status             String    @default("active") // active, trialing, canceled, past_due, suspended, expired
+  currentPeriodStart DateTime?
+  currentPeriodEnd   DateTime?
+
+  trialStartDate DateTime?
+  trialEndDate   DateTime?
+  trialStatus    String    @default("none") // none, trialing, expired, converted
+
+  agencyId              String?
+  agency                Agency?              @relation(fields: [agencyId], references: [id], onDelete: SetNull)
+  agencyPricingConfigId String?
+  agencyPricingConfig   AgencyPricingConfig? @relation(fields: [agencyPricingConfigId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([trialStatus, trialEndDate])
+  @@index([status])
+  @@index([agencyId])
+  @@index([stripePlanScheduleId])
+  @@index([scheduledPlanChangeAt])
+}
+
+model StripeWebhookEvent {
+  id             String    @id
+  status         String    @default("processed")
+  attemptCount   Int       @default(1)
+  leaseExpiresAt DateTime?
+  processedAt    DateTime?
+  lastError      String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([status, leaseExpiresAt])
+  @@map("stripe_webhook_event")
+}
+
+model StripeBillingEvent {
+  id                   String   @id @default(uuid())
+  stripeEventId        String   @unique
+  eventType            String
+  stripeObjectId       String?
+  stripeObjectType     String?
+  stripeCustomerId     String?
+  stripeSubscriptionId String?
+  stripeInvoiceId      String?
+  stripeChargeId       String?
+  stripeRefundId       String?
+  userId               String?
+  businessId           String?
+  amountCents          Int?
+  refundedAmountCents  Int?
+  currency             String   @default("usd")
+  refundStatus         String?
+  refundReason         String?
+  accessAction         String   @default("none")
+  metadata             Json?
+  payload              Json?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  @@index([eventType])
+  @@index([stripeCustomerId])
+  @@index([stripeSubscriptionId])
+  @@index([stripeInvoiceId])
+  @@index([stripeChargeId])
+  @@index([stripeRefundId])
+  @@index([userId])
+  @@index([businessId])
+  @@index([accessAction])
+  @@index([createdAt])
+  @@map("stripe_billing_event")
+}
+
+/// Read-only Stripe invoice projection used by the Command Panel. Amounts are
+/// exact provider minor units; currency determines their display exponent.
+model CommandStripeInvoice {
+  id                   String    @id @default(uuid())
+  stripeInvoiceId      String    @unique
+  lastStripeEventId    String?
+  stripeCustomerId     String?
+  stripeSubscriptionId String?
+  userId               String?
+  businessId           String?
+  status               String
+  billingReason        String?
+  collectionMethod     String?
+  amountDueMinor       Decimal   @default(0) @db.Decimal(19, 0)
+  amountPaidMinor      Decimal   @default(0) @db.Decimal(19, 0)
+  amountRemainingMinor Decimal   @default(0) @db.Decimal(19, 0)
+  currency             String
+  attemptCount         Int       @default(0)
+  periodStart          DateTime?
+  periodEnd            DateTime?
+  paidAt               DateTime?
+  providerCreatedAt    DateTime
+  hostedInvoiceUrl     String?
+  invoicePdf           String?
+  source               String    @default("webhook")
+  lastSyncedAt         DateTime  @default(now())
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  @@index([stripeCustomerId])
+  @@index([stripeSubscriptionId])
+  @@index([userId])
+  @@index([businessId])
+  @@index([status, paidAt])
+  @@index([periodStart, periodEnd])
+  @@map("command_stripe_invoice")
+}
+
+/// Append-only subscription lifecycle facts. The Stripe event id is the
+/// provider idempotency key, so a replay cannot create a second fact.
+model CommandStripeSubscriptionEvent {
+  id                      String    @id @default(uuid())
+  stripeEventId           String    @unique
+  eventType               String
+  stripeSubscriptionId    String
+  stripeCustomerId        String?
+  userId                  String?
+  businessId              String?
+  status                  String
+  pauseCollectionBehavior String?
+  cancelAtPeriodEnd       Boolean   @default(false)
+  stripePriceIds          String[]
+  monthlyRecurringMinor   Decimal   @default(0) @db.Decimal(19, 4)
+  currency                String?
+  currentPeriodStart      DateTime?
+  currentPeriodEnd        DateTime?
+  occurredAt              DateTime
+  metadata                Json?
+  createdAt               DateTime  @default(now())
+
+  @@index([stripeSubscriptionId, occurredAt], map: "cmd_stripe_sub_event_subscription_time_idx")
+  @@index([userId, occurredAt])
+  @@index([businessId, occurredAt])
+  @@index([status])
+  @@index([occurredAt])
+  @@map("command_stripe_subscription_event")
+}
+
+/// Current provider state for each Stripe subscription. Lifecycle history stays
+/// append-only in CommandStripeSubscriptionEvent; this projection keeps Command
+/// dashboard reads bounded and indexable at production volume.
+model CommandStripeSubscriptionSnapshot {
+  stripeSubscriptionId    String    @id
+  lastStripeEventId       String    @unique
+  eventType               String
+  stripeCustomerId        String?
+  userId                  String?
+  businessId              String?
+  status                  String
+  pauseCollectionBehavior String?
+  cancelAtPeriodEnd       Boolean   @default(false)
+  stripePriceIds          String[]
+  monthlyRecurringMinor   Decimal   @default(0) @db.Decimal(19, 4)
+  currency                String?
+  currentPeriodStart      DateTime?
+  currentPeriodEnd        DateTime?
+  occurredAt              DateTime
+  metadata                Json?
+  updatedAt               DateTime  @updatedAt
+
+  @@index([status, pauseCollectionBehavior], map: "cmd_stripe_snapshot_status_pause_idx")
+  @@index([stripeCustomerId])
+  @@index([userId])
+  @@index([businessId])
+  @@index([currency])
+  @@index([occurredAt])
+  @@map("command_stripe_subscription_snapshot")
+}
+
+model CommandProviderSyncRun {
+  id          String    @id @default(uuid())
+  provider    String
+  mode        String
+  status      String    @default("running")
+  inspected   Int       @default(0)
+  created     Int       @default(0)
+  updated     Int       @default(0)
+  unchanged   Int       @default(0)
+  corrections Json?
+  error       String?
+  startedAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  @@index([provider, startedAt])
+  @@index([status])
+  @@map("command_provider_sync_run")
+}
+
+/// Precomputed provider-derived metrics keep the leadership dashboard bounded
+/// at production volume. The source facts remain append-only and authoritative.
+model CommandStripeMonthlyRollup {
+  periodMonth String   @id
+  payload     Json
+  generatedAt DateTime
+  updatedAt   DateTime @updatedAt
+
+  @@index([generatedAt])
+  @@map("command_stripe_monthly_rollup")
+}
+
+model CommandGhlContact {
+  id                String    @id @default(uuid())
+  ghlContactId      String    @unique
+  locationId        String
+  name              String?
+  email             String?
+  phone             String?
+  country           String?
+  source            String?
+  assignedToGhlId   String?
+  tags              String[]
+  customFields      Json?
+  providerCreatedAt DateTime?
+  providerUpdatedAt DateTime?
+  isActive          Boolean   @default(true)
+  lastSyncedAt      DateTime  @default(now())
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@index([locationId])
+  @@index([assignedToGhlId])
+  @@index([source])
+  @@index([isActive])
+  @@map("command_ghl_contact")
+}
+
+model CommandGhlOpportunity {
+  id                 String                     @id @default(uuid())
+  ghlOpportunityId   String                     @unique
+  locationId         String
+  ghlContactId       String?
+  name               String
+  monetaryValue      Decimal?                   @db.Decimal(19, 4)
+  currency           String?
+  pipelineId         String
+  pipelineName       String?
+  pipelineStageId    String
+  pipelineStageName  String?
+  pipelineStageIndex Int?
+  furthestStageId    String?
+  furthestStageName  String?
+  furthestStageIndex Int?
+  assignedToGhlId    String?
+  status             String
+  source             String?
+  lostReasonId       String?
+  lastStatusChangeAt DateTime?
+  lastStageChangeAt  DateTime?
+  lastActionAt       DateTime?
+  providerCreatedAt  DateTime?
+  providerUpdatedAt  DateTime?
+  expectedCloseDate  DateTime?
+  isActive           Boolean                    @default(true)
+  lastSyncedAt       DateTime                   @default(now())
+  createdAt          DateTime                   @default(now())
+  updatedAt          DateTime                   @updatedAt
+  assignmentHistory  CommandGhlLeadAssignment[]
+
+  @@index([locationId])
+  @@index([ghlContactId])
+  @@index([pipelineId, pipelineStageId])
+  @@index([assignedToGhlId])
+  @@index([status])
+  @@index([providerCreatedAt])
+  @@index([isActive])
+  @@index([isActive, assignedToGhlId, lastActionAt], map: "cmd_ghl_opp_active_owner_action_idx")
+  @@index([isActive, status])
+  @@index([isActive, source, status])
+  @@map("command_ghl_opportunity")
+}
+
+model CommandGhlPaymentSubscription {
+  id                       String    @id @default(uuid())
+  ghlSubscriptionRecordId  String    @unique
+  providerSubscriptionId   String?
+  locationId               String
+  contactId                String?
+  contactName              String?
+  contactEmail             String?
+  amount                   Decimal?  @db.Decimal(19, 4)
+  currency                 String?
+  status                   String
+  liveMode                 Boolean?
+  entityType               String?
+  entityId                 String?
+  entitySourceType         String?
+  entitySourceName         String?
+  entitySourceId           String?
+  paymentProviderType      String?
+  paymentProviderAccountId String?
+  providerCreatedAt        DateTime?
+  providerUpdatedAt        DateTime?
+  isActive                 Boolean   @default(true)
+  lastSyncedAt             DateTime  @default(now())
+  createdAt                DateTime  @default(now())
+  updatedAt                DateTime  @updatedAt
+
+  @@index([providerSubscriptionId])
+  @@index([locationId])
+  @@index([contactId])
+  @@index([status, liveMode])
+  @@index([currency])
+  @@index([providerCreatedAt])
+  @@index([isActive])
+  @@map("command_ghl_payment_subscription")
+}
+
+model CommandGhlPaymentTransaction {
+  id                       String    @id @default(uuid())
+  ghlTransactionId         String    @unique
+  locationId               String
+  contactId                String?
+  contactName              String?
+  contactEmail             String?
+  amount                   Decimal?  @db.Decimal(19, 4)
+  amountRefunded           Decimal?  @db.Decimal(19, 4)
+  currency                 String?
+  status                   String
+  liveMode                 Boolean?
+  providerSubscriptionId   String?
+  chargeId                 String?
+  entityType               String?
+  entityId                 String?
+  entitySourceType         String?
+  entitySourceSubType      String?
+  entitySourceName         String?
+  entitySourceId           String?
+  paymentProviderType      String?
+  paymentProviderAccountId String?
+  fulfilledAt              DateTime?
+  providerCreatedAt        DateTime?
+  providerUpdatedAt        DateTime?
+  isActive                 Boolean   @default(true)
+  lastSyncedAt             DateTime  @default(now())
+  createdAt                DateTime  @default(now())
+  updatedAt                DateTime  @updatedAt
+
+  @@index([providerSubscriptionId])
+  @@index([locationId])
+  @@index([contactId])
+  @@index([status, liveMode])
+  @@index([currency, fulfilledAt])
+  @@index([paymentProviderType])
+  @@index([isActive])
+  @@map("command_ghl_payment_transaction")
+}
+
+model CommandCostEntry {
+  id               String    @id @default(uuid())
+  category         String
+  costCategory     String
+  vendor           String
+  source           String    @default("manual")
+  amountMinor      Decimal   @db.Decimal(19, 0)
+  currency         String
+  description      String
+  occurredAt       DateTime
+  sourceExternalId String?   @unique
+  createdByUserId  String?
+  updatedByUserId  String?
+  deletedAt        DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@index([category, occurredAt])
+  @@index([costCategory, occurredAt])
+  @@index([vendor, occurredAt])
+  @@index([source, occurredAt])
+  @@index([currency, occurredAt])
+  @@index([deletedAt])
+  @@map("command_cost_entry")
+}
+
+model RewardfulAttribution {
+  id                      String    @id @default(uuid())
+  userId                  String    @unique
+  user                    User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  referralId              String?   @unique
+  via                     String?
+  affiliateId             String?
+  affiliateToken          String?
+  affiliateName           String?
+  affiliateFirstName      String?
+  affiliateLastName       String?
+  campaignId              String?
+  campaignName            String?
+  couponId                String?
+  couponName              String?
+  landingUrl              String?
+  capturedAt              DateTime  @default(now())
+  lastSeenAt              DateTime  @default(now())
+  stripeCustomerId        String?
+  stripeSubscriptionId    String?
+  stripeCheckoutSessionId String?
+  conversionEmail         String?
+  conversionTrackedAt     DateTime?
+  raw                     Json?
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  @@index([affiliateId])
+  @@index([affiliateToken])
+  @@index([campaignId])
+  @@index([stripeCustomerId])
+  @@index([stripeSubscriptionId])
+  @@index([createdAt])
+  @@map("rewardful_attribution")
+}
+
+model RewardfulWebhookEvent {
+  id                   String    @id @default(uuid())
+  eventId              String    @unique
+  eventType            String
+  objectId             String?
+  objectType           String?
+  referralId           String?
+  affiliateId          String?
+  saleId               String?
+  commissionId         String?
+  payoutId             String?
+  stripeCustomerId     String?
+  stripeSubscriptionId String?
+  amountCents          Int?
+  currency             String?
+  status               String?
+  processingStatus     String    @default("received")
+  processingError      String?
+  retryCount           Int       @default(0)
+  lastRetriedAt        DateTime?
+  payload              Json
+  deliveryCount        Int       @default(1)
+  receivedAt           DateTime  @default(now())
+  processedAt          DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  @@index([eventType])
+  @@index([objectId])
+  @@index([referralId])
+  @@index([affiliateId])
+  @@index([saleId])
+  @@index([commissionId])
+  @@index([stripeCustomerId])
+  @@index([stripeSubscriptionId])
+  @@index([processingStatus])
+  @@index([receivedAt])
+  @@map("rewardful_webhook_event")
+}
+
+enum KeywordType {
+  MUST_HAVE
+  NICE_TO_HAVE
+}
+
+enum OnboardingFlow {
+  trial_primary
+  website_secondary
+}
+
+enum OnboardingStatus {
+  idle
+  queued
+  running
+  awaiting_confirmation
+  failed
+  completed
+}
+
+model Keywords {
+  id          String      @id @default(uuid())
+  keyword     String
+  keywordType KeywordType
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  Business    Business    @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  businessId  String
+}
+
+model CompetitiveAdvantage {
+  id         String   @id @default(uuid())
+  advantage  String[]
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  Business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  businessId String
+}
+
+model Competitors {
+  id         String   @id @default(uuid())
+  name       String
+  url        String
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  Business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  businessId String
+}
+
+model currentRanking {
+  id         String   @id @default(uuid())
+  website    String
+  ranking    String
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  Business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  businessId String
+}
+
+model QuickScrapeBusiness {
+  id                        String    @id @default(uuid())
+  userId                    String
+  businessName              String
+  businessType              String
+  businessWebsiteUrl        String
+  detectedServices          String[]  @default([])
+  selectedServices          String[]  @default([])
+  servicesPriority          Json?
+  businessAddress           String?
+  businessCity              String?
+  businessState             String?
+  businessCountry           String?
+  businessPhone             String?
+  serviceArea               String?
+  serviceAreaLocations      String[]  @default([])
+  businessLocationMode      String?
+  confirmedPlaceId          String?
+  contactDetailsConfirmedAt DateTime?
+
+  // Onboarding v2 persists the one-time Context.dev snapshot so services,
+  // blog generation, and social generation all reuse the same source facts.
+  businessDescription String?
+  targetAudience      String?
+  brandContext        Json?
+
+  // Resumable onboarding progress. These fields are intentionally additive
+  // so records created before the canonical flow remain compatible.
+  onboardingV2Flow                OnboardingFlow   @default(trial_primary)
+  onboardingV2Step                String           @default("website")
+  onboardingV2QuestionIndex       Int              @default(0)
+  onboardingV2Answers             Json?
+  onboardingV2AnswerRevision      Int              @default(0)
+  onboardingV2Status              String           @default("in_progress")
+  onboardingV2LastSeenAt          DateTime?
+  onboardingV2GenerationStartedAt DateTime?
+  onboardingV2GenerationRevision  Int?
+  onboardingV2BusinessId          String?
+  onboardingV2BlogId              String?
+  onboardingV2SocialRunId         String?
+  onboardingV2BlogStatus          String           @default("idle")
+  onboardingV2SocialStatus        String           @default("idle")
+  onboardingV2GenerationError     Json?
+  onboardingV2Author              Json?
+  onboardingV2CompletedAt         DateTime?
+  onboardingV2SelectedPlanTier    WebsitePlanTier?
+
+  quickKeywords            Json?
+  quickKeywordsGenerating  Boolean   @default(false)
+  quickKeywordsGeneratedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, businessWebsiteUrl])
+  @@index([userId, onboardingV2Status, onboardingV2LastSeenAt], map: "qsb_user_v2_status_seen_idx")
+  @@index([userId, onboardingV2Flow, onboardingV2Status, onboardingV2LastSeenAt], map: "qsb_user_v2_flow_status_seen_idx")
+  @@map("quick_scrape_business")
+}
+
+model TrialAnalytics {
+  id     String @id @default(uuid())
+  userId String @unique
+
+  // Onboarding metrics
+  onboardingStartedAt    DateTime  @default(now())
+  onboardingCompletedAt  DateTime?
+  quickScrapeCompletedAt DateTime?
+  servicesSelectedAt     DateTime?
+  trialEnrolledAt        DateTime?
+
+  // Engagement metrics
+  firstLoginAt    DateTime?
+  lastLoginAt     DateTime?
+  totalLogins     Int       @default(0)
+  dashboardVisits Int       @default(0)
+  blogsViewed     Int       @default(0)
+  keywordsViewed  Int       @default(0)
+
+  // Content metrics
+  firstBlogGeneratedAt   DateTime?
+  totalBlogsGenerated    Int       @default(0)
+  totalKeywordsGenerated Int       @default(0)
+
+  // Conversion metrics
+  upgradeCTAClicked   Int       @default(0)
+  pricingPageVisited  Int       @default(0)
+  checkoutStarted     Boolean   @default(false)
+  checkoutCompletedAt DateTime?
+  converted           Boolean   @default(false)
+  convertedAt         DateTime?
+
+  // A/B Testing
+  abTestVariant String? // "control", "variant_a", "variant_b"
+  abTestGroup   String? // "modal_design", "pricing_display", etc.
+
+  // Email engagement
+  welcomeEmailSent       Boolean   @default(false)
+  welcomeEmailOpenedAt   DateTime?
+  firstBlogEmailSent     Boolean   @default(false)
+  firstBlogEmailOpenedAt DateTime?
+  expiringEmailSent      Boolean   @default(false)
+  expiringEmailOpenedAt  DateTime?
+  expiredEmailSent       Boolean   @default(false)
+  expiredEmailOpenedAt   DateTime?
+
+  // Trial outcome
+  trialEndedAt       DateTime?
+  trialOutcome       String? // "converted", "expired", "cancelled"
+  cancellationReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("trial_analytics")
+}
+
+model Business {
+  id                  String  @id @default(uuid())
+  businessName        String
+  businessType        String
+  businessDescription String
+  businessWebsiteUrl  String
+  businessPhone       String?
+
+  // Geographic Information
+  businessAddress      String?
+  businessCity         String?
+  businessState        String?
+  businessCountry      String?
+  serviceArea          String? // local, regional, national, international
+  // 🆕 NEW: Service area locations (cities/areas where business operates)
+  serviceAreaLocations String[] // Array of city names within service area for location-based keyword generation
+
+  // Target Audience & Content Preferences
+  targetAudience        String?
+  contentTone           String? // professional, casual, technical, friendly
+  publishingFrequency   String? // daily, weekly, bi-weekly, monthly
+  publishDaysOfWeek     Int[]    @default([0, 1, 2, 3, 4, 5, 6]) // 0=Sun..6=Sat; which days to schedule blogs
+  preferredContentTypes String[] // guides, reviews, news, tutorials, case-studies, how-to
+  blogImagesEnabled     Boolean  @default(true) // Generate featured and in-article images for new blogs
+  // 🆕 NEW: Multilanguage preferences
+  defaultLanguage       String?  @default("en") // User's preferred default language (backward compatibility)
+  supportedLanguages    String[] // Array of language codes user wants to support
+  // 🆕 NEW: Locale preferences
+  defaultLocale         String?  @default("en-US") // User's preferred default locale (e.g., "en-CA", "fr-CA", "en-US")
+  // 🆕 NEW: Example blog URLs for content style reference
+  exampleBlogUrls       String[] // Array of example blog URLs (max 5) from user's website
+
+  // 🆕 NEW: Service selection from quick scrape (30-second onboarding)
+  detectedServices Json? // AI-detected services from quick scrape
+  selectedServices String[] @default([]) // User-selected services to target
+  servicesPriority Json? // {service: priority} mapping for ranking focus
+
+  // 🆕 SEO 2026: Author E-E-A-T profile (for blog schema + byline)
+  authorName        String? // Display name for blog byline
+  authorBio         String? // Short bio (1-2 sentences)
+  authorJobTitle    String? // e.g., "Founder & CEO", "Head Chef"
+  authorImage       String? // URL to author headshot
+  authorExpertise   String[] // Areas of expertise e.g., ["SEO", "Digital Marketing"]
+  authorSocialLinks Json? // { linkedin, twitter, facebook, website }
+
+  // 🆕 NEW: Link to complete website analysis
+  websiteAnalysis WebsiteAnalysis?
+
+  // 🆕 NEW: Multi-website support
+  isActive                  Boolean          @default(true)
+  isPrimary                 Boolean          @default(false) // First website is primary
+  websiteStatus             String           @default("active") // active, suspended, trial, expired
+  stripeSubscriptionItemId  String? // Track per-website subscription item in Stripe
+  onboardingFlow            OnboardingFlow?
+  onboardingStatus          OnboardingStatus @default(idle)
+  onboardingAttemptCount    Int              @default(0)
+  onboardingLastAttemptAt   DateTime?
+  onboardingCompletedAt     DateTime?
+  onboardingCorrelationId   String?
+  onboardingLastError       Json?
+  secondaryDetailsConfirmed Boolean          @default(false)
+
+  // Recoverable, billing-safe website removal lifecycle. Content remains
+  // attached to the Business during the recovery window.
+  removalStatus                     String    @default("active") // active, cancellation_pending, removed
+  removalRequestedAt                DateTime?
+  removalCompletedAt                DateTime?
+  removalRecoveryDeadline           DateTime?
+  removalRestoredAt                 DateTime?
+  removalPreviousWebsiteStatus      String?
+  removalPreviousSubscriptionStatus String?
+  removalBillingAction              String? // none, cancel_dedicated_subscription, delete_shared_subscription_item, unknown
+  removalBillingObjectId            String?
+  removalOperationKey               String?   @unique
+  removalReplacementBusinessId      String?
+  removalLastError                  Json?
+
+  keywordGenerationStatus      String    @default("idle")
+  keywordGenerationStartedAt   DateTime?
+  keywordGenerationCompletedAt DateTime?
+
+  agencyId          String?
+  agency            Agency? @relation(fields: [agencyId], references: [id], onDelete: SetNull)
+  onboardedByUserId String?
+  ownershipType     String  @default("uplift_direct") // "agency_managed" | "uplift_direct"
+
+  keywords                   Keywords[]
+  competitiveAdvantage       CompetitiveAdvantage[]
+  competitiors               Competitors[]
+  currentRanking             currentRanking[]
+  createdAt                  DateTime                    @default(now())
+  updatedAt                  DateTime                    @updatedAt
+  User                       User                        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId                     String
+  websiteSubscription        WebsiteSubscription?
+  Blog                       Blog[]
+  BlogLinks                  SitemapUrls[]
+  Backlinks                  Backlinks[]
+  PublishingIntegrations     PublishingIntegration[]     @relation("PublishingIntegrations")
+  ExternalBacklinks          ExternalBacklink[]
+  ExternalBacklinkSummary    ExternalBacklinkSummary?
+  ExternalReferringDomains   ExternalReferringDomain[]
+  ExternalBacklinkAnchors    ExternalBacklinkAnchor[]
+  BrandAnalysis              BrandAnalysis?
+  GuestPostCampaigns         GuestPostCampaign[]
+  BlogImages                 BlogImage[]
+  PlatformKeywordAllocations PlatformKeywordAllocation[]
+  CompetitorIntelligences    CompetitorIntelligence[]
+  ServiceTaxonomies          ServiceTaxonomy[]
+  DynamicKnowledgeBase       DynamicKnowledgeBase?
+  Plan                       Plan[]
+  ApiTokens                  ApiToken[]                  @relation("ApiTokens")
+  GoogleMyBusiness           GoogleMyBusiness?
+  GeoProfile                 BusinessGeoProfile?
+  ServiceAreaGeoHints        ServiceAreaGeoHint[]
+  Photos                     BusinessPhoto[]
+  GMBAISuggestion            GMBAISuggestion?
+  GMBProfileProposalCache    GMBProfileProposalCache?
+  GMBCategoryCacheEntries    GMBCategoryCacheEntry[]
+  GMBPostSuggestions         GMBPostSuggestion[]
+  GMBReviewAnalysis          GMBReviewAnalysis?
+  GMBProfileSnapshots        GMBProfileSnapshot[]
+  GMBDailyMetrics            GMBDailyMetric[]
+  GMBDiscoveryKeywords       GMBDiscoveryKeyword[]
+  GMBProfileHealthRuns       GMBProfileHealthRun[]
+  GMBActionRecommendations   GMBActionRecommendation[]
+  GMBMediaAssets             GMBMediaAsset[]
+  GMBLocalRankScans          GMBLocalRankScan[]
+  GMBCompetitorSnapshots     GMBCompetitorSnapshot[]
+  GMBReviewCampaigns         GMBReviewCampaign[]
+  GMBReviewContacts          GMBReviewContact[]
+  GMBAttributionLinks        GMBAttributionLink[]
+  GMBAlerts                  GMBAlert[]
+  GMBBusinessHours           GMBBusinessHours[]
+  GMBSpecialHours            GMBSpecialHours[]
+  GMBCategories              GMBCategory[]
+  GMBAttributes              GMBAttribute[]
+  GMBEditImpactSnapshots     GMBEditImpactSnapshot[]
+  SeoAuditRuns               SeoAuditRun[]               @relation("SeoAuditRuns")
+  LlmUsageEvents             LlmUsageEvent[]             @relation("LlmUsageEventsBusiness")
+  SocialCreativeRuns         SocialCreativeRun[]         @relation("SocialCreativeRunsBusiness")
+  SocialCreativePosts        SocialCreativePost[]
+  LegacySocialPosts          SocialPost[]
+  BlogEvidenceSnapshots      BlogEvidenceSnapshot[]
+  contentClusters            ContentCluster[]
+  DRActionLogs               DRActionLog[]
+  DRContentOptimizations     DRContentOptimization[]
+  DROutreachCampaigns        DROutreachCampaign[]
+  DRLinkRecoveries           DRLinkRecovery[]
+  excludedOutreachDomains    String[]                    @default([]) // Domains to exclude from DR outreach
+
+  // AI Visibility
+  llmCitationScans              LlmCitationScan[]
+  llmCitations                  LlmCitation[]
+  llmQueryDiscoveries           LlmQueryDiscovery[]
+  contentLlmScores              ContentLlmScore[]
+  contentRoutes                 ContentRoute[]
+  aiVisibilityJobs              AiVisibilityJob[]
+  aiVisibilityTrialRun          AiVisibilityTrialRun?
+  competitiveGaps               CompetitiveGap[]
+  analyticsConfig               BusinessAnalyticsConfig?
+  aiReferralTraffic             AiReferralTraffic[]
+  searchConsoleMetrics          SearchConsoleMetric[]
+  socialAutomationSettings      SocialAutomationSettings?
+  socialPromotionCampaign       SocialPromotionCampaign?
+  socialCreativeReferences      SocialCreativeReferenceImage[]
+  socialLogoWeekAssignments     SocialLogoWeekAssignment[]
+  socialCarouselWeekAssignments SocialCarouselWeekAssignment[]
+  socialTopicPlans              SocialTopicPlan[]
+  socialPublisherProfile        SocialPublisherProfile?
+  socialPublisherAccounts       SocialPublisherAccount[]
+  socialPublishAttempts         SocialPublishAttempt[]
+  SalesCustomerAssignment       SalesCustomerAssignment?
+
+  @@index([agencyId])
+  @@index([ownershipType])
+  @@index([onboardingStatus, onboardingLastAttemptAt])
+  @@index([onboardingFlow])
+  @@index([userId, removalStatus])
+  @@index([removalStatus, removalRecoveryDeadline])
+}
+
+// ============================================
+// Website Analysis Models - Complete LLM Output Structure
+// ============================================
+
+model WebsiteAnalysis {
+  id         String @id @default(uuid())
+  scrapedUrl String
+  domain     String
+  userId     String
+
+  // Relations
+  business      Business?      @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  businessId    String?        @unique
+  brandIdentity BrandIdentity?
+  design        Design?
+  techStack     TechStack?
+  coreServices  CoreServices?
+  recognition   Recognition?
+  seo           SEO?
+  sitemap       Sitemap?
+  contactInfo   ContactInfo?
+  socialMedia   SocialMedia[]
+  navigation    Navigation[]
+  businessInfo  BusinessInfo?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Brand Identity
+
+model BrandIdentity {
+  id                String          @id @default(uuid())
+  websiteAnalysisId String          @unique
+  websiteAnalysis   WebsiteAnalysis @relation(fields: [websiteAnalysisId], references: [id], onDelete: Cascade)
+
+  name     String
+  tagline  String?
+  platform String?
+  favicon  String?
+
+  logos BrandLogo[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model BrandLogo {
+  id              String        @id @default(uuid())
+  brandIdentityId String
+  brandIdentity   BrandIdentity @relation(fields: [brandIdentityId], references: [id], onDelete: Cascade)
+
+  type String
+  url  String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Design
+
+model Design {
+  id                String          @id @default(uuid())
+  websiteAnalysisId String          @unique
+  websiteAnalysis   WebsiteAnalysis @relation(fields: [websiteAnalysisId], references: [id], onDelete: Cascade)
+
+  colors DesignColor[]
+  fonts  DesignFont[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model DesignColor {
+  id       String @id @default(uuid())
+  designId String
+  design   Design @relation(fields: [designId], references: [id], onDelete: Cascade)
+
+  type   String
+  hex    String
+  source String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model DesignFont {
+  id       String @id @default(uuid())
+  designId String
+  design   Design @relation(fields: [designId], references: [id], onDelete: Cascade)
+
+  type   String
+  family String?
+  weight String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Tech Stack
+
+model TechStack {
+  id                String          @id @default(uuid())
+  websiteAnalysisId String          @unique
+  websiteAnalysis   WebsiteAnalysis @relation(fields: [websiteAnalysisId], references: [id], onDelete: Cascade)
+
+  frontend   String[]
+  backend    String[]
+  database   String[]
+  automation String[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Core Services
+
+model CoreServices {
+  id                String          @id @default(uuid())
+  websiteAnalysisId String          @unique
+  websiteAnalysis   WebsiteAnalysis @relation(fields: [websiteAnalysisId], references: [id], onDelete: Cascade)
+
+  topLevel      String[]
+  subOfferings  String[]
+  industryFocus String[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Recognition
+
+model Recognition {
+  id                String          @id @default(uuid())
+  websiteAnalysisId String          @unique
+  websiteAnalysis   WebsiteAnalysis @relation(fields: [websiteAnalysisId], references: [id], onDelete: Cascade)
+
+  awards       String[]
+  partnerships String[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// SEO
+
+model SEO {
+  id                String          @id @default(uuid())
+  websiteAnalysisId String          @unique
+  websiteAnalysis   WebsiteAnalysis @relation(fields: [websiteAnalysisId], references: [id], onDelete: Cascade)
+
+  title                  String?
+  metaDescription        String?
+  canonicalUrl           String?
+  keywords               String[] // Basic keywords array from meta tags
+  targetKeywords         String[] // Target keywords for SEO strategy
+  targetKeywordsWithType Json? // Keywords with MUST_HAVE/NICE_TO_HAVE types
+  openGraph              Json? // Store as JSON object
+  twitterCard            Json? // Store as JSON object
+  schema                 Json? // Store as JSON array
+  verification           Json? // Store verification data (google-site-verification, etc.)
+  analytics_tracking     String[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Sitemap
+
+model Sitemap {
+  id                String          @id @default(uuid())
+  websiteAnalysisId String          @unique
+  websiteAnalysis   WebsiteAnalysis @relation(fields: [websiteAnalysisId], references: [id], onDelete: Cascade)
+
+  url  String?
+  note String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Contact Info
+
+model ContactInfo {
+  id                String          @id @default(uuid())
+  websiteAnalysisId String          @unique
+  websiteAnalysis   WebsiteAnalysis @relation(fields: [websiteAnalysisId], references: [id], onDelete: Cascade)
+
+  phone      String?
+  email      String?
+  contactUrl String?
+  bookingUrl String?
+  hours      String[]
+
+  locations ContactLocation[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model ContactLocation {
+  id            String      @id @default(uuid())
+  contactInfoId String
+  contactInfo   ContactInfo @relation(fields: [contactInfoId], references: [id], onDelete: Cascade)
+
+  type    String
+  address String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Social Media
+
+model SocialMedia {
+  id                String          @id @default(uuid())
+  websiteAnalysisId String
+  websiteAnalysis   WebsiteAnalysis @relation(fields: [websiteAnalysisId], references: [id], onDelete: Cascade)
+
+  name String
+  url  String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Navigation
+
+model Navigation {
+  id                String          @id @default(uuid())
+  websiteAnalysisId String
+  websiteAnalysis   WebsiteAnalysis @relation(fields: [websiteAnalysisId], references: [id], onDelete: Cascade)
+
+  text String
+  url  String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Business Info - Enhanced business information for better context
+
+model BusinessInfo {
+  id                String          @id @default(uuid())
+  websiteAnalysisId String          @unique
+  websiteAnalysis   WebsiteAnalysis @relation(fields: [websiteAnalysisId], references: [id], onDelete: Cascade)
+
+  businessSummary     String?
+  businessGoals       String[] // Array of goals
+  targetAudience      String?
+  valuePropositions   String[] // Array of value props
+  businessModel       String?
+  customerPainPoints  String[] // Array of pain points
+  uniqueSellingPoints String[] // Array of USPs
+  pricingModel        String?
+  industryPositioning String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum ConnectionPlatform {
+  WORDPRESS
+  WEBFLOW
+  SHOPIFY
+  FRAMER
+  CUSTOM_API
+  WIX
+  REDDIT
+  MEDIUM
+}
+
+enum PublishAs {
+  DRAFT
+  PUBLISH
+}
+
+enum PublishStatus {
+  PENDING
+  PUBLISHING
+  PUBLISHED
+  FAILED
+  UPDATED
+}
+
+model PublishConsole {
+  id                 String             @id @default(uuid())
+  autoPublish        Boolean            @default(true)
+  connectionPlatform ConnectionPlatform
+  publishAs          PublishAs
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+}
+
+// ============================================
+// WordPress OAuth Token Model
+// ============================================
+
+model WordPressOAuthToken {
+  id               String @id @default(uuid())
+  userId           String // Database User ID
+  wordpressSiteUrl String // WordPress site URL
+
+  // OAuth tokens (encrypted)
+  accessToken    String
+  refreshToken   String?
+  tokenExpiresAt DateTime?
+
+  // Connection info
+  isActive    Boolean   @default(true)
+  connectedAt DateTime  @default(now())
+  lastUsedAt  DateTime?
+
+  // Plugin metadata
+  pluginVersion    String?
+  wordpressVersion String?
+
+  createdAt             DateTime                @default(now())
+  updatedAt             DateTime                @updatedAt
+  PublishingIntegration PublishingIntegration[]
+
+  @@unique([userId, wordpressSiteUrl])
+  @@index([userId])
+  @@index([wordpressSiteUrl])
+  @@index([isActive])
+}
+
+// ============================================
+// Shopify OAuth Token Model
+// ============================================
+
+model ShopifyOAuthToken {
+  id         String @id @default(uuid())
+  userId     String // Database User ID
+  shopDomain String // shop.myshopify.com
+
+  // OAuth tokens (encrypted)
+  accessToken    String
+  refreshToken   String?
+  tokenExpiresAt DateTime?
+
+  // Connection info
+  isActive    Boolean   @default(true)
+  connectedAt DateTime  @default(now())
+  lastUsedAt  DateTime?
+
+  // App metadata
+  shopName  String?
+  shopEmail String?
+  planName  String?
+
+  createdAt             DateTime                @default(now())
+  updatedAt             DateTime                @updatedAt
+  PublishingIntegration PublishingIntegration[]
+
+  @@unique([userId, shopDomain])
+  @@index([userId])
+  @@index([shopDomain])
+  @@index([isActive])
+}
+
+// ============================================
+// Webflow OAuth Token Model
+// ============================================
+
+model WebflowOAuthToken {
+  id     String @id @default(uuid())
+  userId String // Database User ID
+  siteId String // Webflow Site ID
+
+  // OAuth tokens (encrypted)
+  accessToken    String
+  refreshToken   String?
+  tokenExpiresAt DateTime?
+
+  // Connection info
+  isActive    Boolean   @default(true)
+  connectedAt DateTime  @default(now())
+  lastUsedAt  DateTime?
+
+  // Site metadata
+  siteName String?
+  siteUrl  String?
+
+  createdAt             DateTime                @default(now())
+  updatedAt             DateTime                @updatedAt
+  PublishingIntegration PublishingIntegration[]
+
+  @@unique([userId, siteId])
+  @@index([userId])
+  @@index([siteId])
+  @@index([isActive])
+}
+
+// ============================================
+// Wix OAuth Token Model
+// ============================================
+
+model WixOAuthToken {
+  id            String  @id @default(uuid())
+  userId        String // Database User ID
+  wixSiteId     String // Wix Site ID
+  wixInstanceId String? // Wix App instance ID used by current Wix OAuth
+
+  // OAuth tokens (encrypted)
+  accessToken    String
+  refreshToken   String?
+  tokenExpiresAt DateTime?
+
+  // Connection info
+  isActive    Boolean   @default(true)
+  connectedAt DateTime  @default(now())
+  lastUsedAt  DateTime?
+
+  // Site metadata
+  siteName String?
+  siteUrl  String?
+
+  createdAt             DateTime                @default(now())
+  updatedAt             DateTime                @updatedAt
+  PublishingIntegration PublishingIntegration[]
+
+  @@unique([userId, wixSiteId])
+  @@index([userId])
+  @@index([wixSiteId])
+  @@index([wixInstanceId])
+  @@index([isActive])
+}
+
+// ============================================
+// Reddit OAuth Token Model
+// ============================================
+
+model RedditOAuthToken {
+  id     String @id @default(uuid())
+  userId String // Database User ID
+
+  // OAuth tokens (encrypted)
+  accessToken    String
+  refreshToken   String?
+  tokenType      String    @default("bearer")
+  tokenExpiresAt DateTime?
+  scope          String? // Reddit OAuth scopes
+
+  // Reddit user info
+  redditUsername String?
+  redditUserId   String?
+
+  // Connection info
+  isActive    Boolean   @default(true)
+  connectedAt DateTime  @default(now())
+  lastUsedAt  DateTime?
+
+  createdAt             DateTime                @default(now())
+  updatedAt             DateTime                @updatedAt
+  PublishingIntegration PublishingIntegration[]
+
+  @@unique([userId])
+  @@index([isActive])
+}
+
+// ============================================
+// Medium OAuth Token Model
+// ============================================
+
+model MediumOAuthToken {
+  id     String @id @default(uuid())
+  userId String // Database User ID
+
+  // OAuth tokens (encrypted)
+  accessToken    String
+  refreshToken   String?
+  tokenType      String    @default("bearer")
+  tokenExpiresAt DateTime?
+
+  // Medium user info
+  mediumUserId   String?
+  mediumUsername String?
+
+  // Connection info
+  isActive    Boolean   @default(true)
+  connectedAt DateTime  @default(now())
+  lastUsedAt  DateTime?
+
+  createdAt             DateTime                @default(now())
+  updatedAt             DateTime                @updatedAt
+  PublishingIntegration PublishingIntegration[]
+
+  @@unique([userId])
+  @@index([isActive])
+}
+
+model PublishingIntegration {
+  id         String    @id @default(uuid())
+  userId     String
+  user       User      @relation("PublishingIntegrations", fields: [userId], references: [id], onDelete: Cascade)
+  businessId String?
+  business   Business? @relation("PublishingIntegrations", fields: [businessId], references: [id], onDelete: Cascade)
+
+  platform    ConnectionPlatform
+  isActive    Boolean            @default(true)
+  autoPublish Boolean            @default(false)
+  publishAs   PublishAs          @default(PUBLISH)
+
+  // WordPress (backward compatibility - REST API)
+  wordpressUrl      String?
+  wordpressUsername String?
+  wordpressPassword String?
+
+  // WordPress Plugin OAuth (NEW)
+  wordpressConnectionMethod String?              @default("REST_API") // "REST_API" | "PLUGIN"
+  wordpressOAuthTokenId     String? // Reference to WordPressOAuthToken
+  wordpressOAuthToken       WordPressOAuthToken? @relation(fields: [wordpressOAuthTokenId], references: [id], onDelete: SetNull)
+
+  // WordPress Integration Key (NEW)
+  wordpressIntegrationKey               String?   @unique // Unique key for plugin authentication
+  wordpressIntegrationKeyDigest         String?   @unique // HMAC digest for inbound verification
+  wordpressPreviousKeyDigest            String? // Previous HMAC digest retained only for forensic fingerprinting
+  wordpressIntegrationKeyFirstCreatedAt DateTime? // First key issuance for this integration
+  wordpressIntegrationKeyCreatedAt      DateTime? // When key was generated
+  wordpressIntegrationKeyLastUsedAt     DateTime? // Last time key was used
+  wordpressIntegrationKeyRevokedAt      DateTime? // When the current key was revoked
+  wordpressIntegrationKeyRotationCount  Int       @default(0)
+  pluginVersion                         String? // WordPress plugin version reported during test connection
+
+  // Webflow (backward compatibility - API Key)
+  webflowSiteId       String?
+  webflowApiKey       String?
+  webflowCollectionId String?
+
+  // Webflow OAuth (NEW)
+  webflowConnectionMethod String?            @default("API_KEY") // "API_KEY" | "OAUTH"
+  webflowOAuthTokenId     String? // Reference to WebflowOAuthToken
+  webflowOAuthToken       WebflowOAuthToken? @relation(fields: [webflowOAuthTokenId], references: [id], onDelete: SetNull)
+
+  // Shopify (backward compatibility - API Key)
+  shopifyShopDomain           String?
+  shopifyAccessToken          String?
+  shopifyClientId             String?
+  shopifyClientSecret         String?
+  shopifyAccessTokenIssuedAt  DateTime?
+  shopifyAccessTokenExpiresAt DateTime?
+  shopifyApiVersion           String?   @default("2026-01")
+  shopifyBlogId               String?
+
+  // Shopify App OAuth (NEW)
+  shopifyConnectionMethod String?            @default("OAUTH") // "API_KEY" | "OAUTH" | "CUSTOM_APP"
+  shopifyOAuthTokenId     String? // Reference to ShopifyOAuthToken
+  shopifyOAuthToken       ShopifyOAuthToken? @relation(fields: [shopifyOAuthTokenId], references: [id], onDelete: SetNull)
+  shopifyApiMethod        String?            @default("GRAPHQL") // "REST" | "GRAPHQL"
+
+  // Framer
+  framerProjectId      String?
+  framerApiKey         String?
+  framerCollectionName String?
+
+  // Custom API
+  customApiUrl             String?
+  customApiKey             String?
+  customApiSecret          String?
+  customApiMethod          String? @default("POST")
+  customApiAuthType        String? @default("bearer")
+  customApiHeaders         Json?
+  customApiPayloadMapping  Json?
+  customApiResponseMapping Json?
+
+  // Wix OAuth (Wix requires OAuth 2.0)
+  wixSiteId           String?
+  wixConnectionMethod String?        @default("OAUTH") // "OAUTH" only (Wix requires OAuth)
+  wixOAuthTokenId     String? // Reference to WixOAuthToken
+  wixOAuthToken       WixOAuthToken? @relation(fields: [wixOAuthTokenId], references: [id], onDelete: SetNull)
+  wixCollectionId     String? // Wix collection ID for blog posts
+
+  // Reddit OAuth
+  redditOAuthTokenId String? // Reference to RedditOAuthToken
+  redditOAuthToken   RedditOAuthToken? @relation(fields: [redditOAuthTokenId], references: [id], onDelete: SetNull)
+  redditSubreddit    String? // Target subreddit for posts
+
+  // Medium OAuth
+  mediumOAuthTokenId  String? // Reference to MediumOAuthToken
+  mediumOAuthToken    MediumOAuthToken? @relation(fields: [mediumOAuthTokenId], references: [id], onDelete: SetNull)
+  mediumPublicationId String? // Optional: publish to a Medium publication
+
+  connectionName String?
+  lastSyncAt     DateTime?
+  lastError      String?
+  lastErrorAt    DateTime?
+  errorCount     Int       @default(0)
+  isVerified     Boolean   @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  publishedBlogs PublishedBlog[]
+
+  @@unique([userId, platform, businessId])
+  @@index([businessId])
+  @@index([userId, businessId])
+  @@index([userId])
+  @@index([platform])
+}
+
+model PublishedBlog {
+  id            String                @id @default(uuid())
+  blogId        String
+  blog          Blog                  @relation(fields: [blogId], references: [id], onDelete: Cascade)
+  integrationId String
+  integration   PublishingIntegration @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+
+  platform        ConnectionPlatform
+  externalPostId  String?
+  externalPostUrl String?
+
+  status        PublishStatus @default(PENDING)
+  publishStatus String?
+
+  publishedAt  DateTime?
+  lastSyncedAt DateTime?
+  lastError    String?
+  retryCount   Int       @default(0)
+
+  platformResponse Json?
+
+  publishingStartedAt  DateTime?
+  lastPublishAttemptId String?
+  publishLockExpiresAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([blogId, integrationId])
+  @@index([blogId])
+  @@index([platform])
+  @@index([status])
+  @@index([publishedAt])
+}
+
+enum STATUS {
+  DRAFT
+  PUBLISH
+}
+
+model CustomField {
+  id           String   @id @default(uuid())
+  reading_time String
+  rating       Int
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  Blog         Blog[]
+}
+
+model Meta {
+  id              String   @id @default(uuid())
+  seo_title       String
+  seo_description String
+  focus_keyword   String
+  keywords        String[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  Blog Blog[]
+}
+
+model Blog {
+  id                   String   @id @default(uuid())
+  title                String
+  slug                 String
+  status               STATUS   @default(DRAFT)
+  content              String
+  excerpt              String
+  categories           String[]
+  tags                 String[]
+  featured_media       String
+  blogPublishTime      String
+  blogPublishDate      String
+  seoScore             Int? // SEO score (0-100) calculated on frontend
+  analytics            Json? // LLM-generated analytics: content quality, ranking potential, conversion potential, external links count
+  onboardingPreviewKey String?  @unique
+
+  // 🆕 SEO 2026: Author E-E-A-T fields
+  authorName  String?
+  authorBio   String?
+  authorUrl   String?
+  authorImage String?
+
+  // 🆕 SEO 2026: Content cluster
+  clusterId   String?
+  cluster     ContentCluster? @relation(fields: [clusterId], references: [id])
+  clusterRole String? // "pillar" or "cluster"
+
+  // 🆕 B1: Content freshness loop
+  lastRefreshedAt      DateTime?
+  refreshAttempts      Int       @default(0)
+  // 🆕 B3: Citation verifier output
+  verificationFailures Json? // [{url, reason, strippedAt}]
+  // 🆕 C4: Canonical URL when republished to customer's WordPress/Shopify.
+  // When set, our hosted copy emits <link rel="canonical" href=...> to point at the customer's domain.
+  canonicalUrl         String?
+
+  meta                     Meta                    @relation(fields: [metaId], references: [id], onDelete: Cascade)
+  customField              CustomField             @relation(fields: [customFieldId], references: [id], onDelete: Cascade)
+  user                     User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  business                 Business                @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  createdAt                DateTime                @default(now())
+  updatedAt                DateTime                @updatedAt
+  // Last time this blog's vector was (re)embedded into Pinecone.
+  // NULL = never indexed by the background re-index job.
+  // The weekly re-index job re-embeds blogs where updatedAt > pineconeIndexedAt.
+  pineconeIndexedAt        DateTime?
+  metaId                   String                  @unique
+  customFieldId            String                  @unique
+  userId                   String
+  businessId               String
+  Plan                     Plan[]
+  GeneratedImages          GeneratedImage[]
+  publishedBlogs           PublishedBlog[]
+  outboundManagedBacklinks Backlinks[]             @relation("SourceBlogBacklinks")
+  guestPostSubmissions     GuestPostSubmission[]
+  GMBPostSuggestions       GMBPostSuggestion[]
+  LlmUsageEvents           LlmUsageEvent[]         @relation("LlmUsageEventsBlog")
+  DRContentOptimizations   DRContentOptimization[]
+  SocialCreativeRuns       SocialCreativeRun[]     @relation("SocialCreativeRunsBlog")
+
+  // AI Visibility
+  contentLlmScore ContentLlmScore?
+  contentRoute    ContentRoute?
+}
+
+model SitemapUrls {
+  id         String   @id @default(uuid())
+  urls       String[]
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  businessId String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId     String
+  createdAt  DateTime @default(now())
+  udpatedAt  DateTime @updatedAt
+
+  @@unique([userId, businessId])
+}
+
+model Plan {
+  id                  String    @id @default(uuid())
+  keyword             String
+  keywordInstructions String?
+  publishDate         String
+  publishTime         String
+  keywordDiffculty    String
+  keywordSearchVolume String
+  blog                Blog?     @relation(fields: [blogId], references: [id], onDelete: Cascade)
+  blogId              String?
+  userId              String
+  user                User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businessId          String? // 🆕 Link keywords to specific business
+  business            Business? @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  deletedAt           DateTime?
+
+  // Enhanced keyword tracking fields
+  isUsed            Boolean   @default(false)
+  usedAt            DateTime?
+  similarityScore   Float? // Optional: similarity with other keywords
+  keywordCategory   String? // Optional: categorize keywords (e.g., "informational", "commercial", "local")
+  keywordIntent     String? // Optional: search intent (e.g., "informational", "navigational", "transactional")
+  keywordSource     String? // Optional: selection source (service_seed, domain, competitor, gap, refinement)
+  difficultyBucket  String? // Optional: difficulty bucket (easy, medium, hard)
+  selectionMetadata Json? // Optional: AI/service/source selection rationale and metrics snapshot
+
+  // DataForSEO real-time keyword data
+  keywordCpc              Float? // Cost per click in USD
+  keywordCompetition      Float? // Competition level (0.00-1.00)
+  keywordTrend            Json? // Trend data (monthly search volume over time)
+  keywordMonthlySearches  Int? // Current monthly search volume
+  keywordClicks           Int? // Estimated monthly clicks
+  keywordImpressions      Int? // Estimated monthly impressions
+  keywordCTR              Float? // Click-through rate
+  keywordLowTopOfPageBid  Float? // Low top of page bid (USD)
+  keywordHighTopOfPageBid Float? // High top of page bid (USD)
+  keywordDataUpdatedAt    DateTime? // When DataForSEO data was last fetched
+
+  // 🆕 SEO 2026: Content cluster assignment
+  clusterId          String?
+  cluster            ContentCluster?     @relation(fields: [clusterId], references: [id])
+  clusterName        String?
+  clusterRole        String? // "pillar" or "cluster"
+  SocialCreativeRuns SocialCreativeRun[] @relation("SocialCreativeRunsPlan")
+  SocialTopicPlans   SocialTopicPlan[]
+}
+
+model WordPressintegration {
+  id           String   @id @default(uuid())
+  websiteUrl   String
+  username     String
+  app_password String // Increased size for encrypted data
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  User         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId       String   @unique
+}
+
+model GoogleMyBusiness {
+  id         String   @id @default(uuid())
+  businessId String   @unique
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  accessToken  String
+  refreshToken String
+  tokenExpiry  DateTime
+
+  accountId       String?
+  accountName     String?
+  locationId      String?
+  locationName    String?
+  placeId         String? // Google Maps Place ID (distinct from GMB locationId). Populated by GMB metadata when available, feeds BusinessGeoProfile enrichment.
+  businessName    String?
+  businessAddress String?
+  businessPhone   String?
+  businessWebsite String?
+
+  isActive                Boolean @default(true)
+  isDemo                  Boolean @default(false)
+  autoPostToGmbEnabled    Boolean @default(true)
+  autoReviewReplyEnabled  Boolean @default(true)
+  postAutomationMode      String  @default("approval_required") // approval_required | auto_publish | disabled
+  reviewReplyMode         String  @default("approval_required") // approval_required | auto_publish | disabled
+  profileEditMode         String  @default("approval_required") // approval_required | disabled
+  mediaPublishingMode     String  @default("approval_required") // approval_required | auto_publish | disabled
+  rankScanCadence         String  @default("weekly") // manual | weekly | monthly
+  notificationPreferences Json?
+
+  // Phase 1 ranking foundations
+  timezone          String? // IANA timezone (e.g., "America/Toronto"). Derived from coords or address. Required for hour comparisons and DST handling.
+  verified          Boolean   @default(false) // Mirror of GBP verificationState == VERIFIED for quick health-check lookups.
+  verificationState String? // VERIFIED | UNVERIFIED | PENDING | SUSPENDED | DUPLICATE - raw GBP state.
+  verifiedAt        DateTime?
+  moderationStatus  String? // OK | FLAGGED | SUSPENDED - surfaces policy violations from GBP.
+
+  lastSyncAt       DateTime?
+  lastSyncError    String?
+  totalReviewCount Int?
+
+  cachedInsightsViews      Int?
+  cachedInsightsClicks     Int?
+  cachedInsightsCalls      Int?
+  cachedInsightsDirections Int?
+  cachedAverageRating      Float?
+  cachedCategories         Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  gmbPosts              GMBPost[]
+  gmbReviews            GMBReview[]
+  profileSnapshots      GMBProfileSnapshot[]
+  dailyMetrics          GMBDailyMetric[]
+  discoveryKeywords     GMBDiscoveryKeyword[]
+  profileHealthRuns     GMBProfileHealthRun[]
+  actionRecommendations GMBActionRecommendation[]
+  mediaAssets           GMBMediaAsset[]
+  localRankScans        GMBLocalRankScan[]
+  competitorSnapshots   GMBCompetitorSnapshot[]
+  reviewCampaigns       GMBReviewCampaign[]
+  attributionLinks      GMBAttributionLink[]
+  alerts                GMBAlert[]
+  businessHours         GMBBusinessHours[]
+  specialHours          GMBSpecialHours[]
+  categories            GMBCategory[]
+  attributes            GMBAttribute[]
+  editImpactSnapshots   GMBEditImpactSnapshot[]
+}
+
+model GMBProfileSnapshot {
+  id               String           @id @default(uuid())
+  businessId       String
+  business         Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  gmbId            String
+  googleMyBusiness GoogleMyBusiness @relation(fields: [gmbId], references: [id], onDelete: Cascade)
+
+  profileJson       Json
+  categoriesJson    Json?
+  attributesJson    Json?
+  servicesJson      Json?
+  hoursJson         Json?
+  specialHoursJson  Json?
+  moreHoursJson     Json?
+  serviceAreaJson   Json?
+  googleUpdatesJson Json?
+  source            String   @default("google_business_profile")
+  syncedAt          DateTime @default(now())
+
+  @@index([businessId, syncedAt])
+  @@index([gmbId, syncedAt])
+}
+
+model GMBDailyMetric {
+  id               String           @id @default(uuid())
+  businessId       String
+  business         Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  gmbId            String
+  googleMyBusiness GoogleMyBusiness @relation(fields: [gmbId], references: [id], onDelete: Cascade)
+
+  metricDate        DateTime
+  impressionsSearch Int      @default(0)
+  impressionsMaps   Int      @default(0)
+  websiteClicks     Int      @default(0)
+  callClicks        Int      @default(0)
+  directionRequests Int      @default(0)
+  bookings          Int      @default(0)
+  menuClicks        Int      @default(0)
+  foodOrders        Int      @default(0)
+  rawJson           Json?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@unique([businessId, metricDate])
+  @@index([gmbId, metricDate])
+}
+
+model GMBDiscoveryKeyword {
+  id               String           @id @default(uuid())
+  businessId       String
+  business         Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  gmbId            String
+  googleMyBusiness GoogleMyBusiness @relation(fields: [gmbId], references: [id], onDelete: Cascade)
+
+  keyword     String
+  month       DateTime
+  impressions Int      @default(0)
+  source      String   @default("gbp_performance")
+  rawJson     Json?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([businessId, keyword, month])
+  @@index([businessId, month])
+  @@index([gmbId, month])
+}
+
+model GMBProfileHealthRun {
+  id               String           @id @default(uuid())
+  businessId       String
+  business         Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  gmbId            String
+  googleMyBusiness GoogleMyBusiness @relation(fields: [gmbId], references: [id], onDelete: Cascade)
+
+  score             Int
+  completenessScore Int
+  reputationScore   Int
+  engagementScore   Int
+  visibilityScore   Int
+  conversionScore   Int
+  summary           String?
+  source            String                 @default("rules")
+  generatedAt       DateTime               @default(now())
+  items             GMBProfileHealthItem[]
+
+  @@index([businessId, generatedAt])
+  @@index([gmbId, generatedAt])
+}
+
+model GMBProfileHealthItem {
+  id    String              @id @default(uuid())
+  runId String
+  run   GMBProfileHealthRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  checkKey          String
+  title             String
+  description       String?
+  category          String
+  status            String // pass | warning | fail
+  priority          String  @default("medium")
+  scoreImpact       Int     @default(0)
+  recommendedAction String?
+  evidenceJson      Json?
+
+  @@index([runId])
+  @@index([status])
+}
+
+model GMBActionRecommendation {
+  id               String           @id @default(uuid())
+  businessId       String
+  business         Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  gmbId            String
+  googleMyBusiness GoogleMyBusiness @relation(fields: [gmbId], references: [id], onDelete: Cascade)
+
+  actionType  String
+  title       String
+  description String?
+  category    String
+  priority    String    @default("medium")
+  status      String    @default("PENDING") // PENDING | APPROVED | DISMISSED | APPLIED | FAILED
+  payloadJson Json?
+  source      String    @default("rules")
+  approvedAt  DateTime?
+  dismissedAt DateTime?
+  appliedAt   DateTime?
+  error       String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  editImpactSnapshots GMBEditImpactSnapshot[]
+
+  @@index([businessId, status])
+  @@index([gmbId, status])
+  @@index([actionType])
+}
+
+// Phase 2 ranking foundations — edit→rank impact attribution.
+// One row per (action, phase). 'baseline' captures rank state at approval;
+// 'post' captures rank state 14 days later. The pair feeds the impact UI.
+model GMBEditImpactSnapshot {
+  id               String           @id @default(uuid())
+  businessId       String
+  business         Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  gmbId            String
+  googleMyBusiness GoogleMyBusiness @relation(fields: [gmbId], references: [id], onDelete: Cascade)
+
+  actionId   String
+  action     GMBActionRecommendation @relation(fields: [actionId], references: [id], onDelete: Cascade)
+  actionType String // copied at capture so we can group/filter without joining
+  phase      String // "baseline" | "post"
+  capturedAt DateTime                @default(now())
+
+  // Array of { keyword, locationLabel, position, rankAbsolute, scanId } — taken from
+  // the most recent COMPLETE GMBLocalRankScan rows at capture time. JSON for
+  // forward-compat (deltas computed on read).
+  rankSnapshot Json
+
+  // Filled in on the 'post' row by the evaluator. Null until evaluation runs.
+  deltaSummary Json? // { keywordsImproved, keywordsDeclined, avgPositionDelta, topMoves: [...] }
+  evaluatedAt  DateTime?
+
+  @@unique([actionId, phase])
+  @@index([businessId, capturedAt])
+  @@index([phase, capturedAt])
+}
+
+model GMBMediaAsset {
+  id               String           @id @default(uuid())
+  businessId       String
+  business         Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  gmbId            String
+  googleMyBusiness GoogleMyBusiness @relation(fields: [gmbId], references: [id], onDelete: Cascade)
+  businessPhotoId  String?
+  businessPhoto    BusinessPhoto?   @relation(fields: [businessPhotoId], references: [id], onDelete: SetNull)
+
+  sourceUrl   String
+  googleUrl   String?
+  mediaType   String    @default("PHOTO")
+  category    String    @default("OTHER")
+  status      String    @default("PENDING") // PENDING | APPROVED | PUBLISHED | FAILED | DISMISSED
+  caption     String?
+  approvedAt  DateTime?
+  publishedAt DateTime?
+  error       String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([businessId, status])
+  @@index([gmbId, status])
+}
+
+model GMBLocalRankScan {
+  id               String           @id @default(uuid())
+  businessId       String
+  business         Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  gmbId            String
+  googleMyBusiness GoogleMyBusiness @relation(fields: [gmbId], references: [id], onDelete: Cascade)
+
+  keyword       String
+  locationLabel String?
+  locationCode  Int?
+  latitude      Float?
+  longitude     Float?
+  status        String               @default("PENDING") // PENDING | COMPLETE | FAILED
+  source        String               @default("dataforseo_maps")
+  rawJson       Json?
+  requestedAt   DateTime             @default(now())
+  completedAt   DateTime?
+  error         String?
+  results       GMBLocalRankResult[]
+
+  @@index([businessId, requestedAt])
+  @@index([gmbId, requestedAt])
+  @@index([keyword])
+}
+
+model GMBLocalRankResult {
+  id     String           @id @default(uuid())
+  scanId String
+  scan   GMBLocalRankScan @relation(fields: [scanId], references: [id], onDelete: Cascade)
+
+  position        Int?
+  rankAbsolute    Int?
+  matchConfidence Float    @default(0)
+  matchedBy       String?
+  title           String?
+  domain          String?
+  url             String?
+  placeId         String?
+  cid             String?
+  rating          Float?
+  reviewCount     Int?
+  categoriesJson  Json?
+  address         String?
+  latitude        Float?
+  longitude       Float?
+  isClient        Boolean  @default(false)
+  rawJson         Json?
+  createdAt       DateTime @default(now())
+
+  @@index([scanId, position])
+  @@index([placeId])
+  @@index([cid])
+  @@index([isClient])
+}
+
+model GMBCompetitorSnapshot {
+  id               String           @id @default(uuid())
+  businessId       String
+  business         Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  gmbId            String
+  googleMyBusiness GoogleMyBusiness @relation(fields: [gmbId], references: [id], onDelete: Cascade)
+
+  name           String
+  domain         String?
+  url            String?
+  placeId        String?
+  cid            String?
+  rating         Float?
+  reviewCount    Int?
+  categoriesJson Json?
+  strengthsJson  Json?
+  weaknessesJson Json?
+  source         String   @default("dataforseo_maps")
+  lastSeenAt     DateTime @default(now())
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([businessId, lastSeenAt])
+  @@index([gmbId, lastSeenAt])
+  @@index([placeId])
+  @@index([cid])
+  @@index([domain])
+}
+
+model GMBReviewCampaign {
+  id               String           @id @default(uuid())
+  businessId       String
+  business         Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  gmbId            String
+  googleMyBusiness GoogleMyBusiness @relation(fields: [gmbId], references: [id], onDelete: Cascade)
+
+  name         String
+  status       String   @default("DRAFT") // DRAFT | ACTIVE | PAUSED | COMPLETE
+  reviewLink   String
+  emailSubject String?
+  emailBody    String?  @db.Text
+  qrCodeUrl    String?
+  sentCount    Int      @default(0)
+  clickedCount Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  contacts GMBReviewContact[]
+
+  @@index([businessId, status])
+  @@index([gmbId, status])
+}
+
+// Per-business contact list for review-request campaigns. Each row is one
+// customer to email (or skip, if opted out). The dispatch cron walks this
+// table for every ACTIVE campaign and sends one email per contact ever.
+model GMBReviewContact {
+  id         String            @id @default(uuid())
+  businessId String
+  business   Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  campaignId String
+  campaign   GMBReviewCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  email            String
+  name             String?
+  status           String    @default("PENDING") // PENDING | SENT | OPTED_OUT | BOUNCED
+  source           String    @default("manual") // manual | csv | api
+  unsubscribeToken String    @unique
+  addedAt          DateTime  @default(now())
+  lastEmailedAt    DateTime?
+  optedOutAt       DateTime?
+  bouncedAt        DateTime?
+  emailError       String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([campaignId, email])
+  @@index([businessId, status])
+  @@index([campaignId, status])
+  @@index([status, lastEmailedAt])
+}
+
+model GMBAttributionLink {
+  id               String           @id @default(uuid())
+  businessId       String
+  business         Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  gmbId            String
+  googleMyBusiness GoogleMyBusiness @relation(fields: [gmbId], references: [id], onDelete: Cascade)
+
+  surface        String
+  destinationUrl String
+  taggedUrl      String
+  campaign       String
+  content        String?
+  createdAt      DateTime @default(now())
+
+  @@index([businessId, surface])
+  @@index([gmbId, surface])
+}
+
+model GMBAlert {
+  id               String           @id @default(uuid())
+  businessId       String
+  business         Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  gmbId            String
+  googleMyBusiness GoogleMyBusiness @relation(fields: [gmbId], references: [id], onDelete: Cascade)
+
+  alertType   String
+  title       String
+  description String?
+  severity    String    @default("medium")
+  status      String    @default("OPEN") // OPEN | RESOLVED | DISMISSED
+  payloadJson Json?
+  createdAt   DateTime  @default(now())
+  resolvedAt  DateTime?
+
+  @@index([businessId, status])
+  @@index([gmbId, status])
+  @@index([alertType])
+}
+
+/// Structured weekly business hours. Replaces unstructured hoursJson blob.
+/// Drives hour-completeness health checks and DST-safe display. Multi-segment
+/// support (e.g., lunch break) via segmentOrder.
+model GMBBusinessHours {
+  id               String           @id @default(uuid())
+  businessId       String
+  business         Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  gmbId            String
+  googleMyBusiness GoogleMyBusiness @relation(fields: [gmbId], references: [id], onDelete: Cascade)
+
+  dayOfWeek    Int // 0 = Sunday ... 6 = Saturday
+  openTime     String? // "HH:mm" 24h - null when closed/24h
+  closeTime    String? // "HH:mm" 24h - null when closed/24h
+  isClosed     Boolean @default(false) // Explicit "closed all day" - distinct from "no hours set"
+  is24Hours    Boolean @default(false) // Open continuously
+  segmentOrder Int     @default(0) // 0 = primary segment, 1 = afternoon segment (split hours)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([businessId, dayOfWeek, segmentOrder])
+  @@index([gmbId])
+}
+
+/// Special / holiday hours overrides for specific dates.
+model GMBSpecialHours {
+  id               String           @id @default(uuid())
+  businessId       String
+  business         Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  gmbId            String
+  googleMyBusiness GoogleMyBusiness @relation(fields: [gmbId], references: [id], onDelete: Cascade)
+
+  date      DateTime // Date this override applies to (YYYY-MM-DD at 00:00 UTC for storage simplicity)
+  openTime  String? // "HH:mm" 24h
+  closeTime String? // "HH:mm" 24h
+  isClosed  Boolean  @default(false)
+  is24Hours Boolean  @default(false)
+  label     String? // "Christmas Day", "Memorial Day" - free-text label for UI/UX
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([businessId, date])
+  @@index([gmbId, date])
+}
+
+/// Business's chosen GMB categories. Primary + up to 9 secondary per GBP rules.
+/// categoryId references the static taxonomy in src/lib/data/gmb-categories.json
+/// (e.g., "gcid:plumber"). displayName cached for UI to avoid catalog lookups.
+model GMBCategory {
+  id               String           @id @default(uuid())
+  businessId       String
+  business         Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  gmbId            String
+  googleMyBusiness GoogleMyBusiness @relation(fields: [gmbId], references: [id], onDelete: Cascade)
+
+  categoryId  String // Official GBP category id, e.g. "gcid:plumber"
+  displayName String // Cached human-readable name from catalog
+  isPrimary   Boolean @default(false) // Exactly one primary per business expected
+  order       Int     @default(0) // Display ordering for secondary categories
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([businessId, categoryId])
+  @@index([gmbId])
+  @@index([businessId, isPrimary])
+}
+
+/// Business attribute values (e.g., wheelchair_accessible_entrance, has_wifi,
+/// payment methods). Attribute definitions live in src/lib/data/gmb-attributes.json.
+/// Value is stored in the column matching the attribute's valueType.
+model GMBAttribute {
+  id               String           @id @default(uuid())
+  businessId       String
+  business         Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  gmbId            String
+  googleMyBusiness GoogleMyBusiness @relation(fields: [gmbId], references: [id], onDelete: Cascade)
+
+  attributeId String // Official GBP attribute id, e.g. "has_wheelchair_accessible_entrance"
+  displayName String // Cached human label from catalog
+  valueType   String // BOOL | ENUM | URL | REPEATED_ENUM
+  boolValue   Boolean? // populated when valueType = BOOL
+  enumValue   String? // populated when valueType = ENUM (single selection)
+  urlValue    String? // populated when valueType = URL
+  enumValues  String[] // populated when valueType = REPEATED_ENUM (multi-select)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([businessId, attributeId])
+  @@index([gmbId])
+}
+
+/// BusinessPhoto (D14) — customer-uploaded real photos. Used as preferred
+/// image source for service-page archetype blogs when present (AI-generated
+/// images fall back to the role of gap-filler). Drives meaningful E-E-A-T
+/// improvement for local businesses.
+enum BusinessPhotoCategory {
+  EXTERIOR
+  INTERIOR
+  TEAM
+  PRODUCT
+  WORK_SAMPLE
+  OTHER
+}
+
+model BusinessPhoto {
+  id             String                @id @default(uuid())
+  businessId     String
+  business       Business              @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  url            String // Cloudinary delivery URL
+  altText        String?
+  category       BusinessPhotoCategory @default(OTHER)
+  order          Int                   @default(0)
+  width          Int?
+  height         Int?
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+  gmbMediaAssets GMBMediaAsset[]
+
+  @@index([businessId, order])
+  @@index([businessId, category])
+}
+
+/// ServiceAreaGeoHint (D12) — lightweight per-service-city geocoding. Each
+/// row is a city the business serves but doesn't have a physical location in.
+/// Stores only coordinates + canonical city/state/country; no landmarks, no
+/// Place ID collision worries — city centroids are permanent. Used by the
+/// blog generator when a blog targets a service-area keyword ("plumber
+/// Mississauga") so the prompt can reference verified city-level geography.
+model ServiceAreaGeoHint {
+  id               String   @id @default(uuid())
+  businessId       String
+  business         Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  cityName         String // user-provided city name (preserved for display)
+  canonicalCity    String? // normalized city name from Places API
+  state            String?
+  countryCode      String? // ISO-3166 alpha-2
+  latitude         Float?
+  longitude        Float?
+  placeId          String? // locality-level Place ID, not business-level
+  resolved         Boolean  @default(false)
+  lastResolveError String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([businessId, cityName])
+  @@index([businessId])
+  @@index([canonicalCity])
+}
+
+/// BusinessGeoProfile — canonical location data derived from Google Maps Places
+/// API (New) v1. One-to-one with Business. Permanent fields (placeId,
+/// coordinates, addressComponents) cached indefinitely per Google ToS;
+/// ephemeral POI data (nearbyLandmarksJson) refreshed every 30 days by the
+/// businessGeoPoiRefresh cron. Quality fields populate without Maps calls.
+model BusinessGeoProfile {
+  id         String   @id @default(uuid())
+  businessId String   @unique
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  // --- Permanent (indefinite cache allowed per Google ToS) ---
+  placeId           String? @unique
+  formattedAddress  String?
+  latitude          Float?
+  longitude         Float?
+  plusCode          String?
+  googleMapsUri     String?
+  addressComponents Json?
+  streetNumber      String?
+  route             String?
+  neighborhood      String? // sublocality_level_1
+  locality          String? // city
+  adminArea2        String? // metro/county
+  adminArea1        String? // state/province
+  postalCode        String?
+  countryCode       String? // ISO-3166 alpha-2
+  viewportJson      Json?
+
+  // --- Resolution state ---
+  resolutionSource     String @default("user_confirmed") // user_confirmed | gmb_sync | auto | manual
+  resolutionConfidence Float?
+  alternateCandidates  Json?
+
+  // --- Ephemeral (30-day TTL per Google ToS) ---
+  nearbyLandmarksJson Json?
+  areaPOIsJson        Json?
+  poisRefreshedAt     DateTime?
+  poisTTLDays         Int       @default(30)
+
+  // --- Quality / status (computed without Maps calls; used for dashboard nudge) ---
+  qualityScore    Int      @default(0)
+  missingFields   String[]
+  recommendations Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([placeId])
+  @@index([countryCode, locality])
+  @@index([poisRefreshedAt])
+}
+
+model GMBPost {
+  id               String           @id @default(uuid())
+  gmbId            String
+  googleMyBusiness GoogleMyBusiness @relation(fields: [gmbId], references: [id], onDelete: Cascade)
+
+  // Post content
+  postId       String? // GMB post ID
+  postType     String // "UPDATE", "EVENT", "OFFER", "PRODUCT"
+  title        String?
+  summary      String?
+  callToAction String?
+  mediaUrls    String[] // Image/video URLs
+
+  // Status
+  status      String    @default("DRAFT") // DRAFT, PUBLISHED, FAILED
+  publishedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model GMBReview {
+  id               String           @id @default(uuid())
+  gmbId            String
+  googleMyBusiness GoogleMyBusiness @relation(fields: [gmbId], references: [id], onDelete: Cascade)
+
+  // Review details
+  reviewId      String   @unique // GMB review ID
+  reviewerName  String
+  reviewerPhoto String?
+  rating        Int // 1-5 stars
+  comment       String?
+  reviewDate    DateTime
+
+  // Response
+  response     String?
+  responseDate DateTime?
+  isResponded  Boolean   @default(false)
+
+  // AI-generated response cache
+  aiResponse GMBAIReviewResponse?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([gmbId, reviewDate])
+}
+
+model GMBAISuggestion {
+  id         String   @id @default(uuid())
+  businessId String   @unique
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  suggestions         Json
+  profileCompleteness Int
+
+  generatedAt DateTime @default(now())
+  expiresAt   DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([expiresAt])
+}
+
+// Persistent cache for AI-generated GBP profile proposals. Proposal output is
+// keyed by the SHA-256 hash of the input fields (business name, type,
+// description, services, location, etc.) so identical inputs always produce
+// identical output without hitting the LLM. Survives deploys (unlike the
+// in-process map). When a business edits its profile, the input hash
+// changes and the next read regenerates.
+model GMBProfileProposalCache {
+  id         String   @id @default(uuid())
+  businessId String   @unique
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  inputHash    String
+  proposalJson Json
+
+  generatedAt DateTime @default(now())
+  expiresAt   DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([inputHash])
+  @@index([expiresAt])
+}
+
+// Cache for Google's businessInformation categories.list resolutions. Maps a
+// (regionCode, normalized displayName) pair to the resolved categories/gcid:*
+// resource ID. Google's category taxonomy is stable for weeks, so a 30-day
+// TTL is plenty. Used by the runtime category resolver as a layer between
+// the static map and the live API call.
+model GMBCategoryCacheEntry {
+  id         String    @id @default(uuid())
+  businessId String?
+  business   Business? @relation(fields: [businessId], references: [id], onDelete: SetNull)
+
+  // Normalized lookup key — lowercase displayName (no punctuation) joined
+  // with the regionCode and languageCode used at lookup time.
+  cacheKey String @unique
+
+  regionCode   String
+  languageCode String
+  displayName  String
+  // Resolved Google resource ID, or null when Google returned no match.
+  // Storing null lets us cache misses too without re-hammering the API.
+  resourceId   String?
+
+  generatedAt DateTime @default(now())
+  expiresAt   DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([expiresAt])
+  @@index([businessId])
+}
+
+model GMBAIReviewResponse {
+  id        String    @id @default(uuid())
+  reviewId  String    @unique
+  gmbReview GMBReview @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+
+  response String  @db.Text
+  intent   String?
+
+  generatedAt DateTime @default(now())
+  expiresAt   DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([expiresAt])
+}
+
+enum GMBPostSuggestionStatus {
+  PENDING
+  SCHEDULED
+  PUBLISHED
+  DISMISSED
+}
+
+model GMBPostSuggestion {
+  id         String   @id @default(uuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  blogId     String?
+  blog       Blog?    @relation(fields: [blogId], references: [id], onDelete: SetNull)
+  keywordId  String?
+
+  postType     String
+  title        String
+  summary      String  @db.Text
+  callToAction String?
+  mediaUrls    Json    @default("[]")
+
+  status                 GMBPostSuggestionStatus @default(PENDING)
+  scheduledAt            DateTime?
+  publishedAt            DateTime?
+  gmbPostId              String?
+  approvalEmailClaimedAt DateTime?
+  approvalEmailSentAt    DateTime?
+
+  generatedAt DateTime @default(now())
+  expiresAt   DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([businessId])
+  @@index([blogId])
+  @@index([status])
+  @@index([expiresAt])
+}
+
+model GMBReviewAnalysis {
+  id         String   @id @default(uuid())
+  businessId String   @unique
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  sentimentSummary     Json
+  commonThemes         Json
+  businessInsights     Json
+  totalReviewsAnalyzed Int
+  averageRating        Float
+
+  generatedAt DateTime @default(now())
+  expiresAt   DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([expiresAt])
+}
+
+model Backlinks {
+  id                 String   @id @default(uuid())
+  sourceBlogId       String?
+  sourceBlogUrl      String
+  sourceBusinessId   String
+  referredBlogUrl    String
+  referredBusinessId String
+  sourceBlog         Blog?    @relation("SourceBlogBacklinks", fields: [sourceBlogId], references: [id], onDelete: SetNull)
+  business           Business @relation(fields: [referredBusinessId], references: [id], onDelete: Cascade)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@unique([sourceBlogId, referredBusinessId, referredBlogUrl])
+  @@index([sourceBlogId])
+  @@index([sourceBusinessId])
+  @@index([referredBusinessId])
+}
+
+// ============================================
+// External Backlinks Models - DataForSEO Integration
+// ============================================
+
+model ExternalBacklink {
+  id         String   @id @default(uuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  // Target information
+  targetUrl    String // URL being analyzed
+  targetDomain String // Domain being analyzed
+
+  // Source information (from DataForSEO)
+  sourceUrl        String // URL where backlink is found
+  sourceDomain     String // Domain where backlink originates
+  sourceDomainRank Int? // Domain authority/rank
+  sourceDomainType String? // "root_domain", "subdomain", etc.
+
+  // Link attributes
+  anchorText   String? // Anchor text used
+  anchorType   String? // "exact", "partial", "branded", "generic"
+  linkType     String? // "dofollow", "nofollow", "sponsored", "ugc"
+  linkPosition String? // "footer", "header", "content", "sidebar"
+
+  // Quality metrics
+  domainAuthority Float? // Domain authority score (0-100)
+  pageAuthority   Float? // Page authority score (0-100)
+  spamScore       Float? // Spam score (0-100, lower is better)
+  trustScore      Float? // Trust score
+  citationFlow    Float? // Citation flow metric
+  trustFlow       Float? // Trust flow metric
+
+  // DataForSEO metadata
+  backlinkId String? // DataForSEO backlink ID
+  firstSeen  DateTime? // When backlink was first discovered
+  lastSeen   DateTime? // When backlink was last seen
+  lostAt     DateTime? // When backlink was lost (if applicable)
+  isLost     Boolean   @default(false)
+
+  // Status
+  status      String  @default("active") // "active", "lost", "new", "reviewed"
+  isReviewed  Boolean @default(false)
+  reviewNotes String?
+
+  // Timestamps
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  lastSyncedAt DateTime? // Last time synced from DataForSEO
+
+  @@unique([businessId, sourceUrl, targetUrl])
+  @@index([businessId])
+  @@index([targetDomain])
+  @@index([sourceDomain])
+  @@index([status])
+  @@index([isLost])
+  @@index([targetUrl])
+  @@index([sourceUrl])
+}
+
+model ExternalBacklinkSummary {
+  id         String   @id @default(uuid())
+  businessId String   @unique
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  // Overall metrics
+  totalBacklinks        Int @default(0)
+  totalReferringDomains Int @default(0)
+  totalReferringIps     Int @default(0)
+
+  // Quality distribution
+  dofollowBacklinks  Int @default(0)
+  nofollowBacklinks  Int @default(0)
+  sponsoredBacklinks Int @default(0)
+  ugcBacklinks       Int @default(0)
+
+  // Authority metrics
+  averageDomainAuthority Float?
+  averagePageAuthority   Float?
+  averageSpamScore       Float?
+  averageTrustScore      Float?
+
+  // Growth metrics
+  newBacklinksThisMonth  Int    @default(0)
+  lostBacklinksThisMonth Int    @default(0)
+  growthRate             Float? // Percentage growth
+
+  // Last sync
+  lastSyncedAt DateTime?
+  syncStatus   String    @default("pending") // "pending", "syncing", "completed", "failed"
+  syncError    String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model ExternalReferringDomain {
+  id         String   @id @default(uuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  domain          String
+  domainAuthority Float?
+  domainRank      Int?
+  domainType      String? // "root_domain", "subdomain"
+
+  // Backlink counts
+  totalBacklinks    Int @default(0)
+  dofollowBacklinks Int @default(0)
+  nofollowBacklinks Int @default(0)
+
+  // Quality scores
+  spamScore    Float?
+  trustScore   Float?
+  citationFlow Float?
+  trustFlow    Float?
+
+  // First/last seen
+  firstSeen DateTime?
+  lastSeen  DateTime?
+
+  // DataForSEO metadata
+  domainId String? // DataForSEO domain ID
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([businessId, domain])
+  @@index([businessId])
+  @@index([domain])
+}
+
+model ExternalBacklinkAnchor {
+  id         String   @id @default(uuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  anchorText String
+  anchorType String? // "exact", "partial", "branded", "generic"
+
+  // Occurrences
+  occurrenceCount       Int @default(0)
+  referringDomainsCount Int @default(0)
+
+  // Quality indicators
+  averageDomainAuthority Float?
+  averagePageAuthority   Float?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([businessId, anchorText])
+  @@index([businessId])
+  @@index([anchorText])
+}
+
+model BrandAnalysis {
+  id         String   @id @default(uuid())
+  businessId String   @unique
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  primaryColors   String[]
+  secondaryColors String[]
+  fontFamily      String?
+
+  // Logo information
+  logoUrl     String?
+  logoAltText String?
+  faviconUrl  String?
+
+  referenceImageUrl String?
+  lastAnalyzed      DateTime @default(now())
+  analysisVersion   String   @default("3.0")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model GeneratedImage {
+  id     String  @id @default(uuid())
+  blogId String?
+  blog   Blog?   @relation(fields: [blogId], references: [id], onDelete: Cascade)
+
+  imageUrl    String
+  imageType   String
+  prompt      String
+  brandData   Json
+  generatedAt DateTime @default(now())
+  isActive    Boolean  @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum SocialCreativeRunStatus {
+  PENDING
+  PLANNING
+  RENDERING
+  COMPLETE
+  FAILED
+  CANCELLED
+}
+
+enum SocialCreativeAssetStatus {
+  PENDING
+  RENDERING
+  COMPLETE
+  FAILED
+}
+
+enum SocialPostStatus {
+  DRAFT
+  SCHEDULED
+  PUBLISHED
+  FAILED
+}
+
+// Legacy social scout output retained for data compatibility. New generation
+// writes to SocialCreativeRun, SocialCreativePost, and SocialCreativeAsset.
+model SocialPost {
+  id String @id @default(uuid())
+
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  runId      String?
+  scoutRunId String?
+  externalId String?
+
+  kind        String?
+  hookText    String?
+  imageStyle  String?
+  imagePrompt String?
+  imageUrl    String?
+  variants    Json
+
+  status   SocialPostStatus @default(DRAFT)
+  position Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([runId, externalId])
+  @@index([businessId])
+  @@index([userId])
+  @@index([runId])
+  @@map("social_post")
+}
+
+enum WebsitePlanTier {
+  SEO
+  SEO_SOCIAL
+}
+
+enum SocialTopicPlanStatus {
+  PLANNED
+  CLAIMED
+  GENERATING
+  READY
+  FAILED
+  SKIPPED
+  CANCELLED
+}
+
+enum SocialTopicPlanSource {
+  ONBOARDING
+  INITIAL
+  ROLLING
+  MANUAL
+}
+
+enum SocialCreativeReferenceScope {
+  ALWAYS
+  PROMOTION
+}
+
+enum SocialLogoUsageMode {
+  RECOMMENDED
+  ALWAYS
+}
+
+model SocialAutomationSettings {
+  id                      String              @id @default(uuid())
+  businessId              String              @unique
+  business                Business            @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  enabled                 Boolean             @default(false)
+  cadencePerWeek          Int                 @default(7)
+  platforms               String[]            @default(["instagram", "facebook", "linkedin", "x"])
+  timezone                String              @default("UTC")
+  generationLeadHours     Int                 @default(24)
+  approvalRequired        Boolean             @default(false)
+  logoUsageMode           SocialLogoUsageMode @default(RECOMMENDED)
+  carouselEnabled         Boolean             @default(true)
+  strategy                Json?
+  plannerModel            String?
+  plannerVersion          String?
+  initialPlanStatus       String              @default("not_started")
+  initialPlanQueuedAt     DateTime?
+  initialPlanStartedAt    DateTime?
+  initialPlanGeneratedAt  DateTime?
+  initialPlanErrorCode    String?
+  initialPlanErrorMessage String?
+  plannedThrough          DateTime?
+  nextPlanningAt          DateTime?
+  createdAt               DateTime            @default(now())
+  updatedAt               DateTime            @updatedAt
+
+  @@index([enabled, nextPlanningAt])
+  @@index([initialPlanStatus, updatedAt])
+  @@map("social_automation_settings")
+}
+
+model SocialLogoWeekAssignment {
+  id                String             @id @default(uuid())
+  businessId        String
+  business          Business           @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  weekStart         String
+  timezone          String
+  selectedLocalDate String
+  claimedRunId      String?            @unique
+  claimedRun        SocialCreativeRun? @relation("SocialLogoWeekClaim", fields: [claimedRunId], references: [id], onDelete: SetNull)
+  claimedAt         DateTime?
+  generatedAt       DateTime?
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+
+  @@unique([businessId, weekStart])
+  @@index([businessId, selectedLocalDate])
+  @@map("social_logo_week_assignment")
+}
+
+model SocialCarouselWeekAssignment {
+  id                  String             @id @default(uuid())
+  businessId          String
+  business            Business           @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  weekStart           String
+  timezone            String
+  status              String             @default("PLANNING") // PLANNING | SELECTED | FAILED
+  selectedTopicPlanId String?            @unique
+  selectedTopicPlan   SocialTopicPlan?   @relation(fields: [selectedTopicPlanId], references: [id], onDelete: SetNull)
+  selectedLocalDate   String?
+  selection           Json?
+  model               String
+  promptVersion       String
+  responseId          String?            @unique
+  inputTokens         Int?
+  outputTokens        Int?
+  totalTokens         Int?
+  estimatedUsd        Decimal?           @db.Decimal(14, 6)
+  claimedRunId        String?            @unique
+  claimedRun          SocialCreativeRun? @relation("SocialCarouselWeekClaim", fields: [claimedRunId], references: [id], onDelete: SetNull)
+  failureCode         String?
+  failureMessage      String?
+  startedAt           DateTime           @default(now())
+  completedAt         DateTime?
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @updatedAt
+
+  @@unique([businessId, weekStart])
+  @@index([businessId, status, selectedLocalDate])
+  @@map("social_carousel_week_assignment")
+}
+
+model SocialPromotionCampaign {
+  id                     String   @id @default(uuid())
+  businessId             String   @unique
+  business               Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  enabled                Boolean  @default(false)
+  title                  String?
+  information            String?  @db.Text
+  preferredContent       String?  @db.Text
+  startsOn               String?
+  endsOn                 String?
+  imageUrl               String?
+  imageName              String?
+  imageMimeType          String?
+  imageSizeBytes         Int?
+  imageWidth             Int?
+  imageHeight            Int?
+  imageChecksumSha256    String?
+  documentName           String?
+  documentMimeType       String?
+  documentSizeBytes      Int?
+  documentChecksumSha256 String?
+  documentText           String?  @db.Text
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  @@index([enabled, startsOn, endsOn])
+  @@map("social_promotion_campaign")
+}
+
+model SocialCreativeReferenceImage {
+  id             String                       @id @default(uuid())
+  businessId     String
+  business       Business                     @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  scope          SocialCreativeReferenceScope
+  url            String
+  name           String?
+  mimeType       String?
+  sizeBytes      Int?
+  width          Int?
+  height         Int?
+  checksumSha256 String
+  createdAt      DateTime                     @default(now())
+  updatedAt      DateTime                     @updatedAt
+
+  @@unique([businessId, scope, checksumSha256], map: "social_ref_image_business_scope_checksum_key")
+  @@index([businessId, scope, createdAt], map: "social_ref_image_business_scope_created_idx")
+  @@map("social_creative_reference_image")
+}
+
+model SocialTopicPlan {
+  id                     String                        @id @default(uuid())
+  idempotencyKey         String                        @unique
+  userId                 String
+  user                   User                          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businessId             String
+  business               Business                      @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  topic                  String
+  contentPillar          String?
+  objective              String
+  hook                   String?
+  cta                    String?
+  contentType            String?
+  platforms              String[]                      @default(["instagram", "facebook", "linkedin", "x"])
+  scheduledFor           DateTime
+  timezone               String                        @default("UTC")
+  status                 SocialTopicPlanStatus         @default(PLANNED)
+  source                 SocialTopicPlanSource
+  sourceSeoPlanId        String?
+  sourceSeoPlan          Plan?                         @relation(fields: [sourceSeoPlanId], references: [id], onDelete: SetNull)
+  plannerModel           String
+  plannerVersion         String
+  promptVersion          String
+  failureCode            String?
+  failureMessage         String?
+  claimedAt              DateTime?
+  generatedAt            DateTime?
+  createdAt              DateTime                      @default(now())
+  updatedAt              DateTime                      @updatedAt
+  creativeRun            SocialCreativeRun?
+  carouselWeekAssignment SocialCarouselWeekAssignment?
+
+  @@index([businessId, status, scheduledFor])
+  @@index([userId, scheduledFor])
+  @@map("social_topic_plan")
+}
+
+model SocialCreativeRun {
+  id                     String                        @id @default(uuid())
+  idempotencyKey         String                        @unique
+  userId                 String
+  user                   User                          @relation("SocialCreativeRunsUser", fields: [userId], references: [id], onDelete: Cascade)
+  businessId             String
+  business               Business                      @relation("SocialCreativeRunsBusiness", fields: [businessId], references: [id], onDelete: Cascade)
+  source                 String
+  kind                   String
+  topic                  String
+  sourceBlogId           String?
+  sourceBlog             Blog?                         @relation("SocialCreativeRunsBlog", fields: [sourceBlogId], references: [id], onDelete: SetNull)
+  sourcePlanId           String?
+  sourcePlan             Plan?                         @relation("SocialCreativeRunsPlan", fields: [sourcePlanId], references: [id], onDelete: SetNull)
+  socialTopicPlanId      String?                       @unique
+  socialTopicPlan        SocialTopicPlan?              @relation(fields: [socialTopicPlanId], references: [id], onDelete: SetNull)
+  status                 SocialCreativeRunStatus       @default(PENDING)
+  language               String?
+  locale                 String?
+  requestedPlatforms     String[]                      @default([])
+  plannedSlides          Int                           @default(1)
+  pipelineVersion        String
+  promptVersion          String
+  textModel              String
+  imageModel             String
+  imageQuality           String
+  contentPlan            Json?
+  estimatedBudgetUsd     Decimal?                      @db.Decimal(14, 6)
+  actualCostUsd          Decimal?                      @db.Decimal(14, 6)
+  correlationId          String                        @unique
+  errorCode              String?
+  errorMessage           String?
+  failureStage           String?
+  startedAt              DateTime?
+  completedAt            DateTime?
+  approvalEmailClaimedAt DateTime?
+  approvalEmailSentAt    DateTime?
+  createdAt              DateTime                      @default(now())
+  updatedAt              DateTime                      @updatedAt
+  posts                  SocialCreativePost[]
+  publishAttempts        SocialPublishAttempt[]
+  logoWeekAssignment     SocialLogoWeekAssignment?     @relation("SocialLogoWeekClaim")
+  carouselWeekAssignment SocialCarouselWeekAssignment? @relation("SocialCarouselWeekClaim")
+
+  @@index([businessId, createdAt])
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+  @@index([sourceBlogId])
+  @@index([sourcePlanId])
+  @@map("social_creative_run")
+}
+
+model SocialCreativePost {
+  id                String                @id @default(uuid())
+  runId             String
+  run               SocialCreativeRun     @relation(fields: [runId], references: [id], onDelete: Cascade)
+  businessId        String
+  business          Business              @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  slideIndex        Int
+  topic             String
+  headline          String
+  supportingLine    String?
+  cta               String?
+  caption           String                @db.Text
+  language          String
+  locale            String
+  campaignObjective String
+  archetype         String
+  layoutFamily      String
+  visualConcept     String                @db.Text
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+  assets            SocialCreativeAsset[]
+
+  @@unique([runId, slideIndex])
+  @@index([businessId, createdAt])
+  @@map("social_creative_post")
+}
+
+model SocialCreativeAsset {
+  id                     String                      @id @default(uuid())
+  postId                 String
+  post                   SocialCreativePost          @relation(fields: [postId], references: [id], onDelete: Cascade)
+  platform               String
+  slideIndex             Int
+  status                 SocialCreativeAssetStatus   @default(PENDING)
+  width                  Int
+  height                 Int
+  aspectRatio            String
+  sourceSize             String
+  imageUrl               String?
+  provider               String                      @default("openai")
+  model                  String
+  quality                String
+  renderMode             String                      @default("provider-direct")
+  pipelineVersion        String                      @default("website-campaign-direct-v1")
+  promptVersion          String                      @default("website-campaign-v1")
+  prompt                 String                      @db.Text
+  providerRequestId      String?
+  providerArtifactSha256 String?
+  providerArtifactUrl    String?
+  finalArtifactSha256    String?
+  estimatedUsd           Decimal?                    @db.Decimal(14, 6)
+  actualUsd              Decimal?                    @db.Decimal(14, 6)
+  cloudinaryPublicId     String?
+  cloudinaryAccount      String?
+  uploadMetadata         Json?
+  qualityResult          Json?
+  compositorDiagnostics  Json?
+  errorCode              String?
+  errorMessage           String?
+  failureStage           String?
+  attemptCount           Int                         @default(0)
+  startedAt              DateTime?
+  completedAt            DateTime?
+  createdAt              DateTime                    @default(now())
+  updatedAt              DateTime                    @updatedAt
+  publishAttempts        SocialPublishAttempt[]
+  publishAttemptMedia    SocialPublishAttemptMedia[]
+
+  @@unique([postId, platform, slideIndex])
+  @@index([status, createdAt])
+  @@index([providerRequestId])
+  @@map("social_creative_asset")
+}
+
+// Zernio is the server-side social account and publishing provider. A profile
+// is scoped to exactly one Uplift website so provider account IDs can never be
+// used across tenants without first passing the Business ownership boundary.
+model SocialPublisherProfile {
+  id                String                   @id @default(uuid())
+  businessId        String                   @unique
+  business          Business                 @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  provider          String                   @default("zernio")
+  externalProfileId String?                  @unique
+  status            String                   @default("PROVISIONING") // PROVISIONING | READY | ERROR
+  lastErrorCode     String?
+  lastErrorMessage  String?
+  lastSyncedAt      DateTime?
+  createdAt         DateTime                 @default(now())
+  updatedAt         DateTime                 @updatedAt
+  accounts          SocialPublisherAccount[]
+
+  @@index([status, updatedAt])
+  @@map("social_publisher_profile")
+}
+
+model SocialPublisherAccount {
+  id                String                 @id @default(uuid())
+  profileId         String
+  profile           SocialPublisherProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  businessId        String
+  business          Business               @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  provider          String                 @default("zernio")
+  externalAccountId String                 @unique
+  platform          String
+  providerPlatform  String
+  username          String?
+  displayName       String?
+  profileUrl        String?
+  avatarUrl         String?
+  isActive          Boolean                @default(true)
+  isDefault         Boolean                @default(false)
+  connectedAt       DateTime               @default(now())
+  disconnectedAt    DateTime?
+  lastSyncedAt      DateTime               @default(now())
+  createdAt         DateTime               @default(now())
+  updatedAt         DateTime               @updatedAt
+  publishAttempts   SocialPublishAttempt[]
+
+  @@index([businessId, platform, isActive])
+  @@index([profileId, platform])
+  @@map("social_publisher_account")
+}
+
+model SocialPublishAttempt {
+  id                 String                      @id @default(uuid())
+  idempotencyKey     String                      @unique
+  requestId          String                      @unique
+  businessId         String
+  business           Business                    @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  runId              String
+  run                SocialCreativeRun           @relation(fields: [runId], references: [id], onDelete: Cascade)
+  assetId            String?
+  asset              SocialCreativeAsset?        @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  publisherAccountId String
+  publisherAccount   SocialPublisherAccount      @relation(fields: [publisherAccountId], references: [id], onDelete: Restrict)
+  provider           String                      @default("zernio")
+  platform           String
+  mode               String // NOW | SCHEDULE
+  status             String                      @default("PENDING") // PENDING | SUBMITTING | SCHEDULED | PUBLISHED | FAILED | CANCELLED
+  scheduledFor       DateTime?
+  timezone           String                      @default("UTC")
+  caption            String                      @db.Text
+  hashtags           String[]                    @default([])
+  mediaUrl           String?
+  contentHash        String
+  externalPostId     String?
+  externalStatus     String?
+  externalPostUrl    String?
+  lastErrorCode      String?
+  lastErrorMessage   String?
+  attemptCount       Int                         @default(0)
+  submittedAt        DateTime?
+  publishedAt        DateTime?
+  createdAt          DateTime                    @default(now())
+  updatedAt          DateTime                    @updatedAt
+  mediaItems         SocialPublishAttemptMedia[]
+
+  @@index([businessId, status, createdAt])
+  @@index([runId, status])
+  @@index([externalPostId])
+  @@index([publisherAccountId, status])
+  @@map("social_publish_attempt")
+}
+
+model SocialPublishAttemptMedia {
+  id        String               @id @default(uuid())
+  attemptId String
+  attempt   SocialPublishAttempt @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+  assetId   String
+  asset     SocialCreativeAsset  @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  position  Int
+  mediaUrl  String
+  createdAt DateTime             @default(now())
+
+  @@unique([attemptId, position])
+  @@unique([attemptId, assetId])
+  @@index([assetId])
+  @@map("social_publish_attempt_media")
+}
+
+model ZernioWebhookEvent {
+  id              String    @id @default(uuid())
+  externalEventId String    @unique
+  eventType       String
+  payloadHash     String
+  status          String    @default("RECEIVED") // RECEIVED | PROCESSED | IGNORED | FAILED
+  errorMessage    String?
+  processedAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([status, createdAt])
+  @@map("zernio_webhook_event")
+}
+
+model BlogImage {
+  id         String   @id @default(uuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  imageUrl    String
+  imageAlt    String?
+  blogUrl     String?
+  blogTitle   String?
+  imageType   String?
+  width       Int?
+  height      Int?
+  isSelected  Boolean  @default(false)
+  source      String   @default("scraped") // "scraped" | "manual"
+  uploadedBy  String? // userId who uploaded (for manual uploads)
+  extractedAt DateTime @default(now())
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([businessId])
+  @@index([isSelected])
+  @@index([blogUrl])
+  @@index([source])
+}
+
+// ============================================
+// Guest Posting Models
+// ============================================
+
+model GuestPostPublisher {
+  id     String @id @default(uuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Publisher Info
+  name       String
+  websiteUrl String
+  domain     String
+  niche      String? // e.g., "SEO", "Marketing", "Tech"
+
+  // Metrics (from DataForSEO or manual entry)
+  domainAuthority Int? // DA score (0-100)
+  domainRank      Int? // DR score
+  monthlyTraffic  Int? // Estimated monthly visitors
+  spamScore       Int? // 0-100 (lower is better)
+
+  // Contact Info
+  contactEmail         String?
+  contactName          String?
+  submissionUrl        String?
+  submissionGuidelines String?
+  acceptedFormats      String[] // ["HTML", "Markdown", "Word"]
+
+  // Guest Post Requirements
+  minWordCount     Int? // Minimum words required
+  maxWordCount     Int? // Maximum words allowed
+  requiresPayment  Boolean  @default(false)
+  priceRange       String? // e.g., "$50-$150"
+  acceptsLinks     Boolean  @default(true)
+  maxLinksPerPost  Int? // Maximum backlinks allowed
+  linkTypesAllowed String[] // ["dofollow", "nofollow", "sponsored"]
+
+  // Status
+  isActive       Boolean   @default(true)
+  responseTime   String? // e.g., "2-3 days", "1 week"
+  acceptanceRate Float? // 0-1 (percentage)
+  isSuggested    Boolean   @default(false) // Whether this is a new suggestion from auto-discovery
+  suggestedAt    DateTime? // When this publisher was suggested to the user
+
+  // Metadata
+  source        String  @default("MANUAL") // "MANUAL" | "MARKETPLACE" | "COMPETITOR_ANALYSIS" | "REDDIT" | "MEDIUM" | "AI_DISCOVERED"
+  marketplaceId String? // ID from marketplace API
+  notes         String?
+
+  // Discovery Metadata
+  discoveryMetadata     Json? // Store discovery source data (Reddit post, Medium publication, etc.)
+  aiConfidenceScore     Float? // 0-1 score from AI analysis
+  aiExtractedGuidelines String? // Guidelines extracted by AI
+  lastDiscoveredAt      DateTime? // When this publisher was discovered
+  isVerified            Boolean   @default(false) // Whether publisher has been verified
+  verificationMethod    String? // "AI" | "MANUAL" | "SCRAPED"
+  qualityScore          Float?
+  qualityGateStatus     String    @default("PENDING") // "QUALIFIED" | "NEEDS_REVIEW" | "BLOCKED" | "PENDING"
+  qualityGateReasons    String[]  @default([])
+  complianceNotes       String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  submissions GuestPostSubmission[]
+
+  @@unique([userId, websiteUrl])
+  @@index([userId])
+  @@index([domain])
+  @@index([niche])
+  @@index([isActive])
+  @@index([domainAuthority])
+}
+
+model GuestPostCampaign {
+  id         String   @id @default(uuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  // Campaign Info
+  name           String // e.g., "Q1 2025 SEO Guest Posting"
+  description    String?
+  targetKeywords String[] // Keywords to target in guest posts
+
+  // Campaign Settings
+  targetNiche           String? // Target niche/industry
+  minDomainAuthority    Int? // Minimum DA filter
+  maxPublisherSpamScore Int?    @default(15) // Maximum spam score for high-authority automation
+  maxBudget             Float? // Maximum budget per post
+  targetLinks           Int     @default(10) // Target number of links
+  campaignTemplate      String  @default("STANDARD") // "STANDARD" | "HIGH_DR_GUEST_POSTING"
+
+  // Status
+  status    String    @default("DRAFT") // "DRAFT" | "ACTIVE" | "PAUSED" | "COMPLETED"
+  startDate DateTime?
+  endDate   DateTime?
+
+  // Metrics (auto-calculated)
+  totalPublishers Int @default(0)
+  submissionsSent Int @default(0)
+  accepted        Int @default(0)
+  published       Int @default(0)
+  rejected        Int @default(0)
+
+  // Budget Tracking
+  totalSpent Float @default(0)
+
+  // Automation Settings
+  autoCreateSubmissions     Boolean @default(false) // Auto-create submissions for matched publishers
+  autoGeneratePitch         Boolean @default(false) // Auto-generate pitch emails
+  autoSendPitch             Boolean @default(false) // Auto-send pitch emails after generation
+  autoApprovePublishers     Boolean @default(false) // Auto-approve suggested publishers
+  requireNicheMatch         Boolean @default(false)
+  requireVerifiedPublishers Boolean @default(false)
+
+  // Automation Schedule
+  autoPitchDelayHours  Int? @default(0) // Delay before auto-sending pitch (0 = immediate)
+  maxSubmissionsPerDay Int? @default(5) // Max submissions to create per day
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  submissions GuestPostSubmission[]
+
+  @@index([userId])
+  @@index([businessId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model GuestPostSubmission {
+  id          String             @id @default(uuid())
+  userId      String
+  user        User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  campaignId  String?
+  campaign    GuestPostCampaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  publisherId String
+  publisher   GuestPostPublisher @relation(fields: [publisherId], references: [id], onDelete: Cascade)
+  blogId      String? // Link to generated blog if applicable
+  blog        Blog?              @relation(fields: [blogId], references: [id], onDelete: SetNull)
+
+  // Submission Details
+  title         String
+  proposedTopic String?
+  pitchEmail    String?
+  customContent String? // If different from blog
+
+  // Status Tracking
+  status          String    @default("DRAFT") // "DRAFT" | "PITCHED" | "ACCEPTED" | "REJECTED" | "PUBLISHED" | "EXPIRED"
+  pitchSentAt     DateTime?
+  respondedAt     DateTime?
+  acceptedAt      DateTime?
+  publishedAt     DateTime?
+  rejectedAt      DateTime?
+  rejectionReason String?
+
+  // Email Tracking
+  emailSentAt       DateTime?
+  emailId           String? // Resend email ID
+  emailOpenedAt     DateTime?
+  emailClickedAt    DateTime?
+  emailRepliedAt    DateTime?
+  emailReplyContent String?
+  emailTrackingId   String? // For webhook matching
+
+  // Automation
+  autoGeneratedPitch Boolean   @default(false)
+  lastCheckedAt      DateTime? // For published post checking
+
+  // Quality + compliance snapshot at creation time
+  placementType      String   @default("EDITORIAL") // "EDITORIAL" | "SPONSORED" | "PAID"
+  requiredLinkRel    String   @default("none") // "none" | "nofollow" | "sponsored"
+  complianceStatus   String   @default("PENDING") // "PENDING" | "APPROVED" | "BLOCKED"
+  complianceNotes    String?
+  qualityScore       Float?
+  qualityGateReasons String[] @default([])
+
+  // Published Post Info
+  publishedUrl      String?
+  publishedTitle    String?
+  backlinksReceived String[] // URLs of backlinks received
+
+  // Cost
+  cost     Float?
+  currency String? @default("USD")
+
+  // Notes
+  internalNotes String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([campaignId])
+  @@index([publisherId])
+  @@index([status])
+  @@index([blogId])
+  @@index([publishedAt])
+  @@index([emailSentAt])
+  @@index([emailRepliedAt])
+  @@index([status, emailSentAt])
+  @@index([status, emailRepliedAt])
+}
+
+// ============================================
+// Platform-Wide Keyword Allocation Models
+// ============================================
+
+model PlatformKeywordAllocation {
+  id            String    @id @default(uuid())
+  keyword       String
+  normalizedKey String
+  industryId    String // Industry identifier (e.g., "restaurant", "plumbing", "web-development")
+  locationScope String // Location scope (e.g., "toronto", "canada", "global")
+  businessId    String
+  business      Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  userId        String
+  priority      Int       @default(1) // 1-10, higher = more important
+  allocatedAt   DateTime  @default(now())
+  expiresAt     DateTime? // Optional expiration for temporary allocations
+  status        String    @default("active") // "active", "expired", "released"
+  searchVolume  Int?
+  difficulty    Float?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@unique([normalizedKey, locationScope])
+  @@index([industryId])
+  @@index([locationScope])
+  @@index([businessId])
+  @@index([status])
+  @@index([userId])
+}
+
+model KeywordAlternative {
+  id                 String   @id @default(uuid())
+  primaryKeyword     String
+  alternativeKeyword String
+  industryId         String
+  similarityScore    Float // 0-1, how similar the keywords are
+  createdAt          DateTime @default(now())
+
+  @@index([primaryKeyword])
+  @@index([industryId])
+  @@index([alternativeKeyword])
+}
+
+// ============================================
+// Competitor Intelligence Models
+// ============================================
+
+model CompetitorIntelligence {
+  id               String   @id @default(uuid())
+  businessId       String
+  business         Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  competitorDomain String
+  competitorName   String?
+  rankingKeywords  String[] // Keywords this competitor ranks for
+  contentUrls      Json // URLs of competitor content (stored as JSON array)
+  contentTopics    String[] // Topics covered in competitor content
+  domainAuthority  Int?
+  totalKeywords    Int?
+  averagePosition  Float?
+  strengthAreas    String[] // Areas where competitor is strong
+  contentStrategy  Json? // LLM-analyzed content strategy
+  lastAnalyzedAt   DateTime @default(now())
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@unique([businessId, competitorDomain])
+  @@index([businessId])
+  @@index([competitorDomain])
+}
+
+model ServiceTaxonomy {
+  id                 String   @id @default(uuid())
+  businessId         String
+  business           Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  primaryService     String
+  subServices        Json // Array of sub-services (stored as JSON)
+  technologies       String[] // Technologies used
+  targetAudiences    String[] // Target customer segments
+  serviceDescription String?
+  industryContext    String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@unique([businessId, primaryService])
+  @@index([businessId])
+  @@index([primaryService])
+}
+
+model DynamicKnowledgeBase {
+  id                       String   @id @default(uuid())
+  businessId               String   @unique
+  business                 Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  serviceHierarchy         Json // Hierarchical breakdown of services
+  competitorInsights       Json // Insights from competitor analysis
+  contentGaps              Json // Content gaps identified
+  topicClusters            Json // Topic clusters for content strategy
+  keywordOpportunities     Json // High-opportunity keywords
+  contentTypeStrategy      Json // LLM-determined content type mix
+  totalCompetitorsAnalyzed Int      @default(0)
+  totalKeywordsDiscovered  Int      @default(0)
+  lastUpdatedAt            DateTime @default(now())
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+}
+
+model Session {
+  id            String    @id @default(uuid())
+  expiresAt     DateTime
+  token         String
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  ipAddress     String?
+  userAgent     String?
+  userId        String
+  surface       String    @default("dashboard")
+  mfaVerifiedAt DateTime?
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([token])
+  @@index([userId])
+  @@index([surface, userId])
+  @@map("session")
+}
+
+model Account {
+  id                    String    @id @default(uuid())
+  accountId             String
+  providerId            String
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@index([userId])
+  @@map("account")
+}
+
+model Verification {
+  id         String   @id @default(uuid())
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+  @@map("verification")
+}
+
+model TwoFactor {
+  id                      String    @id @default(uuid())
+  userId                  String    @unique
+  user                    User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  secret                  String
+  backupCodes             String
+  verified                Boolean   @default(true)
+  failedVerificationCount Int       @default(0)
+  lockedUntil             DateTime?
+
+  @@index([secret])
+  @@map("twoFactor")
+}
+
+model RateLimit {
+  id          String @id @default(uuid())
+  key         String @unique
+  count       Int
+  lastRequest BigInt
+
+  @@map("rateLimit")
+}
+
+// ============================================
+// API Token Model - For external API access
+// ============================================
+
+model ApiToken {
+  id         String   @id @default(uuid())
+  userId     String
+  user       User     @relation("ApiTokens", fields: [userId], references: [id], onDelete: Cascade)
+  businessId String
+  business   Business @relation("ApiTokens", fields: [businessId], references: [id], onDelete: Cascade)
+
+  name        String
+  token       String @unique
+  tokenPrefix String
+
+  permissions String[]
+
+  allowedOrigins String[] @default([])
+
+  isActive           Boolean   @default(true)
+  expiresAt          DateTime?
+  lastUsedAt         DateTime?
+  revokedAt          DateTime?
+  revocationReason   String?
+  rotatedFromTokenId String?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  connectedSiteUrlAtCreation      String?
+  connectedBusinessNameAtCreation String?
+
+  @@index([token])
+  @@index([userId])
+  @@index([businessId])
+  @@index([createdAt])
+  @@index([revokedAt])
+  @@index([rotatedFromTokenId])
+  @@map("api_token")
+}
+
+enum LlmUsagePurpose {
+  blog_keyword_pipeline
+  blog_legacy_graph
+  quick_trial_blog
+  seo_audit
+  gmb_post
+  ai_visibility
+  onboarding_llm
+  social_creative
+  other
+}
+
+model BlogGenerationRun {
+  id                 String    @id @default(uuid())
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  completedAt        DateTime?
+  correlationId      String    @unique
+  userId             String?
+  businessId         String?
+  blogId             String?
+  provider           String
+  model              String
+  promptVersion      String
+  compilerVersion    Int
+  factPacketVersion  Int?
+  factPacketHash     String?
+  approvedTitle      String?
+  approvedSeoTitle   String?
+  approvedOutline    Json?
+  claimIds           String[]  @default([])
+  sourceUrls         String[]  @default([])
+  inputTokens        Int?
+  outputTokens       Int?
+  totalTokens        Int?
+  estimatedUsd       Decimal?  @db.Decimal(14, 6)
+  validationFailures Json?
+  repairCount        Int       @default(0)
+  judgeScore         Float?
+  fallbackUsed       Boolean   @default(false)
+  fallbackReason     String?
+  status             String    @default("RUNNING")
+  finalSaveStatus    String?
+  durationMs         Int?
+  errorCode          String?
+  errorMessage       String?
+  metadata           Json?
+
+  @@index([createdAt])
+  @@index([businessId, createdAt])
+  @@index([provider, model, status])
+  @@index([status, createdAt])
+  @@map("blog_generation_run")
+}
+
+model BlogEvidenceSnapshot {
+  id                    String   @id @default(uuid())
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+  expiresAt             DateTime
+  businessId            String
+  business              Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  keyword               String
+  keywordKey            String
+  websiteUrl            String?
+  packetVersion         Int
+  packetHash            String
+  evidenceHash          String
+  status                String   @default("READY")
+  firstPartyEvidence    Json
+  authoritativeEvidence Json
+  claimIds              String[] @default([])
+  sourceUrls            String[] @default([])
+  counts                Json?
+
+  @@unique([businessId, keywordKey, evidenceHash], map: "blog_evidence_snapshot_business_keyword_evidence_key")
+  @@index([businessId, keywordKey, createdAt], map: "blog_evidence_snapshot_business_keyword_created_idx")
+  @@index([expiresAt], map: "blog_evidence_snapshot_expires_idx")
+  @@map("blog_evidence_snapshot")
+}
+
+model LlmUsageEvent {
+  id                   String          @id @default(uuid())
+  createdAt            DateTime        @default(now())
+  userId               String?
+  user                 User?           @relation("LlmUsageEventsUser", fields: [userId], references: [id], onDelete: SetNull)
+  businessId           String?
+  business             Business?       @relation("LlmUsageEventsBusiness", fields: [businessId], references: [id], onDelete: SetNull)
+  blogId               String?
+  blog                 Blog?           @relation("LlmUsageEventsBlog", fields: [blogId], references: [id], onDelete: SetNull)
+  correlationId        String?
+  purpose              LlmUsagePurpose
+  provider             String
+  model                String
+  inputTokens          Int?
+  outputTokens         Int?
+  totalTokens          Int?
+  estimatedUsd         Decimal?        @db.Decimal(14, 6)
+  pricingSchemaVersion Int             @default(1)
+  metadata             Json?
+
+  @@index([createdAt])
+  @@index([businessId])
+  @@index([purpose])
+  @@index([userId])
+  @@map("llm_usage_event")
+}
+
+// ============================================
+// Stripe Operations Retry Queue
+// ============================================
+
+model StripeRetryQueue {
+  id               String    @id @default(uuid())
+  userId           String
+  operationType    String // "delete_subscription_item", "cancel_subscription", etc.
+  stripeObjectId   String // The Stripe ID to operate on
+  stripeObjectType String // "subscription_item", "subscription", etc.
+  payload          Json // Additional payload for the operation
+  status           String    @default("pending") // "pending", "processing", "failed", "completed"
+  retryCount       Int       @default(0)
+  maxRetries       Int       @default(3)
+  lastError        String?
+  nextRetryAt      DateTime?
+  completedAt      DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  businessId       String?
+  operationKey     String?   @unique
+
+  @@index([userId])
+  @@index([status])
+  @@index([stripeObjectId])
+  @@index([nextRetryAt])
+  @@index([businessId])
+}
+
+// ============================================
+// SEO Audit System
+// ============================================
+
+model SeoAuditRun {
+  id          String    @id @default(uuid())
+  userId      String
+  businessId  String
+  status      String    @default("pending") // "pending", "running", "completed", "failed"
+  startedAt   DateTime  @default(now())
+  completedAt DateTime?
+  error       String?
+
+  summaryScore     Int?
+  modulesRequested String[] @default(["technical", "schema", "geo", "sitemap", "hreflang", "competitorPages", "plan"])
+  currentModule    String?
+  progress         Int      @default(0)
+
+  report Json?
+
+  modelUsed  String?
+  tokenUsage Int?
+  runtimeMs  Int?
+
+  user     User     @relation("SeoAuditRuns", fields: [userId], references: [id], onDelete: Cascade)
+  business Business @relation("SeoAuditRuns", fields: [businessId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([businessId])
+  @@index([status])
+  @@index([businessId, createdAt(sort: Desc)])
+  @@map("seo_audit_run")
+}
+
+model SignupAuditEmailLog {
+  id            String  @id @default(uuid())
+  userId        String
+  businessId    String  @unique
+  seoAuditRunId String?
+
+  status             String    @default("pending") // pending, running, completed, skipped, failed
+  issueCount         Int       @default(0)
+  internalEmailCount Int       @default(0)
+  prospectEmailId    String?
+  lastError          String?
+  completedAt        DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("signup_audit_email_log")
+}
+
+// ============================================
+// Managed Agency System
+// ============================================
+
+model Agency {
+  id       String  @id @default(uuid())
+  name     String
+  slug     String  @unique
+  isActive Boolean @default(true)
+
+  ownerUserId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  domains              AgencyDomain[]
+  memberships          AgencyMembership[]
+  businesses           Business[]
+  pricingConfigs       AgencyPricingConfig[]
+  revenueShareRules    AgencyRevenueShareRule[]
+  payoutAccount        AgencyPayoutAccount?
+  revenueLedgerEntries AgencyRevenueLedger[]
+  settlementRuns       AgencySettlementRun[]
+  websiteSubscriptions WebsiteSubscription[]
+
+  @@index([slug])
+  @@index([isActive])
+  @@map("agency")
+}
+
+model AgencyDomain {
+  id       String @id @default(uuid())
+  agencyId String
+  agency   Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  domain    String  @unique
+  isPrimary Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([agencyId])
+  @@index([domain])
+  @@map("agency_domain")
+}
+
+model AgencyMembership {
+  id       String @id @default(uuid())
+  agencyId String
+  agency   Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+  userId   String
+  user     User   @relation("UserAgencyMemberships", fields: [userId], references: [id], onDelete: Cascade)
+
+  role     String  @default("AGENCY_ADMIN") // "AGENCY_ADMIN"
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([agencyId, userId])
+  @@index([userId])
+  @@index([agencyId])
+  @@map("agency_membership")
+}
+
+model AgencyPricingConfig {
+  id       String @id @default(uuid())
+  agencyId String
+  agency   Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  monthlyPriceCents Int
+  yearlyPriceCents  Int
+  currency          String  @default("usd")
+  isActive          Boolean @default(true)
+
+  stripeMonthlyPriceId String?
+  stripeYearlyPriceId  String?
+  planTier             WebsitePlanTier @default(SEO)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  websiteSubscriptions WebsiteSubscription[]
+
+  @@index([agencyId])
+  @@index([agencyId, planTier, isActive])
+  @@index([isActive])
+  @@map("agency_pricing_config")
+}
+
+model AgencyRevenueShareRule {
+  id       String @id @default(uuid())
+  agencyId String
+  agency   Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  platformSharePercent Int @default(60)
+  agencySharePercent   Int @default(40)
+
+  effectiveFrom DateTime  @default(now())
+  effectiveTo   DateTime?
+  isActive      Boolean   @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([agencyId])
+  @@index([isActive])
+  @@map("agency_revenue_share_rule")
+}
+
+model AgencyPayoutAccount {
+  id       String @id @default(uuid())
+  agencyId String @unique
+  agency   Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  stripeConnectAccountId String? @unique
+  accountStatus          String  @default("pending") // "pending", "active", "restricted", "disabled"
+  chargesEnabled         Boolean @default(false)
+  payoutsEnabled         Boolean @default(false)
+  onboardingComplete     Boolean @default(false)
+
+  bankName          String?
+  bankAccountLast4  String?
+  accountHolderName String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("agency_payout_account")
+}
+
+model AgencyRevenueLedger {
+  id       String @id @default(uuid())
+  agencyId String
+  agency   Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  businessId String?
+
+  stripeInvoiceId      String?
+  stripeEventId        String? @unique
+  stripeSubscriptionId String?
+  stripeChargeId       String?
+
+  entryType String // "collection", "refund", "dispute", "credit", "chargeback"
+
+  grossAmountCents         Int
+  discountAmountCents      Int @default(0)
+  taxAmountCents           Int @default(0)
+  eligibleAmountCents      Int
+  platformShareAmountCents Int
+  agencyShareAmountCents   Int
+
+  currency String @default("usd")
+
+  periodStart DateTime?
+  periodEnd   DateTime?
+
+  settlementRunId String?
+  settlementRun   AgencySettlementRun? @relation(fields: [settlementRunId], references: [id], onDelete: SetNull)
+
+  description String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([agencyId])
+  @@index([businessId])
+  @@index([stripeInvoiceId])
+  @@index([entryType])
+  @@index([settlementRunId])
+  @@index([createdAt])
+  @@map("agency_revenue_ledger")
+}
+
+model AgencySettlementRun {
+  id       String @id @default(uuid())
+  agencyId String
+  agency   Agency @relation(fields: [agencyId], references: [id], onDelete: Cascade)
+
+  periodStart DateTime
+  periodEnd   DateTime
+
+  status String @default("draft") // "draft", "approved", "paid", "failed"
+
+  totalCollectedCents     Int @default(0)
+  totalRefundsCents       Int @default(0)
+  netEligibleCents        Int @default(0)
+  platformShareTotalCents Int @default(0)
+  agencyShareTotalCents   Int @default(0)
+
+  currency String @default("usd")
+
+  approvedAt      DateTime?
+  approvedBy      String?
+  paidAt          DateTime?
+  failedAt        DateTime?
+  failureReason   String?
+  payoutReference String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  lineItems     AgencySettlementLineItem[]
+  ledgerEntries AgencyRevenueLedger[]
+
+  @@unique([agencyId, periodStart, periodEnd])
+  @@index([agencyId])
+  @@index([status])
+  @@index([periodStart, periodEnd])
+  @@map("agency_settlement_run")
+}
+
+model AgencySettlementLineItem {
+  id              String              @id @default(uuid())
+  settlementRunId String
+  settlementRun   AgencySettlementRun @relation(fields: [settlementRunId], references: [id], onDelete: Cascade)
+
+  businessId String?
+
+  description          String
+  collectedAmountCents Int    @default(0)
+  refundAmountCents    Int    @default(0)
+  netAmountCents       Int    @default(0)
+  platformShareCents   Int    @default(0)
+  agencyShareCents     Int    @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([settlementRunId])
+  @@index([businessId])
+  @@map("agency_settlement_line_item")
+}
+
+model AdminAuditLog {
+  id          String @id @default(uuid())
+  adminUserId String
+  adminUser   User   @relation("AdminAuditLogs", fields: [adminUserId], references: [id], onDelete: Cascade)
+
+  action     String
+  targetType String
+  targetId   String
+  details    Json?
+  before     Json?
+  after      Json?
+  ipAddress  String?
+
+  createdAt DateTime @default(now())
+
+  @@index([adminUserId])
+  @@index([action])
+  @@index([targetType, targetId])
+  @@index([createdAt])
+  @@map("admin_audit_log")
+}
+
+model CommandRoleCapability {
+  id         String  @id @default(uuid())
+  role       Role
+  capability String
+  enabled    Boolean @default(true)
+
+  updatedByUserId String?
+  updatedByUser   User?   @relation("CommandCapabilityUpdatedBy", fields: [updatedByUserId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([role, capability])
+  @@index([role, enabled])
+  @@map("command_role_capability")
+}
+
+model CommandRepProfile {
+  id     String @id @default(uuid())
+  userId String @unique
+  user   User   @relation("CommandRepProfileUser", fields: [userId], references: [id], onDelete: Cascade)
+
+  name                String
+  basePay             Decimal?                       @db.Decimal(19, 4)
+  currency            String?
+  ghlUserId           String?                        @unique
+  startDate           DateTime
+  endDate             DateTime?
+  isActive            Boolean                        @default(true)
+  activities          CommandRepActivity[]
+  accounts            CommandAccount[]
+  assignments         CommandGhlLeadAssignment[]
+  dealCredits         CommandDealCredit[]
+  commissionLines     CommandCommissionLine[]
+  commissionSnapshots CommandCommissionRepSnapshot[]
+  calls               CommandCall[]
+  coachingBriefs      CommandCoachingBrief[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isActive])
+  @@index([startDate])
+  @@index([endDate])
+  @@map("command_rep_profile")
+}
+
+/// Canonical customer identity used by the Command Panel. Stripe and GHL
+/// remain provider truth; this projection joins their stable ids to one owner.
+model CommandAccount {
+  id               String             @id @default(uuid())
+  name             String
+  normalizedEmail  String?            @unique
+  stripeCustomerId String?            @unique
+  ghlContactId     String?            @unique
+  ownerRepId       String?
+  ownerRep         CommandRepProfile? @relation(fields: [ownerRepId], references: [id], onDelete: SetNull)
+  userId           String?
+  businessId       String?
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+  calls            CommandCall[]
+
+  @@index([ownerRepId])
+  @@index([userId])
+  @@index([businessId])
+  @@map("command_account")
+}
+
+model CommandRepActivity {
+  id              String            @id @default(uuid())
+  repId           String
+  rep             CommandRepProfile @relation(fields: [repId], references: [id], onDelete: Cascade)
+  periodMonth     String
+  calls           Int               @default(0)
+  connects        Int               @default(0)
+  meetingsBooked  Int               @default(0)
+  meetingsHeld    Int               @default(0)
+  source          String            @default("manual")
+  updatedByUserId String?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  @@unique([repId, periodMonth, source])
+  @@index([periodMonth, source])
+  @@index([repId, periodMonth])
+  @@map("command_rep_activity")
+}
+
+model CommandService {
+  id                   String                      @id @default(uuid())
+  key                  String                      @unique
+  name                 String
+  kind                 String
+  listPriceMinor       Decimal?                    @db.Decimal(19, 0)
+  currency             String?
+  stripePriceIds       String[]
+  ghlPipelineIds       String[]
+  ghlCustomFieldValues String[]
+  isActive             Boolean                     @default(true)
+  createdByUserId      String?
+  updatedByUserId      String?
+  createdAt            DateTime                    @default(now())
+  updatedAt            DateTime                    @updatedAt
+  rateVersions         CommandServiceRateVersion[]
+  dealCredits          CommandDealCredit[]
+  commissionLines      CommandCommissionLine[]
+
+  @@index([kind, isActive])
+  @@index([isActive, name])
+  @@map("command_service")
+}
+
+/// Effective-dated, owner-approved operating decisions. A new version is
+/// appended instead of mutating an approved historical decision.
+model CommandDecision {
+  id                 String    @id @default(uuid())
+  key                String
+  category           String
+  version            Int
+  status             String    @default("draft")
+  value              Json
+  requiresLegal      Boolean   @default(false)
+  legalConfirmedAt   DateTime?
+  legalConfirmedById String?
+  approvedAt         DateTime?
+  approvedByUserId   String?
+  effectiveAt        DateTime
+  retiredAt          DateTime?
+  notes              String?
+  createdByUserId    String
+  updatedByUserId    String
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  @@unique([key, version])
+  @@index([key, status, effectiveAt])
+  @@index([status, effectiveAt])
+  @@map("command_decision")
+}
+
+/// Commission rates are versioned independently from list prices. Rates are
+/// decimal ratios (0.5 = 50%) and are selected by the source deal start date.
+model CommandServiceRateVersion {
+  id               String                  @id @default(uuid())
+  serviceId        String
+  service          CommandService          @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+  effectiveFrom    DateTime
+  effectiveTo      DateTime?
+  firstSaleRate    Decimal                 @db.Decimal(9, 6)
+  recurringRate    Decimal                 @db.Decimal(9, 6)
+  status           String                  @default("draft")
+  approvedAt       DateTime?
+  approvedByUserId String?
+  createdByUserId  String
+  createdAt        DateTime                @default(now())
+  updatedAt        DateTime                @updatedAt
+  commissionLines  CommandCommissionLine[]
+
+  @@unique([serviceId, effectiveFrom])
+  @@index([serviceId, status, effectiveFrom])
+  @@map("command_service_rate_version")
+}
+
+/// First-observed GHL assignment history. It never fabricates an assignment
+/// date that predates Command ingestion, so cohort coverage remains explicit.
+model CommandGhlLeadAssignment {
+  id                String                @id @default(uuid())
+  ghlOpportunityId  String
+  opportunity       CommandGhlOpportunity @relation(fields: [ghlOpportunityId], references: [ghlOpportunityId], onDelete: Cascade)
+  assignedToGhlId   String?
+  repId             String?
+  rep               CommandRepProfile?    @relation(fields: [repId], references: [id], onDelete: SetNull)
+  observedFrom      DateTime
+  observedTo        DateTime?
+  sourceSyncRunId   String?
+  providerUpdatedAt DateTime?
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+
+  @@unique([ghlOpportunityId, observedFrom])
+  @@index([repId, observedFrom])
+  @@index([assignedToGhlId, observedFrom])
+  @@index([observedTo])
+  @@map("command_ghl_lead_assignment")
+}
+
+/// Explicit deal-credit allocations support the owner-selected single-owner
+/// or split-credit policy without rewriting provider assignment facts.
+model CommandDealCredit {
+  id               String            @id @default(uuid())
+  sourceType       String
+  sourceId         String
+  serviceId        String?
+  service          CommandService?   @relation(fields: [serviceId], references: [id], onDelete: SetNull)
+  repId            String
+  rep              CommandRepProfile @relation(fields: [repId], references: [id], onDelete: Restrict)
+  creditShare      Decimal           @db.Decimal(9, 6)
+  effectiveFrom    DateTime
+  effectiveTo      DateTime?
+  status           String            @default("approved")
+  approvedByUserId String
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+
+  @@unique([sourceType, sourceId, repId, effectiveFrom])
+  @@index([sourceType, sourceId, status])
+  @@index([repId, effectiveFrom])
+  @@map("command_deal_credit")
+}
+
+/// One monthly calculation container. Configuration is snapshotted before a
+/// run can be locked so later policy/rate changes cannot alter payroll history.
+model CommandCommissionRun {
+  id                    String                         @id @default(uuid())
+  periodMonth           String                         @unique
+  status                String                         @default("open")
+  configurationSnapshot Json
+  sourceFactsThrough    DateTime
+  calculatedAt          DateTime                       @default(now())
+  calculatedByUserId    String
+  lockedAt              DateTime?
+  lockedByUserId        String?
+  createdAt             DateTime                       @default(now())
+  updatedAt             DateTime                       @updatedAt
+  lines                 CommandCommissionLine[]
+  repSnapshots          CommandCommissionRepSnapshot[]
+
+  @@index([status, periodMonth])
+  @@map("command_commission_run")
+}
+
+/// Exact, currency-separated earned/held/released/adjustment facts. lineKey is
+/// the idempotency key across recalculation and provider replay.
+model CommandCommissionLine {
+  id                String                     @id @default(uuid())
+  lineKey           String                     @unique
+  runId             String
+  run               CommandCommissionRun       @relation(fields: [runId], references: [id], onDelete: Restrict)
+  repId             String
+  rep               CommandRepProfile          @relation(fields: [repId], references: [id], onDelete: Restrict)
+  serviceId         String?
+  service           CommandService?            @relation(fields: [serviceId], references: [id], onDelete: SetNull)
+  rateVersionId     String?
+  rateVersion       CommandServiceRateVersion? @relation(fields: [rateVersionId], references: [id], onDelete: SetNull)
+  kind              String
+  status            String
+  sourceType        String
+  sourceId          String
+  originPeriodMonth String
+  postedPeriodMonth String
+  amountMinor       Decimal                    @db.Decimal(19, 4)
+  currency          String
+  metadata          Json?
+  createdAt         DateTime                   @default(now())
+
+  @@index([runId, repId, currency])
+  @@index([repId, postedPeriodMonth])
+  @@index([sourceType, sourceId])
+  @@index([status, postedPeriodMonth])
+  @@map("command_commission_line")
+}
+
+/// Locked rep-period totals including draw balance reconciliation. Stored
+/// snapshots make historical reports deterministic and fast.
+model CommandCommissionRepSnapshot {
+  id                      String               @id @default(uuid())
+  runId                   String
+  run                     CommandCommissionRun @relation(fields: [runId], references: [id], onDelete: Restrict)
+  repId                   String
+  rep                     CommandRepProfile    @relation(fields: [repId], references: [id], onDelete: Restrict)
+  currency                String
+  firstSaleMinor          Decimal              @db.Decimal(19, 4)
+  recurringMinor          Decimal              @db.Decimal(19, 4)
+  clawbackMinor           Decimal              @db.Decimal(19, 4)
+  heldMinor               Decimal              @db.Decimal(19, 4)
+  releasedMinor           Decimal              @db.Decimal(19, 4)
+  adjustmentMinor         Decimal              @db.Decimal(19, 4)
+  earnedMinor             Decimal              @db.Decimal(19, 4)
+  baseDrawMinor           Decimal              @db.Decimal(19, 4)
+  drawDifferentialMinor   Decimal              @db.Decimal(19, 4)
+  openingDrawBalanceMinor Decimal              @db.Decimal(19, 4)
+  closingDrawBalanceMinor Decimal              @db.Decimal(19, 4)
+  cashPayableMinor        Decimal              @db.Decimal(19, 4)
+  closesNeeded            Int?
+  createdAt               DateTime             @default(now())
+
+  @@unique([runId, repId, currency])
+  @@index([repId, currency, runId])
+  @@map("command_commission_rep_snapshot")
+}
+
+/// Provider facts stay immutable. Approved overrides are separate rows whose
+/// scope and precedence are explicit and fully auditable.
+model CommandDataOverride {
+  id               String    @id @default(uuid())
+  provider         String
+  entityType       String
+  entityId         String
+  field            String
+  value            Json
+  reason           String
+  status           String    @default("approved")
+  effectiveAt      DateTime
+  expiresAt        DateTime?
+  approvedByUserId String
+  createdByUserId  String
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@index([provider, entityType, entityId, field, status])
+  @@index([effectiveAt, expiresAt])
+  @@map("command_data_override")
+}
+
+/// A normalized call envelope. Raw transcripts are deliberately not stored;
+/// only provider references, bounded notes/summary and retention metadata live
+/// in the application database.
+model CommandCall {
+  id                  String              @id @default(uuid())
+  provider            String
+  providerCallId      String
+  lastProviderEventId String?
+  repId               String?
+  rep                 CommandRepProfile?  @relation(fields: [repId], references: [id], onDelete: SetNull)
+  accountId           String?
+  account             CommandAccount?     @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  title               String?
+  startedAt           DateTime
+  durationSeconds     Int?
+  participantEmails   String[]
+  organizerEmail      String?
+  summary             String?
+  actionItems         Json?
+  transcriptUrl       String?
+  recordingUrl        String?
+  consentState        String              @default("provider_managed")
+  reviewStatus        String              @default("pending")
+  retentionExpiresAt  DateTime?
+  providerPayloadHash String
+  providerCreatedAt   DateTime?
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+  reviews             CommandCallReview[]
+
+  @@unique([provider, providerCallId])
+  @@index([repId, startedAt])
+  @@index([accountId, startedAt])
+  @@index([reviewStatus, startedAt])
+  @@index([retentionExpiresAt])
+  @@map("command_call")
+}
+
+/// Durable provider-event claim. Fathom reuses webhook-id when it retries and
+/// Fireflies is namespaced by its stable event/timestamp/meeting identity.
+model CommandCallWebhookEvent {
+  id             String    @id
+  status         String    @default("processing")
+  attemptCount   Int       @default(1)
+  leaseExpiresAt DateTime?
+  processedAt    DateTime?
+  lastError      String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([status, leaseExpiresAt])
+  @@map("command_call_webhook_event")
+}
+
+model CommandCallReview {
+  id            String      @id @default(uuid())
+  callId        String
+  call          CommandCall @relation(fields: [callId], references: [id], onDelete: Cascade)
+  status        String      @default("completed")
+  score         Decimal?    @db.Decimal(5, 2)
+  rubric        Json?
+  strengths     Json?
+  improvements  Json?
+  missedSignal  String?
+  focus         String?
+  nextActions   Json?
+  errorCode     String?
+  model         String
+  promptVersion String
+  inputHash     String
+  generatedAt   DateTime    @default(now())
+  createdAt     DateTime    @default(now())
+
+  @@unique([callId, model, promptVersion, inputHash])
+  @@index([callId, generatedAt])
+  @@index([status, generatedAt])
+  @@map("command_call_review")
+}
+
+model CommandCoachingBrief {
+  id            String            @id @default(uuid())
+  repId         String
+  rep           CommandRepProfile @relation(fields: [repId], references: [id], onDelete: Cascade)
+  periodMonth   String
+  status        String            @default("completed")
+  reviewCount   Int
+  payload       Json?
+  errorCode     String?
+  model         String
+  promptVersion String
+  inputHash     String
+  generatedAt   DateTime          @default(now())
+  createdAt     DateTime          @default(now())
+
+  @@unique([repId, periodMonth, model, promptVersion, inputHash])
+  @@index([repId, periodMonth, generatedAt])
+  @@index([status, generatedAt])
+  @@map("command_coaching_brief")
+}
+
+model SuperAdminSalesRecord {
+  id              String   @id @default(uuid())
+  salespersonName String
+  amountCents     Int
+  currency        String   @default("USD")
+  note            String?
+  recordedAt      DateTime @default(now())
+
+  createdByUserId String
+  createdByUser   User   @relation("SuperAdminSalesRecords", fields: [createdByUserId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([salespersonName])
+  @@index([recordedAt])
+  @@index([createdByUserId])
+  @@map("superadmin_sales_record")
+}
+
+model SalesCustomerAssignment {
+  id            String              @id @default(uuid())
+  businessId    String              @unique
+  business      Business            @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  salespersonId String
+  salesperson   User                @relation("SalespersonAssignments", fields: [salespersonId], references: [id], onDelete: Cascade)
+  assignedAt    DateTime            @default(now())
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+  notes         SalesCustomerNote[]
+  sales         SalesEntry[]
+
+  @@index([salespersonId])
+  @@index([assignedAt])
+  @@map("sales_customer_assignment")
+}
+
+model SalesCustomerNote {
+  id           String                  @id @default(uuid())
+  assignmentId String
+  assignment   SalesCustomerAssignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  authorUserId String
+  author       User                    @relation("SalesNotesAuthor", fields: [authorUserId], references: [id], onDelete: Cascade)
+  body         String
+  createdAt    DateTime                @default(now())
+  updatedAt    DateTime                @updatedAt
+
+  @@index([assignmentId, createdAt])
+  @@index([authorUserId])
+  @@map("sales_customer_note")
+}
+
+model SalesEntry {
+  id            String                  @id @default(uuid())
+  assignmentId  String
+  assignment    SalesCustomerAssignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  salespersonId String
+  salesperson   User                    @relation("SalesEntriesSalesperson", fields: [salespersonId], references: [id], onDelete: Cascade)
+  itemSold      String
+  amountCents   Int
+  currency      String                  @default("USD")
+  soldTo        String
+  soldAt        DateTime                @default(now())
+  createdAt     DateTime                @default(now())
+  updatedAt     DateTime                @updatedAt
+
+  @@index([assignmentId, soldAt])
+  @@index([salespersonId, soldAt])
+  @@map("sales_entry")
+}
+
+// 🆕 SEO 2026: Content Cluster Architecture
+model ContentCluster {
+  id              String   @id @default(uuid())
+  name            String
+  description     String?
+  pillarKeywordId String?
+  businessId      String
+  business        Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  blogs           Blog[]
+  keywords        Plan[]
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+// DR Growth Engine Models
+
+enum DRActionType {
+  CONTENT_OPTIMIZATION
+  GUEST_POST_PITCH
+  LINK_RECLAIM
+  INTERNAL_LINK
+}
+
+enum DRActionStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  SKIPPED
+}
+
+model DRActionLog {
+  id          String         @id @default(uuid())
+  businessId  String
+  business    Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  businessDR  Int? // Snapshot of DR at action time
+  actionType  DRActionType
+  status      DRActionStatus @default(PENDING)
+  details     Json?
+  error       String?
+  retryCount  Int            @default(0)
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  completedAt DateTime?
+
+  @@index([businessId])
+  @@index([actionType])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model DRContentOptimization {
+  id               String         @id @default(uuid())
+  businessId       String
+  business         Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  blogId           String
+  blog             Blog           @relation(fields: [blogId], references: [id], onDelete: Cascade)
+  externalPostId   String? // WordPress post ID
+  optimizationType String // "stats_section", "embeddable_snippet", "structured_data", "sources_section"
+  contentBefore    String?        @db.Text // Original content hash or excerpt for tracking
+  contentAdded     String?        @db.Text // What was added/modified
+  drRangeStrategy  String? // "foundational" (0-10), "data_driven" (10-30), "authority" (30+)
+  status           DRActionStatus @default(PENDING)
+  error            String?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  @@index([businessId])
+  @@index([blogId])
+  @@index([status])
+}
+
+enum DROutreachStatus {
+  DRAFTED
+  SENT
+  OPENED
+  REPLIED
+  ACCEPTED
+  REJECTED
+  NEEDS_REVIEW
+  EXPIRED
+}
+
+model DROutreachCampaign {
+  id                  String            @id @default(uuid())
+  businessId          String
+  business            Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  publisherDomain     String
+  publisherEmail      String?
+  publisherDA         Float? // Domain authority at time of pitch
+  status              DROutreachStatus  @default(DRAFTED)
+  pitchSubject        String?
+  pitchContent        String?           @db.Text
+  proposedTopic       String?
+  inboundReplyAddress String? // reply-{businessId}@inbound.upliftai.co
+  sentAt              DateTime?
+  openedAt            DateTime?
+  respondedAt         DateTime?
+  responseContent     String?           @db.Text
+  guestPostBlogId     String? // Blog ID if guest post was created
+  cooldownUntil       DateTime? // Don't re-pitch until this date
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+  emails              DROutreachEmail[]
+
+  @@index([businessId])
+  @@index([status])
+  @@index([publisherDomain])
+  @@index([cooldownUntil])
+}
+
+enum DROutreachEmailType {
+  PITCH
+  FOLLOWUP
+  RECLAIM
+}
+
+model DROutreachEmail {
+  id             String              @id @default(uuid())
+  campaignId     String
+  campaign       DROutreachCampaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  emailType      DROutreachEmailType
+  recipientEmail String
+  subject        String
+  body           String              @db.Text
+  resendEmailId  String? // Resend message ID for tracking
+  sentAt         DateTime?
+  openedAt       DateTime?
+  repliedAt      DateTime?
+  bounced        Boolean             @default(false)
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+
+  @@index([campaignId])
+  @@index([resendEmailId])
+}
+
+enum DRLinkRecoveryStatus {
+  DETECTED
+  ANALYZING
+  RECOVERABLE
+  NOT_RECOVERABLE
+  EMAILED
+  RECOVERED
+  ABANDONED
+}
+
+model DRLinkRecovery {
+  id              String               @id @default(uuid())
+  businessId      String
+  business        Business             @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  backlinkId      String? // Reference to ExternalBacklink.id
+  sourceUrl       String // The URL that had the backlink
+  sourceDomain    String
+  targetUrl       String // The URL that was linked to
+  domainAuthority Float? // DA of the referring domain at time of loss
+  lostAt          DateTime
+  reason          String? // "page_removed", "link_removed", "nofollow_changed", "domain_expired", "redirect_issue"
+  reclaimStatus   DRLinkRecoveryStatus @default(DETECTED)
+  reclaimEmailId  String? // Reference to DROutreachEmail if a reclaim was sent
+  analyzedAt      DateTime?
+  recoveredAt     DateTime?
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+
+  @@index([businessId])
+  @@index([reclaimStatus])
+  @@index([sourceDomain])
+  @@index([lostAt])
+}
+
+// ============================================
+// AI Visibility Models - GEO / LLM Citation Tracking
+// ============================================
+
+enum LlmProvider {
+  CHATGPT
+  GEMINI
+  PERPLEXITY
+  CLAUDE
+}
+
+enum ContentRouteType {
+  GOOGLE
+  LLM
+  DUAL
+}
+
+enum LlmQueryDifficulty {
+  EASY
+  MEDIUM
+  HARD
+}
+
+enum LlmQuerySource {
+  PAA
+  LLM_EXPANSION
+}
+
+model LlmCitationScan {
+  id              String        @id @default(uuid())
+  businessId      String
+  business        Business      @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  triggeredAt     DateTime      @default(now())
+  completedAt     DateTime?
+  status          String        @default("pending") // pending, running, completed, partial, failed
+  keywordsScanned Int           @default(0)
+  citations       LlmCitation[]
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@index([businessId])
+  @@index([status])
+  @@index([triggeredAt])
+}
+
+model LlmCitation {
+  id               String          @id @default(uuid())
+  scanId           String
+  scan             LlmCitationScan @relation(fields: [scanId], references: [id], onDelete: Cascade)
+  businessId       String
+  business         Business        @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  keyword          String
+  query            String // The natural language query sent to the LLM
+  llmProvider      LlmProvider
+  citedCount       Int             @default(0) // How many times out of totalRuns the domain was cited
+  totalRuns        Int             @default(3) // Number of runs per scan for this query
+  cited            Boolean         @default(false) // Convenience: citedCount > 0
+  citedUrl         String? // The specific URL that was cited (if URL match)
+  citationContext  String? // The sentence/paragraph around the citation
+  competitorsCited Json? // Array of {domain, url, context} for competitors found in the response
+  createdAt        DateTime        @default(now())
+
+  @@index([businessId, keyword, llmProvider, createdAt])
+  @@index([scanId])
+  @@index([businessId, createdAt])
+}
+
+model LlmQueryDiscovery {
+  id              String             @id @default(uuid())
+  businessId      String
+  business        Business           @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  keyword         String // The seed keyword
+  discoveredQuery String // The inferred question people ask AI
+  source          LlmQuerySource
+  difficulty      LlmQueryDifficulty @default(MEDIUM)
+  estimatedVolume Int? // Google search volume via DataForSEO as proxy
+  category        String? // Topic group
+
+  // Phase 2: prioritization signals
+  priorityScore Float     @default(0) // 0–1 composite score
+  lastScoredAt  DateTime?
+  targeted      Boolean   @default(false) // true once blog generation has been enqueued
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([businessId])
+  @@index([businessId, keyword])
+  @@index([businessId, priorityScore(sort: Desc)])
+}
+
+model ContentLlmScore {
+  id                  String   @id @default(uuid())
+  blogId              String   @unique
+  blog                Blog     @relation(fields: [blogId], references: [id], onDelete: Cascade)
+  businessId          String
+  business            Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  overallScore        Int      @default(0) // 0-10
+  schemaMarkup        Int      @default(0) // 0-2
+  faqSection          Int      @default(0) // 0-2
+  sourceCitations     Int      @default(0) // 0-2
+  definitionalClarity Int      @default(0) // 0-2
+  freshness           Int      @default(0) // 0-2
+  suggestions         Json? // Array of {signal, message, priority}
+  lastScored          DateTime @default(now())
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@index([businessId])
+  @@index([overallScore])
+}
+
+model AiVisibilityJob {
+  id                String    @id @default(uuid())
+  businessId        String
+  business          Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  requestedByUserId String?
+  requestedBy       User?     @relation("AiVisibilityJobRequestedBy", fields: [requestedByUserId], references: [id], onDelete: SetNull)
+  type              String
+  source            String    @default("manual")
+  periodKey         String?
+  status            String    @default("pending")
+  progress          Int       @default(0)
+  startedAt         DateTime?
+  completedAt       DateTime?
+  lastError         String?
+  result            Json?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@unique([businessId, type, periodKey])
+  @@index([businessId, type, createdAt])
+  @@index([businessId, type, status])
+  @@index([type, periodKey, status])
+  @@index([status])
+  @@index([requestedByUserId])
+}
+
+model AiVisibilityTrialRun {
+  id                String   @id @default(uuid())
+  businessId        String   @unique
+  business          Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  requestedByUserId String?
+  requestedBy       User?    @relation("AiVisibilityTrialRunRequestedBy", fields: [requestedByUserId], references: [id], onDelete: SetNull)
+  status            String   @default("queued")
+  citationJobId     String?
+  discoveryJobId    String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([requestedByUserId])
+  @@index([status])
+}
+
+model CompetitiveGap {
+  id               String    @id @default(uuid())
+  businessId       String
+  business         Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  keyword          String
+  competitorUrl    String
+  competitorDomain String
+  // Normalized outline: [{ level: "H1"|"H2"|"H3", text: string, hasFaq: boolean }]
+  outline          Json
+  // Topics competitors cover that our own content (if any) doesn't:
+  // [{ topic: string, citedByProviders: ["CHATGPT", ...] }]
+  gapTopics        Json
+  detectedAt       DateTime  @default(now())
+  resolvedAt       DateTime?
+  resolvedByBlogId String?
+
+  @@index([businessId, keyword])
+  @@index([businessId, detectedAt])
+  @@index([businessId, resolvedAt])
+}
+
+model BusinessAnalyticsConfig {
+  id                String    @id @default(uuid())
+  businessId        String    @unique
+  business          Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  ga4PropertyId     String?
+  // Encrypted service-account JSON blob or reference to a secret manager.
+  // The raw value never leaves the backend; encryption is handled by the
+  // upsert helper, never by direct writes.
+  serviceAccountRef String?
+  connectedAt       DateTime?
+  lastSyncedAt      DateTime?
+  lastSyncError     String?
+  gscSiteUrl        String?
+  gscAccessToken    String?
+  gscRefreshToken   String?
+  gscConnectedAt    DateTime?
+  gscLastSyncedAt   DateTime?
+  gscLastSyncError  String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+}
+
+model AiReferralTraffic {
+  id              String   @id @default(uuid())
+  businessId      String
+  business        Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  date            DateTime @db.Date
+  source          String // e.g. chatgpt.com, perplexity.ai, gemini.google.com, claude.ai
+  sessions        Int      @default(0)
+  engagedSessions Int      @default(0)
+  conversions     Int      @default(0)
+  blogUrl         String?
+  createdAt       DateTime @default(now())
+
+  @@unique([businessId, date, source, blogUrl])
+  @@index([businessId, date])
+  @@index([businessId, source])
+}
+
+model SearchConsoleMetric {
+  id          String   @id @default(uuid())
+  businessId  String
+  business    Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  date        DateTime @db.Date
+  query       String   @default("")
+  page        String   @default("")
+  device      String   @default("")
+  country     String   @default("")
+  clicks      Int      @default(0)
+  impressions Int      @default(0)
+  ctr         Float    @default(0)
+  position    Float    @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([businessId, date, query, page, device, country])
+  @@index([businessId, date])
+  @@index([businessId, query])
+  @@index([businessId, page])
+}
+
+model ContentRoute {
+  id         String           @id @default(uuid())
+  blogId     String           @unique
+  blog       Blog             @relation(fields: [blogId], references: [id], onDelete: Cascade)
+  businessId String
+  business   Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  route      ContentRouteType @default(DUAL)
+  confidence Float            @default(0.5) // 0-1, heuristic confidence
+  reason     String? // Human-readable explanation shown in UI
+  assignedAt DateTime         @default(now())
+  createdAt  DateTime         @default(now())
+  updatedAt  DateTime         @updatedAt
+
+  @@index([businessId])
+  @@index([route])
+}
+
+// Framer Marketplace plugin handshake rows.
+// Created on POST /api/public/v1/framer-plugin/authorize,
+// updated when the user completes signup (frontend posts to /handshake),
+// consumed + deleted on POST /api/v1/framer-plugin/connect.
+//
+// Expired rows are removed on the next Framer authorize request.
+// pluginNonceHash binds the readKey to the originating plugin instance
+// so an attacker who sees a readKey can't poll it from a different plugin.
+model FramerPluginHandshake {
+  readKey            String   @id
+  readKeyDigest      String?
+  pluginNonceHash    String
+  exchangeCode       String?  @unique
+  exchangeCodeDigest String?
+  userId             String?
+  createdAt          DateTime @default(now())
+  expiresAt          DateTime
+
+  @@index([expiresAt])
+  @@index([userId])
+}
+
+// Off-page strategy engine: per-business status of an opportunity in the queue.
+// No FK relation (keeps it decoupled from the Business model); keyed by a stable
+// opportunityKey so status survives queue re-computation.
+model OffPageOpportunity {
+  id                 String    @id @default(uuid())
+  businessId         String
+  opportunityKey     String
+  leverKey           String
+  status             String    @default("todo") // todo | in_progress | done | dismissed
+  // Outcome verification: confirm the user's posted Reddit thread / claimed
+  // directory listing is actually live (not blind-trust the "done" toggle).
+  verificationStatus String? // unverified | verifying | verified | not_found | failed
+  verifiedAt         DateTime?
+  evidenceUrl        String? // user-provided post/listing URL to verify
+  evidence           Json? // what the verifier found (matched NAP, post author, etc.)
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  @@unique([businessId, opportunityKey])
+  @@index([businessId])
+}
+
+// Off-page research cache: the validated + live-enriched opportunity set per
+// business. The multi-agent pipeline (planner → researchers → validator) plus
+// the live checks (Reddit threads, directory reachability + already-listed) is
+// expensive, so it runs once per business and is served from here until the TTL
+// expires or the user forces a refresh. inputHash fingerprints the business
+// inputs so a changed profile invalidates the cache.
+model OffPageResearchCache {
+  id          String   @id @default(uuid())
+  businessId  String   @unique
+  inputHash   String
+  payload     Json // validated + enriched opportunities (full queue)
+  generatedAt DateTime @default(now())
+  expiresAt   DateTime
+
+  @@index([businessId])
+  @@map("off_page_research_cache")
+}
