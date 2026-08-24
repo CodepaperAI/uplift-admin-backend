@@ -54,6 +54,12 @@ variable "github_repository" {
   default     = "CodepaperAI/uplift-admin-backend"
 }
 
+variable "github_oidc_subject" {
+  description = "Exact GitHub Actions OIDC subject, including the organization and repository IDs required by the CodepaperAI subject template."
+  type        = string
+  default     = "repo:CodepaperAI@267714447/uplift-admin-backend@1345392511:environment:production"
+}
+
 variable "github_environment" {
   type    = string
   default = "production"

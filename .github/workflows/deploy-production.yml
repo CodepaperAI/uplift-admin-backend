@@ -38,18 +38,6 @@ jobs:
           bun run check
           bun run build
 
-      - name: Confirm OIDC subject
-        shell: bash
-        run: |
-          response=$(curl --fail-with-body --silent --show-error \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com")
-          token=$(jq -er '.value' <<<"$response")
-          TOKEN="$token" node -e '
-            const payload = JSON.parse(Buffer.from(process.env.TOKEN.split(".")[1], "base64url"));
-            console.log(JSON.stringify({ sub: payload.sub, aud: payload.aud, repository: payload.repository, environment: payload.environment }));
-          '
-
       - name: Configure short-lived AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
