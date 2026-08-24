@@ -5,10 +5,17 @@ import { prisma } from "../config/db.config";
 import { sendError, sendSuccess } from "../utils/response.utils";
 import { inngest } from "../inngest/admin-client";
 import {
+  commandDayForDate,
+  commandDayRange,
   commandMonthsEndingAt,
   commandMonthRange,
   currentCommandMonth,
 } from "../command/toronto-period";
+import {
+  buildStripeLifecycle,
+  SUBSCRIPTION_CREATED_EVENT,
+  SUBSCRIPTION_DELETED_EVENT,
+} from "../command/stripe-lifecycle";
 import {
   commandPaginationResult,
   parseCommandPagination,
@@ -1477,5 +1484,160 @@ export async function requestCommandStripeReconciliation(
     );
   } catch (error) {
     sendError(res, "Failed to queue Stripe reconciliation", 500, error);
+  }
+}
+
+/** Live statuses, matching the roster and MRR queries in this file. */
+const LIFECYCLE_LIVE_STATUSES = ["trialing", "active", "past_due"];
+/** Same ceiling the superadmin daily metrics use, for the same reason. */
+const LIFECYCLE_MAX_DAYS = 3_660;
+
+function parseLifecycleRange(query: Request["query"]) {
+  const raw = (value: unknown): string | null =>
+    typeof value === "string" && value.trim() !== "" ? value.trim() : null;
+  const today = commandDayForDate(new Date());
+  const to = raw(query.to) ?? today;
+  const from = raw(query.from) ?? to;
+  try {
+    const range = commandDayRange(from, to);
+    if (range.dayCount > LIFECYCLE_MAX_DAYS) {
+      return { error: new Error(`Date range cannot exceed ${LIFECYCLE_MAX_DAYS} days`) } as const;
+    }
+    return { range } as const;
+  } catch (error) {
+    return { error } as const;
+  }
+}
+
+/**
+ * Daily subscription starts and cancellations.
+ *
+ * Answers the two questions the Command panel has had to guess at: how many
+ * subscriptions began on a given day, and how many ended — with the revenue
+ * attached to each, per currency, never summed across them.
+ *
+ * The timing is taken only from real Stripe webhook rows. Reconciliation
+ * snapshots carry the sync run's clock rather than the event's, so treating
+ * them as starts would report long-standing customers as new business. See
+ * `command/stripe-lifecycle.ts`; the `coverage` block reports exactly how much
+ * of the roster this endpoint can and cannot date, so the panel can say so
+ * rather than drawing zeros that read as "nothing happened".
+ */
+export async function getCommandStripeLifecycle(
+  req: Request,
+  res: Response,
+): Promise<void> {
+  try {
+    const parsed = parseLifecycleRange(req.query);
+    if ("error" in parsed) {
+      sendError(res, "Invalid query", 400, parsed.error);
+      return;
+    }
+    const { range } = parsed;
+    const cacheKey = `stripe-lifecycle-v1:${range.from}:${range.to}`;
+    const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
+    if (cached) {
+      sendSuccess(res, cached, "Command Stripe lifecycle");
+      return;
+    }
+
+    const eventSelect = {
+      stripeSubscriptionId: true,
+      stripeCustomerId: true,
+      eventType: true,
+      status: true,
+      monthlyRecurringMinor: true,
+      currency: true,
+      occurredAt: true,
+    } as const;
+
+    const [inRange, liveSubscriptions, createdEventRefs] = await Promise.all([
+      prisma.commandStripeSubscriptionEvent.findMany({
+        where: {
+          occurredAt: { gte: range.start, lt: range.end },
+          eventType: { in: [SUBSCRIPTION_CREATED_EVENT, SUBSCRIPTION_DELETED_EVENT] },
+        },
+        select: eventSelect,
+        orderBy: { occurredAt: "asc" },
+      }),
+      prisma.commandStripeSubscriptionSnapshot.findMany({
+        where: { status: { in: LIFECYCLE_LIVE_STATUSES } },
+        select: { stripeSubscriptionId: true },
+      }),
+      prisma.commandStripeSubscriptionEvent.findMany({
+        where: { eventType: SUBSCRIPTION_CREATED_EVENT },
+        distinct: ["stripeSubscriptionId"],
+        select: { stripeSubscriptionId: true },
+      }),
+    ]);
+
+    // A cancellation whose payload reports zero needs the last known value to
+    // say what was actually lost. Only those subscriptions need their history,
+    // so the second read stays small instead of pulling the whole log.
+    const needsPriorValue = inRange
+      .filter(
+        (event) =>
+          event.eventType === SUBSCRIPTION_DELETED_EVENT &&
+          event.monthlyRecurringMinor.isZero(),
+      )
+      .map((event) => event.stripeSubscriptionId);
+    const priorValues = needsPriorValue.length
+      ? await prisma.commandStripeSubscriptionEvent.findMany({
+          where: {
+            stripeSubscriptionId: { in: [...new Set(needsPriorValue)] },
+            occurredAt: { lt: range.end },
+          },
+          select: eventSelect,
+          orderBy: { occurredAt: "asc" },
+        })
+      : [];
+
+    // The oldest believable event overall, so the panel can say where the
+    // series genuinely begins rather than implying it covers all history.
+    const oldestReal = await prisma.commandStripeSubscriptionEvent.findFirst({
+      where: {
+        eventType: { in: [SUBSCRIPTION_CREATED_EVENT, SUBSCRIPTION_DELETED_EVENT] },
+      },
+      select: { occurredAt: true },
+      orderBy: { occurredAt: "asc" },
+    });
+
+    const lifecycle = buildStripeLifecycle({
+      events: [...inRange, ...priorValues],
+      from: range.from,
+      to: range.to,
+      liveSubscriptionIds: liveSubscriptions.map((row) => row.stripeSubscriptionId),
+      subscriptionIdsWithCreatedEvent: new Set(
+        createdEventRefs.map((row) => row.stripeSubscriptionId),
+      ),
+    });
+
+    const payload = {
+      range: {
+        from: range.from,
+        to: range.to,
+        start: range.start.toISOString(),
+        endExclusive: range.end.toISOString(),
+        dayCount: range.dayCount,
+        timeZone: range.timeZone,
+      },
+      ...lifecycle,
+      coverage: {
+        ...lifecycle.coverage,
+        // Taken from the whole log, not the fetched window, so a narrow range
+        // does not make the log look younger than it is.
+        eventLogStartsOn: oldestReal
+          ? commandDayForDate(oldestReal.occurredAt)
+          : null,
+        rangeStartsBeforeEventLog: oldestReal
+          ? range.from < commandDayForDate(oldestReal.occurredAt)
+          : false,
+      },
+    };
+
+    await writeCommandCache(cacheKey, payload);
+    sendSuccess(res, payload, "Command Stripe lifecycle");
+  } catch (error: unknown) {
+    sendError(res, "Failed to load Stripe lifecycle", 500, error);
   }
 }

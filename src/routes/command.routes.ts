@@ -10,6 +10,7 @@ import {
   requireCommandPanel,
 } from "../middleware/require-command-capability";
 import {
+  getCommandStripeLifecycle,
   getCommandStripeOverview,
   getCommandStripeHealth,
   getCommandStripeSyncRuns,
@@ -85,6 +86,11 @@ CommandRouter.get(
   "/stripe/overview",
   requireCommandCapability("view.financials"),
   getCommandStripeOverview,
+);
+CommandRouter.get(
+  "/stripe/lifecycle",
+  requireCommandCapability("view.financials"),
+  getCommandStripeLifecycle,
 );
 CommandRouter.get(
   "/stripe/sync-runs",
