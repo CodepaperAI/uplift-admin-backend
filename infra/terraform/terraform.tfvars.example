@@ -1,5 +1,5 @@
 aws_profile       = "uplift-dev"
 aws_region        = "us-east-1"
 admin_api_domain  = "admin-api.upliftai.co"
-github_repository = "CodepaperAI/uplift-ai-admin-api"
+github_repository = "CodepaperAI/uplift-admin-backend"
 github_environment = "production"
