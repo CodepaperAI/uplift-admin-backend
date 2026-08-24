@@ -51,7 +51,7 @@ variable "root_volume_gib" {
 variable "github_repository" {
   description = "Exact owner/repository allowed to assume the deployment role."
   type        = string
-  default     = "CodepaperAI/uplift-ai-admin-api"
+  default     = "CodepaperAI/uplift-admin-backend"
 }
 
 variable "github_environment" {
