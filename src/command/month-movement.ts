@@ -3,6 +3,7 @@ import {
   commandDayForDate,
   commandDays,
   commandDayRange,
+  commandMonthForDate,
   commandMonthRange,
   shiftCommandDay,
 } from "./toronto-period";
@@ -213,4 +214,121 @@ export function parseMovementMonth(value: unknown): string | null {
   } catch {
     return null;
   }
+}
+
+/** Inclusive month list, oldest first. */
+export function commandMonthSpan(from: string, to: string): string[] {
+  const parse = (month: string) => {
+    const match = /^(\d{4})-(0[1-9]|1[0-2])$/.exec(month);
+    if (!match) throw new Error("Month must use YYYY-MM format");
+    return Number(match[1]) * 12 + Number(match[2]) - 1;
+  };
+  const start = parse(from);
+  const end = parse(to);
+  if (end < start) throw new Error("Month range ends before it starts");
+  if (end - start >= 120) throw new Error("Month range cannot exceed 120 months");
+  return Array.from({ length: end - start + 1 }, (_, index) => {
+    const absolute = start + index;
+    return `${Math.floor(absolute / 12)}-${String((absolute % 12) + 1).padStart(2, "0")}`;
+  });
+}
+
+export type MovementHistoryMonth = {
+  month: string;
+  newSubscribers: number;
+  cancellations: number;
+  paymentFailures: number;
+  /** Distinct accounts in either churn bucket. Never their sum. */
+  churned: number;
+  net: number;
+};
+
+/**
+ * The same arrivals and departures, bucketed by month instead of by day.
+ *
+ * Deliberately a second pass over the same facts rather than a roll-up of the
+ * daily series: a customer who failed a payment on the 5th and cancelled on the
+ * 20th is *one* account lost for the month, and summing two daily bars would
+ * report two. The distinct-account rule has to be applied at whatever grain is
+ * being displayed, which is why this cannot be derived from `days`.
+ */
+export function buildMovementHistory(input: {
+  from: string;
+  to: string;
+  starts: readonly MovementFact[];
+  cancellations: readonly MovementFact[];
+  failedInvoices: readonly FailedInvoiceFact[];
+}): {
+  range: { from: string; to: string; timeZone: string };
+  months: MovementHistoryMonth[];
+  totals: {
+    newSubscribers: number;
+    cancellations: number;
+    paymentFailures: number;
+    churned: number;
+    net: number;
+  };
+} {
+  const months = commandMonthSpan(input.from, input.to);
+  const monthIndex = new Set(months);
+
+  const collect = (
+    facts: readonly { accountKey: string; at: Date }[],
+  ): { byMonth: Map<string, Set<string>>; overall: Set<string> } => {
+    const byMonth = new Map<string, Set<string>>();
+    const overall = new Set<string>();
+    for (const fact of facts) {
+      const month = commandMonthForDate(fact.at);
+      if (!monthIndex.has(month)) continue;
+      const bucket = byMonth.get(month) ?? new Set<string>();
+      bucket.add(fact.accountKey);
+      byMonth.set(month, bucket);
+      overall.add(fact.accountKey);
+    }
+    return { byMonth, overall };
+  };
+
+  const arrived = collect(input.starts);
+  const cancelled = collect(input.cancellations);
+  const failed = collect(input.failedInvoices);
+
+  const series = months.map((month) => {
+    const cancels = cancelled.byMonth.get(month) ?? new Set<string>();
+    const fails = failed.byMonth.get(month) ?? new Set<string>();
+    const churned = new Set([...cancels, ...fails]).size;
+    const newSubscribers = (arrived.byMonth.get(month) ?? new Set()).size;
+    return {
+      month,
+      newSubscribers,
+      cancellations: cancels.size,
+      paymentFailures: fails.size,
+      churned,
+      net: newSubscribers - churned,
+    };
+  });
+
+  const churnedOverall = new Set([...cancelled.overall, ...failed.overall]).size;
+
+  return {
+    range: { from: months[0]!, to: months[months.length - 1]!, timeZone: COMMAND_TIME_ZONE },
+    months: series,
+    totals: {
+      newSubscribers: arrived.overall.size,
+      cancellations: cancelled.overall.size,
+      paymentFailures: failed.overall.size,
+      churned: churnedOverall,
+      net: arrived.overall.size - churnedOverall,
+    },
+  };
+}
+
+/** Earliest Toronto month any of these facts falls in. */
+export function earliestFactMonth(
+  facts: readonly { at: Date }[],
+): string | null {
+  const earliest = facts.reduce<Date | null>(
+    (best, fact) => (best === null || fact.at < best ? fact.at : best),
+    null,
+  );
+  return earliest ? commandMonthForDate(earliest) : null;
 }

@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildMonthMovement,
+  buildMovementHistory,
+  commandMonthSpan,
+  earliestFactMonth,
   parseMovementMonth,
   type FailedInvoiceFact,
   type MovementFact,
@@ -193,5 +196,138 @@ describe("parseMovementMonth", () => {
     for (const value of ["2026-13", "2026-00", "2026", "26-08", "", null, 8, "2026-8"]) {
       expect(parseMovementMonth(value)).toBeNull();
     }
+  });
+});
+
+describe("commandMonthSpan", () => {
+  test("lists every month inclusive, oldest first", () => {
+    expect(commandMonthSpan("2026-03", "2026-08")).toEqual([
+      "2026-03",
+      "2026-04",
+      "2026-05",
+      "2026-06",
+      "2026-07",
+      "2026-08",
+    ]);
+  });
+
+  test("a single month is a span of one", () => {
+    expect(commandMonthSpan("2026-08", "2026-08")).toEqual(["2026-08"]);
+  });
+
+  test("crosses a year boundary", () => {
+    expect(commandMonthSpan("2025-11", "2026-02")).toEqual([
+      "2025-11",
+      "2025-12",
+      "2026-01",
+      "2026-02",
+    ]);
+  });
+
+  test("refuses a backwards or absurd range", () => {
+    expect(() => commandMonthSpan("2026-08", "2026-03")).toThrow();
+    expect(() => commandMonthSpan("2010-01", "2026-08")).toThrow();
+    expect(() => commandMonthSpan("2026-13", "2026-14")).toThrow();
+  });
+});
+
+describe("buildMovementHistory", () => {
+  const RANGE = { from: "2026-03", to: "2026-08" };
+
+  test("gives every month in the span a row, including the empty ones", () => {
+    const result = buildMovementHistory({ ...RANGE, starts: [], cancellations: [], failedInvoices: [] });
+    expect(result.months.map((m) => m.month)).toEqual([
+      "2026-03", "2026-04", "2026-05", "2026-06", "2026-07", "2026-08",
+    ]);
+    expect(result.totals.newSubscribers).toBe(0);
+  });
+
+  test("buckets arrivals into their Toronto month", () => {
+    const result = buildMovementHistory({
+      ...RANGE,
+      // 03:59Z on 1 August is still July in Toronto.
+      starts: [
+        start("cus_a", "2026-08-01T03:59:00.000Z"),
+        start("cus_b", "2026-08-01T04:00:00.000Z"),
+      ],
+      cancellations: [],
+      failedInvoices: [],
+    });
+    const july = result.months.find((m) => m.month === "2026-07")!;
+    const august = result.months.find((m) => m.month === "2026-08")!;
+    expect(july.newSubscribers).toBe(1);
+    expect(august.newSubscribers).toBe(1);
+  });
+
+  test("a failure early in the month and a cancellation later is one account lost", () => {
+    // This is why the monthly series cannot be a roll-up of the daily bars:
+    // summing two days would report two losses for one customer.
+    const result = buildMovementHistory({
+      ...RANGE,
+      starts: [],
+      cancellations: [start("cus_a", "2026-08-20T12:00:00.000Z")],
+      failedInvoices: [invoice("cus_a", "2026-08-05T12:00:00.000Z")],
+    });
+    const august = result.months.find((m) => m.month === "2026-08")!;
+    expect(august.cancellations).toBe(1);
+    expect(august.paymentFailures).toBe(1);
+    expect(august.churned).toBe(1);
+    expect(august.net).toBe(-1);
+  });
+
+  test("the same account arriving in two months counts in each, once overall", () => {
+    const result = buildMovementHistory({
+      ...RANGE,
+      starts: [
+        start("cus_a", "2026-06-10T12:00:00.000Z"),
+        start("cus_a", "2026-07-10T12:00:00.000Z"),
+      ],
+      cancellations: [],
+      failedInvoices: [],
+    });
+    expect(result.months.find((m) => m.month === "2026-06")!.newSubscribers).toBe(1);
+    expect(result.months.find((m) => m.month === "2026-07")!.newSubscribers).toBe(1);
+    // Distinct across the span, so the header cannot double-count them.
+    expect(result.totals.newSubscribers).toBe(1);
+  });
+
+  test("facts outside the span are left out entirely", () => {
+    const result = buildMovementHistory({
+      ...RANGE,
+      starts: [start("cus_old", "2026-01-10T12:00:00.000Z"), start("cus_a", "2026-05-10T12:00:00.000Z")],
+      cancellations: [],
+      failedInvoices: [],
+    });
+    expect(result.totals.newSubscribers).toBe(1);
+    expect(result.months.reduce((sum, m) => sum + m.newSubscribers, 0)).toBe(1);
+  });
+
+  test("net per month can be negative and is reported that way", () => {
+    const result = buildMovementHistory({
+      ...RANGE,
+      starts: [start("cus_a", "2026-04-02T12:00:00.000Z")],
+      cancellations: [
+        start("cus_b", "2026-04-03T12:00:00.000Z"),
+        start("cus_c", "2026-04-04T12:00:00.000Z"),
+      ],
+      failedInvoices: [],
+    });
+    expect(result.months.find((m) => m.month === "2026-04")!.net).toBe(-1);
+  });
+});
+
+describe("earliestFactMonth", () => {
+  test("finds the oldest month present", () => {
+    expect(
+      earliestFactMonth([
+        start("cus_a", "2026-06-10T12:00:00.000Z"),
+        start("cus_b", "2026-03-04T12:00:00.000Z"),
+        start("cus_c", "2026-08-01T12:00:00.000Z"),
+      ]),
+    ).toBe("2026-03");
+  });
+
+  test("no facts means no month to start from", () => {
+    expect(earliestFactMonth([])).toBeNull();
   });
 });

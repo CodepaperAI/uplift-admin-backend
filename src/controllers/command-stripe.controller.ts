@@ -19,6 +19,9 @@ import {
 import { buildPlanMix, type SubscriptionSpan } from "../command/plan-mix";
 import {
   buildMonthMovement,
+  buildMovementHistory,
+  commandMonthSpan,
+  earliestFactMonth,
   parseMovementMonth,
   type FailedInvoiceFact,
   type MovementFact,
@@ -1987,6 +1990,9 @@ const FAILED_INVOICE_STATUSES = ["open", "uncollectible"];
 /** Snapshot statuses that mean this subscription has ended. */
 const MOVEMENT_ENDED_STATUSES = ["canceled", "cancelled", "incomplete_expired"];
 
+/** Ceiling on the month-on-month series, so one bad date cannot balloon it. */
+const MOVEMENT_HISTORY_MAX_MONTHS = 24;
+
 /**
  * One month of arrivals against departures, counted in accounts.
  *
@@ -2022,7 +2028,7 @@ export async function getCommandStripeMonthMovement(
   try {
     const month = parseMovementMonth(req.query.month) ?? currentCommandMonth();
     const range = commandMonthRange(month);
-    const cacheKey = `stripe-month-movement-v3:${month}`;
+    const cacheKey = `stripe-month-movement-v4:${month}`;
     const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
     if (cached) {
       sendSuccess(res, cached, "Command Stripe month movement");
@@ -2075,12 +2081,14 @@ export async function getCommandStripeMonthMovement(
         select: eventSelect,
         orderBy: { occurredAt: "asc" },
       }),
+      // Not scoped to the requested month: the month-on-month series below
+      // needs the same rows, and every other read here is already unscoped, so
+      // narrowing this one would cost a second round trip to no purpose.
       prisma.commandStripeInvoice.findMany({
         where: {
           status: { in: FAILED_INVOICE_STATUSES },
           attemptCount: { gt: 0 },
           amountRemainingMinor: { gt: 0 },
-          providerCreatedAt: inMonth,
         },
         select: {
           stripeInvoiceId: true,
@@ -2207,8 +2215,32 @@ export async function getCommandStripeMonthMovement(
         : null,
     });
 
+    /**
+     * Month on month, from the first month we can actually date back to.
+     *
+     * The start is discovered rather than configured: the series begins at the
+     * oldest arrival any subscription can be dated to, so it extends itself as
+     * history accumulates and never draws a run of leading zeros that reads as
+     * "we sold nothing then". Capped so a stray 2019 date cannot turn this into
+     * a hundred empty columns.
+     */
+    const firstArrivalMonth = earliestFactMonth(starts);
+    const historyFrom =
+      firstArrivalMonth &&
+      commandMonthSpan(firstArrivalMonth, month).length <= MOVEMENT_HISTORY_MAX_MONTHS
+        ? firstArrivalMonth
+        : commandMonthsEndingAt(month, MOVEMENT_HISTORY_MAX_MONTHS).at(-1)!;
+    const history = buildMovementHistory({
+      from: historyFrom,
+      to: month,
+      starts,
+      cancellations,
+      failedInvoices,
+    });
+
     const payload = {
       ...movement,
+      history,
       coverage: {
         ...movement.coverage,
         knownSubscriptions: snapshots.length,
