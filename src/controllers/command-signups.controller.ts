@@ -67,7 +67,7 @@ export async function getCommandDailySignups(
       return;
     }
     const { range } = parsed;
-    const cacheKey = `command-signups-v2:${range.from}:${range.to}`;
+    const cacheKey = `command-signups-v3:${range.from}:${range.to}`;
     const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
     if (cached) {
       sendSuccess(res, cached, "Command daily signups");
@@ -80,21 +80,32 @@ export async function getCommandDailySignups(
       // to ring their own colleagues.
       role: "USER" as const,
     };
-    const [signupsInRange, users] = await Promise.all([
-      prisma.user.count({ where }),
-      prisma.user.findMany({
-        where,
-        select: {
-          id: true,
-          name: true,
-          email: true,
-          phone: true,
-          createdAt: true,
-        },
-        orderBy: { createdAt: "desc" },
-        take: SIGNUP_ROW_CAP,
-      }),
-    ]);
+    /**
+     * Every signup in the range, newest first — ids and contact fields only.
+     *
+     * Loaded in full rather than capped because the state counts have to cover
+     * the whole range. Capping here is what made "Paid 15" identical for 30
+     * days, 90 days and 6 months: the newest 500 rows are the same 500 in all
+     * three, so the counts stopped moving while the headline kept growing. The
+     * *table* is still capped further down; the counts no longer are.
+     *
+     * The fields are small and this is one indexed query with no joins, so at
+     * the current book — a couple of thousand rows — it is cheaper than the
+     * second count query it replaces.
+     */
+    const rangeUsers = await prisma.user.findMany({
+      where,
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        phone: true,
+        createdAt: true,
+      },
+      orderBy: { createdAt: "desc" },
+    });
+    const signupsInRange = rangeUsers.length;
+    const users = rangeUsers.slice(0, SIGNUP_ROW_CAP);
 
     if (users.length === 0) {
       const empty = {
@@ -128,7 +139,8 @@ export async function getCommandDailySignups(
     }
 
     const userIds = users.map((user) => user.id);
-    const [businesses, snapshots, appSubscriptions] = await Promise.all([
+    const rangeUserIds = new Set(rangeUsers.map((user) => user.id));
+    const [businesses, allSnapshots, appSubscriptions] = await Promise.all([
       prisma.business.findMany({
         where: { userId: { in: userIds } },
         select: {
@@ -139,8 +151,10 @@ export async function getCommandDailySignups(
         },
         orderBy: { createdAt: "asc" },
       }),
+      // Every snapshot, not just the table's page. The table is a few hundred
+      // rows at most, and filtering it in memory against the range beats
+      // sending a couple of thousand ids to the database.
       prisma.commandStripeSubscriptionSnapshot.findMany({
-        where: { userId: { in: userIds } },
         select: {
           userId: true,
           status: true,
@@ -157,6 +171,10 @@ export async function getCommandDailySignups(
       }),
     ]);
 
+    // Subscriptions belonging to somebody who signed up inside the range.
+    const snapshots = allSnapshots.filter(
+      (row) => row.userId && rangeUserIds.has(row.userId),
+    );
     const subscriptionIds = snapshots.map((row) => row.stripeSubscriptionId);
     const invoices = subscriptionIds.length
       ? await prisma.commandStripeInvoice.findMany({
@@ -209,13 +227,41 @@ export async function getCommandDailySignups(
       ),
     );
 
-    const { rows, totals } = buildDailySignups({
+    const { rows } = buildDailySignups({
       users,
       businessesByUser,
       subscriptionsByUser,
       invoicesBySubscription,
       planNameBySubscription,
     });
+
+    /**
+     * State counts over the whole range.
+     *
+     * Only signups that actually hold a subscription need classifying, and
+     * across the entire book that is a couple of hundred people — so this runs
+     * over that subset and derives `none` by subtraction rather than
+     * classifying two thousand accounts that have no subscription to classify.
+     */
+    const subscribedRangeUsers = rangeUsers.filter((user) =>
+      subscriptionsByUser.has(user.id),
+    );
+    const classified = buildDailySignups({
+      users: subscribedRangeUsers,
+      businessesByUser,
+      subscriptionsByUser,
+      invoicesBySubscription,
+      planNameBySubscription,
+    });
+    const totals = {
+      ...classified.totals,
+      signups: signupsInRange,
+      none: signupsInRange - subscribedRangeUsers.length,
+      // Reachability is a property of the whole range, not of the loaded page:
+      // it is what a rep can actually work through.
+      reachable: rangeUsers.filter((user) => (user.phone ?? "").trim() !== "")
+        .length,
+    };
 
     const payload = {
       day: {
