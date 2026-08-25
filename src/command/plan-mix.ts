@@ -178,6 +178,29 @@ export function buildPlanMix(input: {
         const events = bySubscription.get(snapshot.stripeSubscriptionId) ?? [];
         return !events.some((event) => carriesRealOccurrenceTime(event.eventType));
       }).length,
+      /**
+       * Subscriptions with no start date at all. This is the number that limits
+       * the upgrade count, since that is ordered on start dates — reporting the
+       * event-log gap instead would blame the wrong source.
+       */
+      spansWithoutStartDate: input.spans.filter((span) => span.startedAt === null)
+        .length,
+      /** Every subscription considered for the upgrade question, live or not. */
+      spansConsidered: input.spans.length,
+      /** Customers holding both a core and a social subscription, ever. */
+      customersOnBoth: (() => {
+        const core = new Set<string>();
+        const social = new Set<string>();
+        for (const span of input.spans) {
+          if (!span.stripeCustomerId) continue;
+          if (hasSocial(span.stripePriceIds, socialPriceIds)) {
+            social.add(span.stripeCustomerId);
+          } else {
+            core.add(span.stripeCustomerId);
+          }
+        }
+        return [...social].filter((id) => core.has(id)).length;
+      })(),
       socialPriceIdCount: socialPriceIds.size,
     },
   };

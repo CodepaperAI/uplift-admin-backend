@@ -323,3 +323,43 @@ describe("findUpgradesFromSpans", () => {
     expect(found.map((u) => u.stripeSubscriptionId)).toEqual(["s2", "s1"]);
   });
 });
+
+describe("upgrade coverage is reported against the source it uses", () => {
+  test("counts undated spans and customers holding both plans", () => {
+    const mix = buildPlanMix({
+      from: "2026-08-01",
+      to: "2026-08-31",
+      socialPriceIds: SOCIAL_IDS,
+      snapshots: [],
+      events: [],
+      spans: [
+        { stripeSubscriptionId: "a", stripeCustomerId: "cus_both", stripePriceIds: [CORE], startedAt: new Date("2026-01-01T00:00:00.000Z") },
+        { stripeSubscriptionId: "b", stripeCustomerId: "cus_both", stripePriceIds: [SOCIAL], startedAt: new Date("2026-08-10T00:00:00.000Z") },
+        { stripeSubscriptionId: "c", stripeCustomerId: "cus_core", stripePriceIds: [CORE], startedAt: null },
+      ],
+    });
+    expect(mix.coverage.spansConsidered).toBe(3);
+    expect(mix.coverage.spansWithoutStartDate).toBe(1);
+    // The number that decides whether an upgrade is even possible to find.
+    expect(mix.coverage.customersOnBoth).toBe(1);
+    expect(mix.upgrades.inRange).toBe(1);
+  });
+
+  test("zero customers on both plans means zero upgrades is a real answer", () => {
+    // Not a coverage failure: nobody ever held both, so nobody moved up.
+    const mix = buildPlanMix({
+      from: "2026-08-01",
+      to: "2026-08-31",
+      socialPriceIds: SOCIAL_IDS,
+      snapshots: [],
+      events: [],
+      spans: [
+        { stripeSubscriptionId: "a", stripeCustomerId: "cus_1", stripePriceIds: [CORE], startedAt: new Date("2026-01-01T00:00:00.000Z") },
+        { stripeSubscriptionId: "b", stripeCustomerId: "cus_2", stripePriceIds: [SOCIAL], startedAt: new Date("2026-08-10T00:00:00.000Z") },
+      ],
+    });
+    expect(mix.coverage.customersOnBoth).toBe(0);
+    expect(mix.coverage.spansWithoutStartDate).toBe(0);
+    expect(mix.upgrades.allTime).toBe(0);
+  });
+});
