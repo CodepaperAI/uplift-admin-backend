@@ -116,6 +116,7 @@ export async function getCommandDailySignups(
           monthlyRecurringMinor: true,
           currency: true,
           stripeSubscriptionId: true,
+          currentPeriodEnd: true,
         },
       }),
       // The plan name lives on the app's own record, not on the Stripe snapshot.

@@ -1,4 +1,5 @@
 import { getCommandDailySignups } from "../controllers/command-signups.controller";
+import { getCommandGhlUsers } from "../controllers/command-ghl-users.controller";
 import { Router } from "express";
 import {
   getCommandAccessMatrix,
@@ -125,6 +126,11 @@ CommandRouter.post(
   "/stripe/reconcile",
   requireCommandCapability("stripe.sync"),
   requestCommandStripeReconciliation,
+);
+CommandRouter.get(
+  "/ghl/users",
+  requireCommandCapability("manage.reps"),
+  getCommandGhlUsers,
 );
 CommandRouter.get(
   "/ghl/overview",

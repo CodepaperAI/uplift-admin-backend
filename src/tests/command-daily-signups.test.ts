@@ -12,13 +12,20 @@ function user(id: string, at = "2026-08-25T14:00:00Z", phone: string | null = "+
   return { id, name: `User ${id}`, email: `${id}@example.invalid`, phone, createdAt: new Date(at) };
 }
 
-function sub(id: string, userId: string, status = "active", mrr = "14900"): SignupSubscriptionFact {
+function sub(
+  id: string,
+  userId: string,
+  status = "active",
+  mrr = "14900",
+  currentPeriodEnd: string | null = "2026-09-25T14:00:00Z",
+): SignupSubscriptionFact {
   return {
     userId,
     status,
     monthlyRecurringMinor: dec(mrr),
     currency: "usd",
     stripeSubscriptionId: id,
+    currentPeriodEnd: currentPeriodEnd ? new Date(currentPeriodEnd) : null,
   };
 }
 
@@ -167,5 +174,47 @@ describe("buildDailySignups", () => {
     });
     expect(totals.signups).toBe(3);
     expect(totals.reachable).toBe(1);
+  });
+});
+
+describe("the first bill date", () => {
+  test("a short window is carried so a trial is not read as a failed card", () => {
+    // The production case: signed up today, Stripe says active, bills in three
+    // days. No established subscription on the book renews in under 31 days.
+    const { rows } = buildDailySignups({
+      users: [user("u1", "2026-08-25T14:00:00Z")],
+      businessesByUser: noBusinesses,
+      subscriptionsByUser: new Map([
+        ["u1", [sub("sub_1", "u1", "active", "14900", "2026-08-28T14:00:00Z")]],
+      ]),
+      invoicesBySubscription: new Map([["sub_1", [invoice("sub_1", 0)]]]),
+    });
+    expect(rows[0]?.state).toBe("pending");
+    expect(rows[0]?.daysToNextBill).toBe(3);
+    expect(rows[0]?.nextBillAt).toBe("2026-08-28T14:00:00.000Z");
+  });
+
+  test("a normal monthly window comes through as a month", () => {
+    const { rows } = buildDailySignups({
+      users: [user("u1", "2026-08-25T14:00:00Z")],
+      businessesByUser: noBusinesses,
+      subscriptionsByUser: new Map([
+        ["u1", [sub("sub_1", "u1", "active", "14900", "2026-09-25T14:00:00Z")]],
+      ]),
+      invoicesBySubscription: new Map([["sub_1", [invoice("sub_1", 14900)]]]),
+    });
+    expect(rows[0]?.state).toBe("paid");
+    expect(rows[0]?.daysToNextBill).toBe(31);
+  });
+
+  test("no subscription means no bill date to report", () => {
+    const { rows } = buildDailySignups({
+      users: [user("u1")],
+      businessesByUser: noBusinesses,
+      subscriptionsByUser: new Map(),
+      invoicesBySubscription: new Map(),
+    });
+    expect(rows[0]?.nextBillAt).toBeNull();
+    expect(rows[0]?.daysToNextBill).toBeNull();
   });
 });

@@ -27,7 +27,16 @@ export type SignupPaymentState =
   | "trial"
   /** Opened below full price on a coupon, not yet at full price. */
   | "discounted"
-  /** Has a subscription, but no invoice has settled yet. */
+  /**
+   * A live subscription with no settled invoice in our records yet.
+   *
+   * Named for what is known rather than guessed at. Measured on production
+   * these are same-day signups that Stripe reports as `active` with a first
+   * bill three days out — a window no established subscription has, since every
+   * one of those renews in 31, 34 or 365 days. So it is an introductory period
+   * whose charge has not reached the invoice table, not a failed card. Calling
+   * it "unpaid" sent a rep to chase a payment that was never due.
+   */
   | "pending"
   /** Subscribed and already ended. Signed up and cancelled the same day. */
   | "cancelled"
@@ -51,6 +60,17 @@ export type SignupRow = {
   planName: string | null;
   /** True once they have built something — a signal they are engaged. */
   hasBusiness: boolean;
+  /**
+   * When Stripe bills them next, and how far off that is in days.
+   *
+   * Carried because it is the only thing that distinguishes a subscription
+   * waiting on its first charge from one whose payment failed, and the two need
+   * opposite responses. A window of a few days on a monthly plan is an
+   * introductory period, not a broken card — every established subscription on
+   * the book renews in 31, 34 or 365 days.
+   */
+  nextBillAt: string | null;
+  daysToNextBill: number | null;
 };
 
 export type SignupSubscriptionFact = {
@@ -59,6 +79,8 @@ export type SignupSubscriptionFact = {
   monthlyRecurringMinor: Prisma.Decimal;
   currency: string | null;
   stripeSubscriptionId: string;
+  /** When Stripe next bills them. The first bill, for a brand-new signup. */
+  currentPeriodEnd: Date | null;
 };
 
 const ENDED_STATUSES = new Set([
@@ -113,6 +135,7 @@ export function buildDailySignups(input: {
         input.subscriptionsByUser.get(user.id) ?? [],
       );
 
+      const billAt = subscription?.currentPeriodEnd ?? null;
       const base = {
         userId: user.id,
         name: user.name,
@@ -122,6 +145,12 @@ export function buildDailySignups(input: {
         websiteUrl: primary?.businessWebsiteUrl ?? null,
         signedUpAt: user.createdAt.toISOString(),
         hasBusiness: businesses.length > 0,
+        nextBillAt: billAt ? billAt.toISOString() : null,
+        daysToNextBill: billAt
+          ? Math.round(
+              (billAt.getTime() - user.createdAt.getTime()) / 86_400_000,
+            )
+          : null,
       };
 
       if (!subscription) {

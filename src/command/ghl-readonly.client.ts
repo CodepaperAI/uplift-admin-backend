@@ -35,6 +35,16 @@ export type GhlOpportunity = {
   forecastExpectedCloseDate?: string;
 };
 
+export type GhlUser = {
+  id: string;
+  name?: string;
+  firstName?: string;
+  lastName?: string;
+  email?: string;
+  phone?: string;
+  roles?: { type?: string; role?: string };
+};
+
 export type GhlPipeline = {
   id: string;
   name?: string;
@@ -122,6 +132,7 @@ type GhlClientConfig = {
   paymentsVersion?: string;
   conversationsVersion?: string;
   calendarsVersion?: string;
+  usersVersion?: string;
   fetchImpl?: typeof fetch;
 };
 
@@ -134,6 +145,7 @@ export class GhlReadOnlyClient {
   private readonly paymentsVersion: string;
   private readonly conversationsVersion: string;
   private readonly calendarsVersion: string;
+  private readonly usersVersion: string;
   private readonly fetchImpl: typeof fetch;
 
   constructor(config: GhlClientConfig) {
@@ -150,6 +162,7 @@ export class GhlReadOnlyClient {
     this.paymentsVersion = config.paymentsVersion ?? "2021-07-28";
     this.conversationsVersion = config.conversationsVersion ?? "v3";
     this.calendarsVersion = config.calendarsVersion ?? "2021-04-15";
+    this.usersVersion = config.usersVersion ?? "2021-07-28";
     this.fetchImpl = config.fetchImpl ?? fetch;
   }
 
@@ -210,6 +223,29 @@ export class GhlReadOnlyClient {
       );
     }
     return result.opportunities;
+  }
+
+  /**
+   * The people in the location, so an `assignedTo` id can be given a name.
+   *
+   * The sync stores `assignedToGhlId` on every opportunity but nothing anywhere
+   * maps that id to a person, which is why every opportunity in the panel reads
+   * "Unassigned" — there are nine distinct assignee ids across the pipeline and
+   * no way to tell whose they are. This is the lookup that fixes it.
+   *
+   * Uses the users version rather than the opportunities one: GHL versions its
+   * endpoints independently and the users route answers on 2021-07-28.
+   */
+  async users() {
+    const query = new URLSearchParams({ locationId: this.locationId });
+    const result = await this.get<{ users?: GhlUser[] }>(
+      `/users/?${query.toString()}`,
+      this.usersVersion,
+    );
+    if (!Array.isArray(result.users)) {
+      throw new Error("GHL users response did not contain a users array");
+    }
+    return result.users;
   }
 
   async pipelines() {
