@@ -18,6 +18,13 @@ import {
 } from "../command/stripe-lifecycle";
 import { buildPlanMix, type SubscriptionSpan } from "../command/plan-mix";
 import {
+  classifyEntryPath,
+  tallyEntryPaths,
+  type EntryClassification,
+  type EntryPath,
+  type InvoiceFact,
+} from "../command/entry-path";
+import {
   buildMonthMovement,
   buildMovementHistory,
   commandMonthSpan,
@@ -302,7 +309,7 @@ export async function getCommandStripeOverview(
       page: req.query.page,
       pageSize: req.query.pageSize,
     });
-    const cacheKey = `stripe-overview-v8:${period.month}:${page}:${pageSize}`;
+    const cacheKey = `stripe-overview-v9:${period.month}:${page}:${pageSize}`;
     const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
     if (cached) {
       sendSuccess(res, cached, "Command Stripe overview");
@@ -571,6 +578,60 @@ export async function getCommandStripeOverview(
         ];
       }),
     );
+
+    /**
+     * Trial-first versus paid-full-price-on-day-one, for every live
+     * subscription.
+     *
+     * Read over the whole book rather than the visible page, because the
+     * headline counts are about the business and a page of fifty would answer a
+     * different question. The invoice rows are the only record of *entry* that
+     * survives conversion — see `command/entry-path.ts`.
+     */
+    const liveForEntryPath =
+      await prisma.commandStripeSubscriptionSnapshot.findMany({
+        where: liveWhere,
+        select: {
+          stripeSubscriptionId: true,
+          stripeCustomerId: true,
+          monthlyRecurringMinor: true,
+        },
+      });
+    const entryInvoiceRows = liveForEntryPath.length
+      ? await prisma.commandStripeInvoice.findMany({
+          where: {
+            stripeSubscriptionId: {
+              in: liveForEntryPath.map((row) => row.stripeSubscriptionId),
+            },
+          },
+          select: {
+            stripeSubscriptionId: true,
+            currency: true,
+            amountPaidMinor: true,
+            billingReason: true,
+            paidAt: true,
+            providerCreatedAt: true,
+          },
+        })
+      : [];
+    const invoicesBySubscription = new Map<string, InvoiceFact[]>();
+    for (const row of entryInvoiceRows) {
+      if (!row.stripeSubscriptionId) continue;
+      const list = invoicesBySubscription.get(row.stripeSubscriptionId) ?? [];
+      list.push(row as InvoiceFact);
+      invoicesBySubscription.set(row.stripeSubscriptionId, list);
+    }
+    const entryBySubscription = new Map<string, EntryClassification>();
+    for (const subscription of liveForEntryPath) {
+      entryBySubscription.set(
+        subscription.stripeSubscriptionId,
+        classifyEntryPath({
+          invoices: invoicesBySubscription.get(subscription.stripeSubscriptionId) ?? [],
+          recurringMinor: subscription.monthlyRecurringMinor,
+        }),
+      );
+    }
+    const entryPathTotals = tallyEntryPaths([...entryBySubscription.values()]);
 
     const invoiceTotalsBySubscription = new Map<
       string,
