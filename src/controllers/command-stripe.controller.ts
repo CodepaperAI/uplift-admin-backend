@@ -1373,6 +1373,11 @@ export async function getCommandStripeOverview(
               }
             : null,
         },
+        /**
+         * How the whole live book entered, counted in subscriptions rather than
+         * accounts: an account that took both routes cannot be one tally mark.
+         */
+        entryPaths: entryPathTotals,
         rosterPagination: commandPaginationResult({
           page,
           pageSize,
@@ -1422,6 +1427,24 @@ export async function getCommandStripeOverview(
               earliest === null || candidate.at < earliest.at ? candidate : earliest,
             null,
           );
+          const entries = subscriptions.flatMap((subscription) => {
+            const value = entryBySubscription.get(subscription.stripeSubscriptionId);
+            return value ? [value] : [];
+          });
+          // One label per account only when its subscriptions agree. An account
+          // that bought the trial once and a second plan at full price took
+          // both routes, and picking one would throw the other away.
+          const distinctEntryPaths = [...new Set(entries.map((entry) => entry.path))];
+          const entryPath: EntryPath | "mixed" | null =
+            distinctEntryPaths.length === 0
+              ? null
+              : distinctEntryPaths.length === 1
+                ? distinctEntryPaths[0]!
+                : "mixed";
+          // Only meaningful when there is a single route, so it is withheld
+          // rather than picking an arbitrary one of two openings.
+          const entryOpening =
+            distinctEntryPaths.length === 1 ? entries[0] : undefined;
           const renewalDates = subscriptions.flatMap((subscription) =>
             subscription.currentPeriodEnd ? [subscription.currentPeriodEnd] : [],
           );
@@ -1491,6 +1514,10 @@ export async function getCommandStripeOverview(
             ),
             // Null when nothing authoritative is known, so a reader is told
             // rather than shown the day the sync happened to run.
+            entryPath,
+            entryFirstPaidMinor: entryOpening?.firstPaidMinor ?? null,
+            entryCurrency: entryOpening?.currency ?? null,
+            entryPaidInvoiceCount: entryOpening?.paidInvoiceCount ?? null,
             startedAt: earliestTrueStart?.at ?? null,
             startedAtSource: earliestTrueStart?.source ?? null,
             // What `startedAt` used to be. Kept under a name that says what it
