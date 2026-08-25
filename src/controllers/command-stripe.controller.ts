@@ -16,7 +16,7 @@ import {
   SUBSCRIPTION_CREATED_EVENT,
   SUBSCRIPTION_DELETED_EVENT,
 } from "../command/stripe-lifecycle";
-import { buildPlanMix } from "../command/plan-mix";
+import { buildPlanMix, type SubscriptionSpan } from "../command/plan-mix";
 import {
   commandPaginationResult,
   parseCommandPagination,
@@ -1774,7 +1774,7 @@ export async function getCommandStripePlanMix(
       return;
     }
     const { range } = parsed;
-    const cacheKey = `stripe-plan-mix-v1:${range.from}:${range.to}`;
+    const cacheKey = `stripe-plan-mix-v2:${range.from}:${range.to}`;
     const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
     if (cached) {
       sendSuccess(res, cached, "Command Stripe plan mix");
@@ -1788,8 +1788,10 @@ export async function getCommandStripePlanMix(
         .map((plan) => plan.priceId),
     );
 
-    const snapshots = await prisma.commandStripeSubscriptionSnapshot.findMany({
-      where: { status: { in: LIFECYCLE_LIVE_STATUSES } },
+    // Every subscription ever seen, not only the live ones: a core plan the
+    // customer cancelled in March is exactly what makes an August social
+    // subscription an upgrade rather than a first purchase.
+    const allSnapshots = await prisma.commandStripeSubscriptionSnapshot.findMany({
       select: {
         stripeSubscriptionId: true,
         stripeCustomerId: true,
@@ -1799,7 +1801,11 @@ export async function getCommandStripePlanMix(
         currency: true,
       },
     });
+    const snapshots = allSnapshots.filter((row) =>
+      LIFECYCLE_LIVE_STATUSES.includes(row.status),
+    );
     const subscriptionIds = snapshots.map((row) => row.stripeSubscriptionId);
+    const allSubscriptionIds = allSnapshots.map((row) => row.stripeSubscriptionId);
 
     const events = subscriptionIds.length
       ? await prisma.commandStripeSubscriptionEvent.findMany({
@@ -1815,9 +1821,55 @@ export async function getCommandStripePlanMix(
         })
       : [];
 
+    // Start dates for every subscription, from the created event where there
+    // is one and the subscription record where there is not. Neither source
+    // covers the whole base alone.
+    const [createdForSpans, recordsForSpans] = await Promise.all([
+      allSubscriptionIds.length
+        ? prisma.commandStripeSubscriptionEvent.groupBy({
+            by: ["stripeSubscriptionId"],
+            where: {
+              stripeSubscriptionId: { in: allSubscriptionIds },
+              eventType: SUBSCRIPTION_CREATED_EVENT,
+            },
+            _min: { occurredAt: true },
+          })
+        : Promise.resolve([]),
+      allSubscriptionIds.length
+        ? prisma.subscription.findMany({
+            where: { stripeSubscriptionId: { in: allSubscriptionIds } },
+            select: { stripeSubscriptionId: true, startDate: true },
+          })
+        : Promise.resolve([]),
+    ]);
+    const createdAtBySub = new Map(
+      createdForSpans.flatMap((row) =>
+        row._min.occurredAt
+          ? ([[row.stripeSubscriptionId, row._min.occurredAt]] as const)
+          : [],
+      ),
+    );
+    const recordStartBySub = new Map(
+      recordsForSpans.flatMap((row) =>
+        row.stripeSubscriptionId
+          ? ([[row.stripeSubscriptionId, row.startDate]] as const)
+          : [],
+      ),
+    );
+    const spans: SubscriptionSpan[] = allSnapshots.map((row) => ({
+      stripeSubscriptionId: row.stripeSubscriptionId,
+      stripeCustomerId: row.stripeCustomerId,
+      stripePriceIds: row.stripePriceIds,
+      startedAt:
+        createdAtBySub.get(row.stripeSubscriptionId) ??
+        recordStartBySub.get(row.stripeSubscriptionId) ??
+        null,
+    }));
+
     const mix = buildPlanMix({
       snapshots,
       events,
+      spans,
       socialPriceIds,
       from: range.from,
       to: range.to,

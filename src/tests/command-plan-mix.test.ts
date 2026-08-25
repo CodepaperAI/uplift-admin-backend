@@ -3,7 +3,7 @@ import { Prisma } from "@prisma/client";
 import {
   buildPlanMix,
   classify,
-  findSocialUpgrade,
+  findUpgradesFromSpans,
   hasSocial,
   type PlanMixEvent,
   type PlanMixSnapshot,
@@ -61,104 +61,6 @@ describe("classification", () => {
   });
 });
 
-describe("findSocialUpgrade", () => {
-  test("finds the move from core to social", () => {
-    const upgrade = findSocialUpgrade(
-      [
-        ev({ id: "s1", type: SUBSCRIPTION_CREATED_EVENT, at: "2026-06-01T12:00:00.000Z", prices: [CORE] }),
-        ev({ id: "s1", type: "customer.subscription.updated", at: "2026-08-20T15:00:00.000Z", prices: [SOCIAL] }),
-      ],
-      SOCIAL_IDS,
-    );
-    expect(upgrade?.addedOn).toBe("2026-08-20");
-    expect(upgrade?.stripeSubscriptionId).toBe("s1");
-  });
-
-  test("a subscription created on social is not an upgrade", () => {
-    // New customer buying the bigger plan is a different event from an
-    // existing customer adding to theirs, and worth different attention.
-    const upgrade = findSocialUpgrade(
-      [
-        ev({ id: "s2", type: SUBSCRIPTION_CREATED_EVENT, at: "2026-08-01T12:00:00.000Z", prices: [SOCIAL] }),
-        ev({ id: "s2", type: "customer.subscription.updated", at: "2026-08-10T12:00:00.000Z", prices: [SOCIAL] }),
-      ],
-      SOCIAL_IDS,
-    );
-    expect(upgrade).toBeNull();
-  });
-
-  test("already social on the earliest datable row is not claimed as recent", () => {
-    // No created event, so the change happened before the log can see it.
-    const upgrade = findSocialUpgrade(
-      [
-        ev({ id: "s3", type: "customer.subscription.updated", at: "2026-08-01T12:00:00.000Z", prices: [SOCIAL] }),
-      ],
-      SOCIAL_IDS,
-    );
-    expect(upgrade).toBeNull();
-  });
-
-  test("reconciliation snapshots cannot date an upgrade", () => {
-    // The sync ran today; that is not when the customer upgraded.
-    const upgrade = findSocialUpgrade(
-      [
-        ev({ id: "s4", type: SUBSCRIPTION_CREATED_EVENT, at: "2026-06-01T12:00:00.000Z", prices: [CORE] }),
-        ev({ id: "s4", type: RECONCILIATION_EVENT_TYPE, at: "2026-08-24T21:00:00.000Z", prices: [SOCIAL] }),
-      ],
-      SOCIAL_IDS,
-    );
-    expect(upgrade).toBeNull();
-  });
-
-  test("takes the first move, not a later repeat of the same state", () => {
-    const upgrade = findSocialUpgrade(
-      [
-        ev({ id: "s5", type: SUBSCRIPTION_CREATED_EVENT, at: "2026-05-01T12:00:00.000Z", prices: [CORE] }),
-        ev({ id: "s5", type: "customer.subscription.updated", at: "2026-06-10T12:00:00.000Z", prices: [SOCIAL] }),
-        ev({ id: "s5", type: "customer.subscription.updated", at: "2026-08-01T12:00:00.000Z", prices: [SOCIAL] }),
-      ],
-      SOCIAL_IDS,
-    );
-    expect(upgrade?.addedOn).toBe("2026-06-10");
-  });
-
-  test("a downgrade then re-upgrade reports the first upgrade", () => {
-    const upgrade = findSocialUpgrade(
-      [
-        ev({ id: "s6", type: SUBSCRIPTION_CREATED_EVENT, at: "2026-05-01T12:00:00.000Z", prices: [CORE] }),
-        ev({ id: "s6", type: "customer.subscription.updated", at: "2026-06-01T12:00:00.000Z", prices: [SOCIAL] }),
-        ev({ id: "s6", type: "customer.subscription.updated", at: "2026-07-01T12:00:00.000Z", prices: [CORE] }),
-      ],
-      SOCIAL_IDS,
-    );
-    expect(upgrade?.addedOn).toBe("2026-06-01");
-  });
-
-  test("a core-only subscription has no upgrade", () => {
-    expect(
-      findSocialUpgrade(
-        [ev({ id: "s7", type: SUBSCRIPTION_CREATED_EVENT, at: "2026-06-01T12:00:00.000Z", prices: [CORE] })],
-        SOCIAL_IDS,
-      ),
-    ).toBeNull();
-  });
-
-  test("no events at all yields nothing", () => {
-    expect(findSocialUpgrade([], SOCIAL_IDS)).toBeNull();
-  });
-
-  test("orders by time even when the log arrives shuffled", () => {
-    const upgrade = findSocialUpgrade(
-      [
-        ev({ id: "s8", type: "customer.subscription.updated", at: "2026-08-20T12:00:00.000Z", prices: [SOCIAL] }),
-        ev({ id: "s8", type: SUBSCRIPTION_CREATED_EVENT, at: "2026-06-01T12:00:00.000Z", prices: [CORE] }),
-      ],
-      SOCIAL_IDS,
-    );
-    expect(upgrade?.addedOn).toBe("2026-08-20");
-  });
-});
-
 describe("buildPlanMix", () => {
   const RANGE = { from: "2026-08-01", to: "2026-08-31" };
 
@@ -166,6 +68,7 @@ describe("buildPlanMix", () => {
     const mix = buildPlanMix({
       ...RANGE,
       socialPriceIds: SOCIAL_IDS,
+      spans: [],
       snapshots: [
         snap({ id: "a" }),
         snap({ id: "b" }),
@@ -184,6 +87,7 @@ describe("buildPlanMix", () => {
     const mix = buildPlanMix({
       ...RANGE,
       socialPriceIds: SOCIAL_IDS,
+      spans: [],
       snapshots: [
         snap({ id: "a", stripeCustomerId: "cus_shared" }),
         snap({ id: "b", stripeCustomerId: "cus_shared" }),
@@ -198,6 +102,12 @@ describe("buildPlanMix", () => {
     const mix = buildPlanMix({
       ...RANGE,
       socialPriceIds: SOCIAL_IDS,
+      spans: [
+        { stripeSubscriptionId: "old_core", stripeCustomerId: "cus_old", stripePriceIds: [CORE], startedAt: new Date("2026-01-01T12:00:00.000Z") },
+        { stripeSubscriptionId: "old", stripeCustomerId: "cus_old", stripePriceIds: [SOCIAL], startedAt: new Date("2026-03-05T12:00:00.000Z") },
+        { stripeSubscriptionId: "new_core", stripeCustomerId: "cus_new", stripePriceIds: [CORE], startedAt: new Date("2026-02-01T12:00:00.000Z") },
+        { stripeSubscriptionId: "new", stripeCustomerId: "cus_new", stripePriceIds: [SOCIAL], startedAt: new Date("2026-08-14T12:00:00.000Z") },
+      ],
       snapshots: [
         snap({ id: "old", stripePriceIds: [SOCIAL] }),
         snap({ id: "new", stripePriceIds: [SOCIAL] }),
@@ -218,6 +128,11 @@ describe("buildPlanMix", () => {
     const mix = buildPlanMix({
       ...RANGE,
       socialPriceIds: SOCIAL_IDS,
+      spans: [
+        { stripeSubscriptionId: "prior_core", stripeCustomerId: "cus_upgraded", stripePriceIds: [CORE], startedAt: new Date("2026-06-01T12:00:00.000Z") },
+        { stripeSubscriptionId: "upgraded", stripeCustomerId: "cus_upgraded", stripePriceIds: [SOCIAL], startedAt: new Date("2026-08-05T12:00:00.000Z") },
+        { stripeSubscriptionId: "bornsocial", stripeCustomerId: "cus_bornsocial", stripePriceIds: [SOCIAL], startedAt: new Date("2026-08-06T12:00:00.000Z") },
+      ],
       snapshots: [
         snap({ id: "upgraded", stripePriceIds: [SOCIAL] }),
         snap({ id: "bornsocial", stripePriceIds: [SOCIAL] }),
@@ -237,6 +152,12 @@ describe("buildPlanMix", () => {
     const mix = buildPlanMix({
       ...RANGE,
       socialPriceIds: SOCIAL_IDS,
+      spans: [
+        { stripeSubscriptionId: "x_core", stripeCustomerId: "cus_x", stripePriceIds: [CORE], startedAt: new Date("2026-07-01T12:00:00.000Z") },
+        { stripeSubscriptionId: "x", stripeCustomerId: "cus_x", stripePriceIds: [SOCIAL], startedAt: new Date("2026-08-03T12:00:00.000Z") },
+        { stripeSubscriptionId: "y_core", stripeCustomerId: "cus_y", stripePriceIds: [CORE], startedAt: new Date("2026-07-01T12:00:00.000Z") },
+        { stripeSubscriptionId: "y", stripeCustomerId: "cus_y", stripePriceIds: [SOCIAL], startedAt: new Date("2026-08-19T12:00:00.000Z") },
+      ],
       snapshots: [],
       events: [
         ev({ id: "x", type: SUBSCRIPTION_CREATED_EVENT, at: "2026-07-01T12:00:00.000Z", prices: [CORE] }),
@@ -252,6 +173,7 @@ describe("buildPlanMix", () => {
     const mix = buildPlanMix({
       ...RANGE,
       socialPriceIds: SOCIAL_IDS,
+      spans: [],
       snapshots: [snap({ id: "seen" }), snap({ id: "unseen" })],
       events: [
         ev({ id: "seen", type: SUBSCRIPTION_CREATED_EVENT, at: "2026-06-01T12:00:00.000Z", prices: [CORE] }),
@@ -266,6 +188,7 @@ describe("buildPlanMix", () => {
     const mix = buildPlanMix({
       ...RANGE,
       socialPriceIds: new Set<string>(),
+      spans: [],
       snapshots: [],
       events: [],
     });
@@ -276,70 +199,127 @@ describe("buildPlanMix", () => {
   });
 });
 
-describe("upgrades are tracked per customer, not per subscription", () => {
-  const CUST = "cus_mover";
+describe("findUpgradesFromSpans", () => {
+  const span = (
+    id: string,
+    customer: string | null,
+    prices: string[],
+    startedAt: string | null,
+  ) => ({
+    stripeSubscriptionId: id,
+    stripeCustomerId: customer,
+    stripePriceIds: prices,
+    startedAt: startedAt ? new Date(startedAt) : null,
+  });
 
-  test("an upgrade done by cancelling and resubscribing is still an upgrade", () => {
-    // This is how production actually moves someone from core to social: the
-    // core subscription ends and a social one begins. Following subscription
-    // ids finds two unrelated events and reports zero upgrades forever.
-    const upgrade = findSocialUpgrade(
+  test("an earlier core and a later social is an upgrade", () => {
+    const found = findUpgradesFromSpans(
       [
-        ev({ id: "sub_core", type: SUBSCRIPTION_CREATED_EVENT, at: "2026-06-01T12:00:00.000Z", prices: [CORE], customer: CUST }),
-        ev({ id: "sub_core", type: "customer.subscription.deleted", at: "2026-08-12T11:00:00.000Z", prices: [CORE], customer: CUST }),
-        ev({ id: "sub_social", type: SUBSCRIPTION_CREATED_EVENT, at: "2026-08-12T12:00:00.000Z", prices: [SOCIAL], customer: CUST }),
+        span("core", "cus_1", [CORE], "2026-03-01T12:00:00.000Z"),
+        span("social", "cus_1", [SOCIAL], "2026-08-14T12:00:00.000Z"),
       ],
       SOCIAL_IDS,
     );
-    expect(upgrade).not.toBeNull();
-    expect(upgrade?.addedOn).toBe("2026-08-12");
-    expect(upgrade?.stripeSubscriptionId).toBe("sub_social");
+    expect(found).toHaveLength(1);
+    expect(found[0].addedOn).toBe("2026-08-14");
+    expect(found[0].stripeSubscriptionId).toBe("social");
   });
 
-  test("a brand new customer starting on social is still not an upgrade", () => {
-    const upgrade = findSocialUpgrade(
+  test("counts a cancelled core plan, since dropping it and taking social is still moving up", () => {
+    // The core subscription no longer exists; the upgrade still happened.
+    const found = findUpgradesFromSpans(
       [
-        ev({ id: "sub_new", type: SUBSCRIPTION_CREATED_EVENT, at: "2026-08-12T12:00:00.000Z", prices: [SOCIAL], customer: "cus_new" }),
+        span("dead_core", "cus_2", [CORE], "2026-03-01T12:00:00.000Z"),
+        span("live_social", "cus_2", [SOCIAL], "2026-08-01T12:00:00.000Z"),
       ],
       SOCIAL_IDS,
     );
-    expect(upgrade).toBeNull();
+    expect(found).toHaveLength(1);
   });
 
-  test("counts the customer once even when they hold several subscriptions", () => {
-    const mix = buildPlanMix({
-      from: "2026-08-01",
-      to: "2026-08-31",
-      socialPriceIds: SOCIAL_IDS,
-      snapshots: [
-        snap({ id: "sub_social_a", stripeCustomerId: CUST, stripePriceIds: [SOCIAL] }),
-        snap({ id: "sub_social_b", stripeCustomerId: CUST, stripePriceIds: [SOCIAL] }),
+  test("a customer whose social plan is their oldest did not upgrade", () => {
+    const found = findUpgradesFromSpans(
+      [
+        span("social", "cus_3", [SOCIAL], "2026-02-01T12:00:00.000Z"),
+        span("core", "cus_3", [CORE], "2026-06-01T12:00:00.000Z"),
       ],
-      events: [
-        ev({ id: "sub_core", type: SUBSCRIPTION_CREATED_EVENT, at: "2026-06-01T12:00:00.000Z", prices: [CORE], customer: CUST }),
-        ev({ id: "sub_social_a", type: SUBSCRIPTION_CREATED_EVENT, at: "2026-08-12T12:00:00.000Z", prices: [SOCIAL], customer: CUST }),
-        ev({ id: "sub_social_b", type: SUBSCRIPTION_CREATED_EVENT, at: "2026-08-13T12:00:00.000Z", prices: [SOCIAL], customer: CUST }),
-      ],
-    });
-    // Two subscriptions, one customer, one upgrade.
-    expect(mix.social.subscriptions).toBe(2);
-    expect(mix.social.customers).toBe(1);
-    expect(mix.upgrades.inRange).toBe(1);
-    expect(mix.social.arrivedByUpgrade).toBe(1);
-    expect(mix.social.arrivedOtherwise).toBe(0);
+      SOCIAL_IDS,
+    );
+    expect(found).toEqual([]);
   });
 
-  test("events with no customer id cannot be grouped and are skipped", () => {
-    const mix = buildPlanMix({
-      from: "2026-08-01",
-      to: "2026-08-31",
-      socialPriceIds: SOCIAL_IDS,
-      snapshots: [snap({ id: "s", stripePriceIds: [SOCIAL] })],
-      events: [
-        { ...ev({ id: "s", type: SUBSCRIPTION_CREATED_EVENT, at: "2026-06-01T12:00:00.000Z", prices: [CORE] }), stripeCustomerId: null },
-        { ...ev({ id: "s", type: "customer.subscription.updated", at: "2026-08-05T12:00:00.000Z", prices: [SOCIAL] }), stripeCustomerId: null },
+  test("core and social opened in the same instant is one purchase, not an upgrade", () => {
+    const found = findUpgradesFromSpans(
+      [
+        span("core", "cus_4", [CORE], "2026-06-01T12:00:00.000Z"),
+        span("social", "cus_4", [SOCIAL], "2026-06-01T12:00:00.000Z"),
       ],
-    });
-    expect(mix.upgrades.inRange).toBe(0);
+      SOCIAL_IDS,
+    );
+    expect(found).toEqual([]);
+  });
+
+  test("undated subscriptions are skipped rather than assumed", () => {
+    const found = findUpgradesFromSpans(
+      [
+        span("core", "cus_5", [CORE], null),
+        span("social", "cus_5", [SOCIAL], "2026-08-01T12:00:00.000Z"),
+      ],
+      SOCIAL_IDS,
+    );
+    expect(found).toEqual([]);
+  });
+
+  test("a customer with only core, or only social, is not an upgrade", () => {
+    expect(
+      findUpgradesFromSpans(
+        [span("a", "cus_6", [CORE], "2026-01-01T12:00:00.000Z")],
+        SOCIAL_IDS,
+      ),
+    ).toEqual([]);
+    expect(
+      findUpgradesFromSpans(
+        [span("b", "cus_7", [SOCIAL], "2026-01-01T12:00:00.000Z")],
+        SOCIAL_IDS,
+      ),
+    ).toEqual([]);
+  });
+
+  test("takes the earliest social plan when a customer has several", () => {
+    const found = findUpgradesFromSpans(
+      [
+        span("core", "cus_8", [CORE], "2026-01-01T12:00:00.000Z"),
+        span("social_late", "cus_8", [SOCIAL], "2026-08-20T12:00:00.000Z"),
+        span("social_first", "cus_8", [SOCIAL], "2026-05-05T12:00:00.000Z"),
+      ],
+      SOCIAL_IDS,
+    );
+    expect(found).toHaveLength(1);
+    expect(found[0].stripeSubscriptionId).toBe("social_first");
+  });
+
+  test("subscriptions with no customer cannot be attributed", () => {
+    expect(
+      findUpgradesFromSpans(
+        [
+          span("core", null, [CORE], "2026-01-01T12:00:00.000Z"),
+          span("social", null, [SOCIAL], "2026-08-01T12:00:00.000Z"),
+        ],
+        SOCIAL_IDS,
+      ),
+    ).toEqual([]);
+  });
+
+  test("newest upgrade leads", () => {
+    const found = findUpgradesFromSpans(
+      [
+        span("c1", "cus_a", [CORE], "2026-01-01T12:00:00.000Z"),
+        span("s1", "cus_a", [SOCIAL], "2026-05-01T12:00:00.000Z"),
+        span("c2", "cus_b", [CORE], "2026-01-01T12:00:00.000Z"),
+        span("s2", "cus_b", [SOCIAL], "2026-08-01T12:00:00.000Z"),
+      ],
+      SOCIAL_IDS,
+    );
+    expect(found.map((u) => u.stripeSubscriptionId)).toEqual(["s2", "s1"]);
   });
 });

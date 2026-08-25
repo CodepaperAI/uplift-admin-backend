@@ -12,12 +12,22 @@ import { commandDayForDate } from "./toronto-period";
  * Classification here comes from the Stripe product name instead, which is the
  * same source the Command plan table already reads correctly.
  *
- * The upgrade question is a different shape. "Did this customer add social"
+ * The upgrade question is a different shape. "Did this customer move up"
  * cannot be answered from current state — a subscription on the social price
- * looks identical whether it started there or moved there last week. It is a
- * transition, so it comes from the event log, and the same rule applies as
- * everywhere else in this codebase: reconciliation snapshots carry the sync
- * clock, so only real Stripe events can date a change.
+ * looks identical whether it started there or moved there last week.
+ *
+ * It is answered by ordering start dates per customer: an earlier core
+ * subscription and a later social one is an upgrade, whether Stripe was asked
+ * to change a price or to end one subscription and open another. Production
+ * does the latter, so following subscription ids reports zero upgrades forever.
+ *
+ * The event log is deliberately NOT the source. Only about 80 of 200 live
+ * subscriptions carry a datable Stripe event, so asking the log answers "cannot
+ * tell" for most of the base. Start dates come from the created event where one
+ * exists and the subscription record where it does not, and between them cover
+ * nearly everyone. The log is still read for one thing — reporting how much of
+ * the base has no datable history, so the coverage is stated rather than
+ * implied.
  */
 
 export type PlanClass = "core" | "social";
@@ -69,51 +79,16 @@ export type SocialUpgrade = {
   addedAt: string;
 };
 
-/**
- * The moment a customer first appeared on social, when they did not start there.
- *
- * Takes every event belonging to one customer, across all of their
- * subscriptions, because the move is not necessarily a price change on a single
- * subscription — ending one and starting another is the same upgrade to
- * everyone except a query that follows subscription ids. Production does it
- * that way, which is why the subscription-level version of this reported zero
- * upgrades against a base that plainly had them.
- *
- * Returns null when the customer's earliest datable event is already social:
- * that is a new customer buying the bigger plan, not an existing one moving up,
- * and the two are worth different amounts of attention.
- */
-export function findSocialUpgrade(
-  events: readonly PlanMixEvent[],
-  socialPriceIds: ReadonlySet<string>,
-): SocialUpgrade | null {
-  const real = events
-    .filter((event) => carriesRealOccurrenceTime(event.eventType))
-    .sort((left, right) => left.occurredAt.getTime() - right.occurredAt.getTime());
-
-  const first = real.at(0);
-  if (!first) return null;
-  // Already on social the first time the log can see them: either they bought
-  // it outright or they moved before the log begins. Not claimed as an upgrade.
-  if (hasSocial(first.stripePriceIds, socialPriceIds)) return null;
-
-  const arrival = real.find((event) =>
-    hasSocial(event.stripePriceIds, socialPriceIds),
-  );
-  if (!arrival) return null;
-
-  return {
-    stripeSubscriptionId: arrival.stripeSubscriptionId,
-    stripeCustomerId: arrival.stripeCustomerId,
-    addedOn: commandDayForDate(arrival.occurredAt),
-    addedAt: arrival.occurredAt.toISOString(),
-  };
-}
-
 export function buildPlanMix(input: {
   snapshots: readonly PlanMixSnapshot[];
   /** Every event for the subscriptions above, both kinds. Filtered here. */
   events: readonly PlanMixEvent[];
+  /**
+   * Every subscription the customer has ever held, live or cancelled, with a
+   * start date. Cancelled ones matter: dropping core in March and taking
+   * social in August is still an upgrade.
+   */
+  spans: readonly SubscriptionSpan[];
   socialPriceIds: ReadonlySet<string>;
   from: string;
   to: string;
@@ -145,25 +120,16 @@ export function buildPlanMix(input: {
     }
   }
 
-  // Grouped by customer, because that is the unit an upgrade happens to.
-  const byCustomer = new Map<string, PlanMixEvent[]>();
   const bySubscription = new Map<string, PlanMixEvent[]>();
   for (const event of input.events) {
     const subs = bySubscription.get(event.stripeSubscriptionId) ?? [];
     subs.push(event);
     bySubscription.set(event.stripeSubscriptionId, subs);
-    if (!event.stripeCustomerId) continue;
-    const list = byCustomer.get(event.stripeCustomerId) ?? [];
-    list.push(event);
-    byCustomer.set(event.stripeCustomerId, list);
   }
 
-  const allUpgrades: SocialUpgrade[] = [];
-  for (const events of byCustomer.values()) {
-    const upgrade = findSocialUpgrade(events, socialPriceIds);
-    if (upgrade) allUpgrades.push(upgrade);
-  }
-  allUpgrades.sort((left, right) => right.addedAt.localeCompare(left.addedAt));
+  // Ordering of start dates, not transitions in the log — see the note on
+  // SubscriptionSpan for why the log cannot answer this for most of the base.
+  const allUpgrades = findUpgradesFromSpans(input.spans, socialPriceIds);
 
   const inRange = allUpgrades.filter(
     (upgrade) => upgrade.addedOn >= input.from && upgrade.addedOn <= input.to,
@@ -215,4 +181,80 @@ export function buildPlanMix(input: {
       socialPriceIdCount: socialPriceIds.size,
     },
   };
+}
+
+/**
+ * A subscription reduced to what the upgrade question needs: whose it is, what
+ * it is, and when it began.
+ *
+ * Deliberately not the event log. Only 82 of 207 live subscriptions carry a
+ * datable Stripe event, so asking the log "did this customer move up" answers
+ * "cannot tell" for most of the base. Start dates survive that gap: they come
+ * from the created event where one exists and from the subscription record
+ * where it does not, which between them cover almost everyone.
+ */
+export type SubscriptionSpan = {
+  stripeSubscriptionId: string;
+  stripeCustomerId: string | null;
+  stripePriceIds: string[];
+  /** When it began. Null when neither source can date it. */
+  startedAt: Date | null;
+};
+
+/**
+ * Customers who were on core first and are on social now.
+ *
+ * The test is ordering, not mechanism: an earlier core subscription and a later
+ * social one is an upgrade whether Stripe was asked to change a price, or to
+ * end one subscription and open another. A customer whose social subscription
+ * is their oldest is not an upgrade — they arrived on the bigger plan.
+ *
+ * Cancelled core subscriptions count. Someone who dropped core in March and
+ * took social in August upgraded, even though only one of the two is live.
+ */
+export function findUpgradesFromSpans(
+  spans: readonly SubscriptionSpan[],
+  socialPriceIds: ReadonlySet<string>,
+): SocialUpgrade[] {
+  const byCustomer = new Map<string, SubscriptionSpan[]>();
+  for (const span of spans) {
+    if (!span.stripeCustomerId) continue;
+    const list = byCustomer.get(span.stripeCustomerId) ?? [];
+    list.push(span);
+    byCustomer.set(span.stripeCustomerId, list);
+  }
+
+  const upgrades: SocialUpgrade[] = [];
+  for (const [customerId, list] of byCustomer) {
+    const dated = list.filter(
+      (span): span is SubscriptionSpan & { startedAt: Date } =>
+        span.startedAt !== null,
+    );
+    const core = dated.filter(
+      (span) => !hasSocial(span.stripePriceIds, socialPriceIds),
+    );
+    const social = dated.filter((span) =>
+      hasSocial(span.stripePriceIds, socialPriceIds),
+    );
+    if (core.length === 0 || social.length === 0) continue;
+
+    const firstCore = core.reduce((earliest, span) =>
+      span.startedAt < earliest.startedAt ? span : earliest,
+    );
+    const firstSocial = social.reduce((earliest, span) =>
+      span.startedAt < earliest.startedAt ? span : earliest,
+    );
+    // Strictly later, so a core and a social opened in the same instant — one
+    // checkout buying both — is not read as an upgrade.
+    if (firstSocial.startedAt <= firstCore.startedAt) continue;
+
+    upgrades.push({
+      stripeSubscriptionId: firstSocial.stripeSubscriptionId,
+      stripeCustomerId: customerId,
+      addedOn: commandDayForDate(firstSocial.startedAt),
+      addedAt: firstSocial.startedAt.toISOString(),
+    });
+  }
+  upgrades.sort((left, right) => right.addedAt.localeCompare(left.addedAt));
+  return upgrades;
 }
