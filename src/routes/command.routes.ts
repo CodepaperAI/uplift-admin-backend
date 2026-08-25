@@ -33,6 +33,7 @@ import {
 import {
   createCommandRep,
   createCommandSalesAccount,
+  promoteUserToRep,
   getCommandReps,
   updateCommandRep,
 } from "../controllers/command-reps.controller";
@@ -174,6 +175,11 @@ CommandRouter.post(
   "/reps",
   requireCommandCapability("manage.reps"),
   createCommandRep,
+);
+CommandRouter.post(
+  "/reps/promote",
+  requireCommandCapability("manage.reps"),
+  promoteUserToRep,
 );
 CommandRouter.post(
   "/sales-accounts",

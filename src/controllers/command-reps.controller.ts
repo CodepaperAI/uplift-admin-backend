@@ -396,3 +396,159 @@ export async function updateCommandRep(
     sendError(res, "Failed to update Command rep", 500, error);
   }
 }
+
+const PROMOTE_TO_REP_INPUT = z
+  .object({
+    email: z.string().trim().toLowerCase().email().max(254),
+    /** Overrides the name on the account, which is often a signup typo. */
+    name: z.string().trim().min(2).max(100).optional(),
+    startDate: z.coerce.date().optional(),
+    basePay: z.number().finite().nonnegative().optional(),
+    currency: z.string().trim().length(3).toLowerCase().optional(),
+    ghlUserId: z.string().trim().max(120).optional(),
+  })
+  .strict();
+
+/**
+ * Promotes an existing account to a sales rep.
+ *
+ * `createCommandSalesAccount` cannot be used for someone who already has a
+ * login: `User.email` is unique, so it fails outright. And `createCommandRep`
+ * refuses anyone whose role is not already SALES. Between those two there was no
+ * path for the common case — a rep who signed up through the product first,
+ * usually to look at it, and now needs to be staff.
+ *
+ * No password is involved. The account keeps the credentials it already has,
+ * which is the point: promoting someone must not silently reset how they log in.
+ *
+ * **Refuses anyone carrying customer data.** A role change moves an account from
+ * the product side to the internal side, and doing that to a real customer would
+ * take their own workspace away from them. An account with a business, a
+ * published blog or a live subscription is therefore rejected rather than
+ * promoted, with the counts in the error so whoever asked can see why. Deciding
+ * that a paying customer is really a staff member is not a decision an endpoint
+ * should make.
+ */
+export async function promoteUserToRep(
+  req: Request,
+  res: Response,
+): Promise<void> {
+  if (req.userRole !== "SUPERADMIN" || !req.authUserId) {
+    sendError(res, "Forbidden", 403);
+    return;
+  }
+  const parsed = PROMOTE_TO_REP_INPUT.safeParse(req.body);
+  if (!parsed.success) {
+    sendError(res, "Invalid promotion request", 400, parsed.error);
+    return;
+  }
+
+  try {
+    const user = await prisma.user.findUnique({
+      where: { email: parsed.data.email },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        role: true,
+        CommandRepProfile: { select: { id: true } },
+        _count: { select: { business: true, Blog: true } },
+      },
+    });
+    if (!user) {
+      sendError(res, "No account exists with this email", 404);
+      return;
+    }
+    if (user.CommandRepProfile) {
+      sendError(res, "This account already has a rep profile", 409);
+      return;
+    }
+    if (user.role === "SUPERADMIN") {
+      sendError(res, "A superadmin cannot be demoted to a sales rep", 409);
+      return;
+    }
+
+    const liveSubscription = await prisma.subscription.findFirst({
+      where: {
+        userId: user.id,
+        status: { in: ["active", "trialing", "past_due"] },
+      },
+      select: { id: true, status: true },
+    });
+    if (
+      user._count.business > 0 ||
+      user._count.Blog > 0 ||
+      liveSubscription
+    ) {
+      sendError(
+        res,
+        "This account has customer data, so it will not be converted automatically",
+        409,
+        {
+          businesses: user._count.business,
+          blogs: user._count.Blog,
+          subscriptionStatus: liveSubscription?.status ?? null,
+        },
+      );
+      return;
+    }
+
+    const rep = await prisma.$transaction(async (tx) => {
+      await tx.user.update({
+        where: { id: user.id },
+        data: {
+          role: "SALES",
+          commandPanelEnabled: true,
+          ...(parsed.data.name ? { name: parsed.data.name } : {}),
+        },
+      });
+      const created = await tx.commandRepProfile.create({
+        data: {
+          userId: user.id,
+          name: parsed.data.name ?? user.name,
+          startDate: parsed.data.startDate ?? new Date(),
+          basePay:
+            parsed.data.basePay === undefined
+              ? null
+              : new Prisma.Decimal(parsed.data.basePay),
+          currency: parsed.data.currency ?? null,
+          ghlUserId: normalizeOptionalText(parsed.data.ghlUserId) ?? null,
+        },
+        include: {
+          user: {
+            select: {
+              id: true,
+              name: true,
+              email: true,
+              role: true,
+              commandPanelEnabled: true,
+            },
+          },
+        },
+      });
+      await tx.adminAuditLog.create({
+        data: {
+          adminUserId: req.authUserId!,
+          action: "sales_account.promote",
+          targetType: "User",
+          targetId: user.id,
+          details: {
+            email: user.email,
+            previousRole: user.role,
+            previousName: user.name,
+            role: "SALES",
+            renamedTo: parsed.data.name ?? null,
+            commandRepProfileCreated: true,
+          },
+          ipAddress: req.ip,
+        },
+      });
+      return created;
+    });
+
+    await invalidateCommandCache();
+    sendSuccess(res, { rep }, "Account promoted to sales rep", 201);
+  } catch (error) {
+    sendError(res, "Account could not be promoted", 500, error);
+  }
+}
