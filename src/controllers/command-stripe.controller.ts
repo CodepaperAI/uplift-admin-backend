@@ -292,7 +292,7 @@ export async function getCommandStripeOverview(
       page: req.query.page,
       pageSize: req.query.pageSize,
     });
-    const cacheKey = `stripe-overview-v6:${period.month}:${page}:${pageSize}`;
+    const cacheKey = `stripe-overview-v7:${period.month}:${page}:${pageSize}`;
     const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
     if (cached) {
       sendSuccess(res, cached, "Command Stripe overview");
@@ -482,11 +482,11 @@ export async function getCommandStripeOverview(
     ] = await Promise.all([
       prisma.user.findMany({
         where: { id: { in: [...userIds] } },
-        select: { id: true, name: true, email: true },
+        select: { id: true, name: true, email: true, phone: true },
       }),
       prisma.business.findMany({
         where: { id: { in: [...businessIds] } },
-        select: { id: true, businessName: true },
+        select: { id: true, businessName: true, businessPhone: true },
       }),
       prisma.commandStripeInvoice.groupBy({
         by: ["stripeSubscriptionId", "currency"],
@@ -1328,8 +1328,34 @@ export async function getCommandStripeOverview(
               account?.normalizedEmail ??
               (first?.userId ? userById.get(first.userId)?.email : null) ??
               null,
+            // Somebody to call. The account owner's number comes first because
+            // that is the person who holds the subscription; the business line
+            // is the fallback, and which one it is gets said rather than left
+            // for the caller to discover when a receptionist answers.
+            phone:
+              (first?.userId ? userById.get(first.userId)?.phone : null) ??
+              (first?.businessId
+                ? businessById.get(first.businessId)?.businessPhone
+                : null) ??
+              null,
+            phoneSource: (first?.userId
+              ? userById.get(first.userId)?.phone
+              : null)
+              ? "user"
+              : (first?.businessId
+                    ? businessById.get(first.businessId)?.businessPhone
+                    : null)
+                ? "business"
+                : null,
+            // Shaped explicitly so selecting businessPhone above does not
+            // quietly widen this object's contract.
             business: first?.businessId
-              ? (businessById.get(first.businessId) ?? null)
+              ? (() => {
+                  const record = businessById.get(first.businessId);
+                  return record
+                    ? { id: record.id, businessName: record.businessName }
+                    : null;
+                })()
               : null,
             ownerRep: account?.ownerRep ?? fallbackOwner,
             subscriptionsHeld: subscriptions.length,
