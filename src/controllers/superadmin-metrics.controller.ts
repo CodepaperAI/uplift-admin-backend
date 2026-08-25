@@ -254,12 +254,19 @@ const API_TOKENS_QUERY = PAGINATION_QUERY.extend({
   activeOnly: z.enum(["true", "false"]).optional(),
 });
 
+/**
+ * Same finding as the user list: this endpoint costs about the same per call
+ * whatever the page size, so a caller assembling the whole feed pays the fixed
+ * cost once per page for no reason. A 30-day range holds ~1,600 publishes,
+ * which was 17 pages, and Product Analysis fetches two ranges to compare them —
+ * 34 requests to build one comparison. The ceiling goes to 2000 so it is two.
+ */
 const BLOGS_DAILY_QUERY = z.object({
   from: z.string(),
   to: z.string(),
   userId: z.string().uuid().optional(),
   page: z.coerce.number().int().min(1).optional().default(1),
-  limit: z.coerce.number().int().min(1).max(200).optional().default(50),
+  limit: z.coerce.number().int().min(1).max(2000).optional().default(50),
 });
 
 const DAILY_METRICS_QUERY = z.object({
