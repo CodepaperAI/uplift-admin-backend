@@ -275,3 +275,71 @@ describe("buildPlanMix", () => {
     expect(mix.core.mrrMinorByCurrency).toEqual({});
   });
 });
+
+describe("upgrades are tracked per customer, not per subscription", () => {
+  const CUST = "cus_mover";
+
+  test("an upgrade done by cancelling and resubscribing is still an upgrade", () => {
+    // This is how production actually moves someone from core to social: the
+    // core subscription ends and a social one begins. Following subscription
+    // ids finds two unrelated events and reports zero upgrades forever.
+    const upgrade = findSocialUpgrade(
+      [
+        ev({ id: "sub_core", type: SUBSCRIPTION_CREATED_EVENT, at: "2026-06-01T12:00:00.000Z", prices: [CORE], customer: CUST }),
+        ev({ id: "sub_core", type: "customer.subscription.deleted", at: "2026-08-12T11:00:00.000Z", prices: [CORE], customer: CUST }),
+        ev({ id: "sub_social", type: SUBSCRIPTION_CREATED_EVENT, at: "2026-08-12T12:00:00.000Z", prices: [SOCIAL], customer: CUST }),
+      ],
+      SOCIAL_IDS,
+    );
+    expect(upgrade).not.toBeNull();
+    expect(upgrade?.addedOn).toBe("2026-08-12");
+    expect(upgrade?.stripeSubscriptionId).toBe("sub_social");
+  });
+
+  test("a brand new customer starting on social is still not an upgrade", () => {
+    const upgrade = findSocialUpgrade(
+      [
+        ev({ id: "sub_new", type: SUBSCRIPTION_CREATED_EVENT, at: "2026-08-12T12:00:00.000Z", prices: [SOCIAL], customer: "cus_new" }),
+      ],
+      SOCIAL_IDS,
+    );
+    expect(upgrade).toBeNull();
+  });
+
+  test("counts the customer once even when they hold several subscriptions", () => {
+    const mix = buildPlanMix({
+      from: "2026-08-01",
+      to: "2026-08-31",
+      socialPriceIds: SOCIAL_IDS,
+      snapshots: [
+        snap({ id: "sub_social_a", stripeCustomerId: CUST, stripePriceIds: [SOCIAL] }),
+        snap({ id: "sub_social_b", stripeCustomerId: CUST, stripePriceIds: [SOCIAL] }),
+      ],
+      events: [
+        ev({ id: "sub_core", type: SUBSCRIPTION_CREATED_EVENT, at: "2026-06-01T12:00:00.000Z", prices: [CORE], customer: CUST }),
+        ev({ id: "sub_social_a", type: SUBSCRIPTION_CREATED_EVENT, at: "2026-08-12T12:00:00.000Z", prices: [SOCIAL], customer: CUST }),
+        ev({ id: "sub_social_b", type: SUBSCRIPTION_CREATED_EVENT, at: "2026-08-13T12:00:00.000Z", prices: [SOCIAL], customer: CUST }),
+      ],
+    });
+    // Two subscriptions, one customer, one upgrade.
+    expect(mix.social.subscriptions).toBe(2);
+    expect(mix.social.customers).toBe(1);
+    expect(mix.upgrades.inRange).toBe(1);
+    expect(mix.social.arrivedByUpgrade).toBe(1);
+    expect(mix.social.arrivedOtherwise).toBe(0);
+  });
+
+  test("events with no customer id cannot be grouped and are skipped", () => {
+    const mix = buildPlanMix({
+      from: "2026-08-01",
+      to: "2026-08-31",
+      socialPriceIds: SOCIAL_IDS,
+      snapshots: [snap({ id: "s", stripePriceIds: [SOCIAL] })],
+      events: [
+        { ...ev({ id: "s", type: SUBSCRIPTION_CREATED_EVENT, at: "2026-06-01T12:00:00.000Z", prices: [CORE] }), stripeCustomerId: null },
+        { ...ev({ id: "s", type: "customer.subscription.updated", at: "2026-08-05T12:00:00.000Z", prices: [SOCIAL] }), stripeCustomerId: null },
+      ],
+    });
+    expect(mix.upgrades.inRange).toBe(0);
+  });
+});

@@ -1,8 +1,5 @@
 import { Prisma } from "@prisma/client";
-import {
-  carriesRealOccurrenceTime,
-  SUBSCRIPTION_CREATED_EVENT,
-} from "./stripe-lifecycle";
+import { carriesRealOccurrenceTime } from "./stripe-lifecycle";
 import { commandDayForDate } from "./toronto-period";
 
 /**
@@ -73,12 +70,18 @@ export type SocialUpgrade = {
 };
 
 /**
- * The moment a subscription first gained a social price, when it did not start
- * with one.
+ * The moment a customer first appeared on social, when they did not start there.
  *
- * Returns null for a subscription that was created on social — that is a new
- * customer buying the bigger plan, not an existing customer upgrading, and the
- * two are worth different amounts of attention.
+ * Takes every event belonging to one customer, across all of their
+ * subscriptions, because the move is not necessarily a price change on a single
+ * subscription — ending one and starting another is the same upgrade to
+ * everyone except a query that follows subscription ids. Production does it
+ * that way, which is why the subscription-level version of this reported zero
+ * upgrades against a base that plainly had them.
+ *
+ * Returns null when the customer's earliest datable event is already social:
+ * that is a new customer buying the bigger plan, not an existing one moving up,
+ * and the two are worth different amounts of attention.
  */
 export function findSocialUpgrade(
   events: readonly PlanMixEvent[],
@@ -87,34 +90,24 @@ export function findSocialUpgrade(
   const real = events
     .filter((event) => carriesRealOccurrenceTime(event.eventType))
     .sort((left, right) => left.occurredAt.getTime() - right.occurredAt.getTime());
-  // Started on social: not an upgrade, however many later events repeat it.
+
   const first = real.at(0);
   if (!first) return null;
-  if (
-    first.eventType === SUBSCRIPTION_CREATED_EVENT &&
-    hasSocial(first.stripePriceIds, socialPriceIds)
-  ) {
-    return null;
-  }
+  // Already on social the first time the log can see them: either they bought
+  // it outright or they moved before the log begins. Not claimed as an upgrade.
+  if (hasSocial(first.stripePriceIds, socialPriceIds)) return null;
 
-  let previouslySocial = hasSocial(first.stripePriceIds, socialPriceIds);
-  // No created event and already social on the first row we can see: the change
-  // happened outside what the log can date, so it is not claimed as recent.
-  if (previouslySocial) return null;
+  const arrival = real.find((event) =>
+    hasSocial(event.stripePriceIds, socialPriceIds),
+  );
+  if (!arrival) return null;
 
-  for (const event of real.slice(1)) {
-    const nowSocial = hasSocial(event.stripePriceIds, socialPriceIds);
-    if (nowSocial && !previouslySocial) {
-      return {
-        stripeSubscriptionId: event.stripeSubscriptionId,
-        stripeCustomerId: event.stripeCustomerId,
-        addedOn: commandDayForDate(event.occurredAt),
-        addedAt: event.occurredAt.toISOString(),
-      };
-    }
-    previouslySocial = nowSocial;
-  }
-  return null;
+  return {
+    stripeSubscriptionId: arrival.stripeSubscriptionId,
+    stripeCustomerId: arrival.stripeCustomerId,
+    addedOn: commandDayForDate(arrival.occurredAt),
+    addedAt: arrival.occurredAt.toISOString(),
+  };
 }
 
 export function buildPlanMix(input: {
@@ -152,16 +145,21 @@ export function buildPlanMix(input: {
     }
   }
 
-  // Upgrades are per subscription, so group the log before walking it.
+  // Grouped by customer, because that is the unit an upgrade happens to.
+  const byCustomer = new Map<string, PlanMixEvent[]>();
   const bySubscription = new Map<string, PlanMixEvent[]>();
   for (const event of input.events) {
-    const list = bySubscription.get(event.stripeSubscriptionId) ?? [];
+    const subs = bySubscription.get(event.stripeSubscriptionId) ?? [];
+    subs.push(event);
+    bySubscription.set(event.stripeSubscriptionId, subs);
+    if (!event.stripeCustomerId) continue;
+    const list = byCustomer.get(event.stripeCustomerId) ?? [];
     list.push(event);
-    bySubscription.set(event.stripeSubscriptionId, list);
+    byCustomer.set(event.stripeCustomerId, list);
   }
 
   const allUpgrades: SocialUpgrade[] = [];
-  for (const events of bySubscription.values()) {
+  for (const events of byCustomer.values()) {
     const upgrade = findSocialUpgrade(events, socialPriceIds);
     if (upgrade) allUpgrades.push(upgrade);
   }
@@ -175,11 +173,13 @@ export function buildPlanMix(input: {
   const socialSubs = counts.social.subscriptions;
   // Of everyone on social now, how many got there by upgrading — the rest
   // either started on it or moved before the log could date it.
-  const upgradedIds = new Set(allUpgrades.map((u) => u.stripeSubscriptionId));
-  const socialByUpgrade = input.snapshots.filter(
-    (snapshot) =>
-      classify(snapshot.stripePriceIds, socialPriceIds) === "social" &&
-      upgradedIds.has(snapshot.stripeSubscriptionId),
+  const upgradedCustomers = new Set(
+    allUpgrades.flatMap((upgrade) =>
+      upgrade.stripeCustomerId ? [upgrade.stripeCustomerId] : [],
+    ),
+  );
+  const socialByUpgrade = [...counts.social.customers].filter((customerId) =>
+    upgradedCustomers.has(customerId),
   ).length;
 
   return {
@@ -192,10 +192,13 @@ export function buildPlanMix(input: {
       subscriptions: socialSubs,
       customers: counts.social.customers.size,
       mrrMinorByCurrency: serialize(mrr.social),
-      /** On social now, having demonstrably moved there from core. */
+      /** Customers on social now who demonstrably moved there from core. */
       arrivedByUpgrade: socialByUpgrade,
-      /** On social now with no datable upgrade: started there, or moved early. */
-      arrivedOtherwise: Math.max(0, socialSubs - socialByUpgrade),
+      /** Customers on social with no datable move: bought it, or moved early. */
+      arrivedOtherwise: Math.max(
+        0,
+        counts.social.customers.size - socialByUpgrade,
+      ),
     },
     upgrades: {
       inRange: inRange.length,
