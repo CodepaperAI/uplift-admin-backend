@@ -47,6 +47,7 @@ import {
   getMetricsRevenueSummary,
   getMetricsUsers,
   getMetricsUsersDaily,
+  getMetricsMonthlyPerformance,
   getMetricsUserDetail,
 } from "../controllers/superadmin-metrics.controller";
 import {
@@ -80,6 +81,7 @@ SuperAdminRouter.get("/metrics/blogs/daily", getMetricsBlogsDaily);
 SuperAdminRouter.get("/metrics/payments/daily", getMetricsPaymentsDaily);
 SuperAdminRouter.get("/metrics/blog-generation", getMetricsBlogGeneration);
 SuperAdminRouter.get("/metrics/users", getMetricsUsers);
+SuperAdminRouter.get("/metrics/monthly-performance", getMetricsMonthlyPerformance);
 SuperAdminRouter.get("/metrics/users/daily", getMetricsUsersDaily);
 SuperAdminRouter.get("/metrics/users/export", exportMetricsUsers);
 SuperAdminRouter.get("/metrics/users/:userId", getMetricsUserDetail);
