@@ -280,7 +280,22 @@ const USER_ONBOARDING_VALUES = [
   "needs_follow_up",
 ] as const;
 
+/**
+ * The user list allows a much larger page than the shared default.
+ *
+ * Measured against production, this endpoint costs the same at limit=1 as at
+ * limit=100 — about 330ms either way — because every call recomputes the whole
+ * summary block regardless of how many rows it returns. The cost is per
+ * request, not per row.
+ *
+ * The admin has to walk the whole list to build its cohorts, so a 100 cap made
+ * it pay that fixed cost nine times for a 30-day range and twenty-one times for
+ * everything. Raising the ceiling is backward compatible — existing callers
+ * asking for 25 or 100 are unaffected — and turns the walk into one or two
+ * calls.
+ */
 const USERS_QUERY = PAGINATION_QUERY.extend({
+  limit: z.coerce.number().int().min(1).max(2000).optional().default(25),
   search: z.string().optional().default(""),
   status: z.enum(USER_STATUS_VALUES).optional(),
   onboarding: z.enum(USER_ONBOARDING_VALUES).optional(),
@@ -482,10 +497,15 @@ async function loadMetricsUsersDataset(input: {
   maxRows?: number;
 }): Promise<MetricsUsersDataset> {
   const page = Math.max(1, input.page);
+  // The 100 clamp existed to stop a caller asking for the whole table through
+  // a paginated endpoint. The validator now caps the public surface at 2000, so
+  // this clamps to the same number rather than silently returning a hundred
+  // rows to a caller that asked for five hundred — a silent short page is
+  // worse than a rejected request.
   const limit =
     input.maxRows !== undefined
       ? Math.max(1, input.limit)
-      : Math.min(100, Math.max(1, input.limit));
+      : Math.min(2000, Math.max(1, input.limit));
   const search = input.search?.trim() ?? "";
   const statusFilter = input.status;
   const onboardingFilter = input.onboarding;
