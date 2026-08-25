@@ -310,6 +310,7 @@ export async function updateCommandRep(
       return;
     }
 
+    let claimedAssignments = 0;
     const updated = await prisma.$transaction(async (tx) => {
       const rep = await tx.commandRepProfile.update({
         where: { id: existing.id },
@@ -351,6 +352,34 @@ export async function updateCommandRep(
           data: { commandPanelEnabled: parsed.data.isActive },
         });
       }
+
+      /**
+       * Claim the assignment history this GHL id already owns.
+       *
+       * `CommandGhlLeadAssignment.repId` is resolved when the row is written,
+       * and the sync only writes a row when an opportunity is first seen or
+       * reassigned. So linking a rep to a GHL id does nothing for the deals
+       * that id already holds — they keep the `null` they were written with,
+       * and the leaderboard reports zero for a rep holding hundreds of
+       * opportunities until each one happens to move. Measured on production
+       * that was 259 opportunities for one rep and 232 for another.
+       *
+       * Only ever fills a null, and only for the exact id being linked, so it
+       * cannot take a deal away from another rep or rewrite attribution history
+       * that was already decided.
+       */
+      if (
+        parsed.data.ghlUserId !== undefined &&
+        normalizeOptionalText(parsed.data.ghlUserId)
+      ) {
+        const ghlUserId = normalizeOptionalText(parsed.data.ghlUserId)!;
+        claimedAssignments = (
+          await tx.commandGhlLeadAssignment.updateMany({
+            where: { assignedToGhlId: ghlUserId, repId: null },
+            data: { repId: existing.id },
+          })
+        ).count;
+      }
       await tx.adminAuditLog.create({
         data: {
           adminUserId: req.authUserId!,
@@ -384,7 +413,13 @@ export async function updateCommandRep(
     });
 
     await invalidateCommandCache();
-    sendSuccess(res, serializeRep(updated), "Command rep updated");
+    sendSuccess(
+      res,
+      // The count is returned rather than silently applied: a link that quietly
+      // moved 259 deals onto a rep is something the caller should see.
+      { ...serializeRep(updated), claimedAssignments },
+      "Command rep updated",
+    );
   } catch (error) {
     if (
       error instanceof Prisma.PrismaClientKnownRequestError &&
