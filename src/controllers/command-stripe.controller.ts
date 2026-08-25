@@ -293,12 +293,34 @@ export async function getCommandStripeOverview(
       page: req.query.page,
       pageSize: req.query.pageSize,
     });
-    const cacheKey = `stripe-overview-v7:${period.month}:${page}:${pageSize}`;
+    const cacheKey = `stripe-overview-v8:${period.month}:${page}:${pageSize}`;
     const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
     if (cached) {
       sendSuccess(res, cached, "Command Stripe overview");
       return;
     }
+    // How fresh the facts below actually are. Without this the panel is a
+    // confident table with no way to tell a live number from one the sync
+    // stopped updating three days ago.
+    const [newestSnapshot, lastSyncRun] = await Promise.all([
+      prisma.commandStripeSubscriptionSnapshot.aggregate({
+        _max: { occurredAt: true, updatedAt: true },
+      }),
+      prisma.commandProviderSyncRun.findFirst({
+        where: { provider: "stripe" },
+        orderBy: { startedAt: "desc" },
+        select: {
+          status: true,
+          mode: true,
+          startedAt: true,
+          completedAt: true,
+          inspected: true,
+          updated: true,
+          error: true,
+        },
+      }),
+    ]);
+
     const upliftPlans = await getUpliftPlanDefinitions();
     const upliftPlanByPriceId = new Map(
       upliftPlans.map((plan) => [plan.priceId, plan]),
@@ -1259,6 +1281,27 @@ export async function getCommandStripeOverview(
         monthlyMovement: {
           period,
           ...monthlyMovement,
+        },
+        dataFreshness: {
+          /** When this payload was computed, before any caching. */
+          generatedAt: new Date().toISOString(),
+          /** How long a cached copy of it may be served for. */
+          cacheTtlSeconds: 60,
+          /** Newest provider event behind these figures. */
+          newestFactAt: newestSnapshot._max.occurredAt?.toISOString() ?? null,
+          /** Newest write to the projection, sync runs included. */
+          newestWriteAt: newestSnapshot._max.updatedAt?.toISOString() ?? null,
+          lastSync: lastSyncRun
+            ? {
+                status: lastSyncRun.status,
+                mode: lastSyncRun.mode,
+                startedAt: lastSyncRun.startedAt.toISOString(),
+                completedAt: lastSyncRun.completedAt?.toISOString() ?? null,
+                inspected: lastSyncRun.inspected,
+                updated: lastSyncRun.updated,
+                error: lastSyncRun.error,
+              }
+            : null,
         },
         rosterPagination: commandPaginationResult({
           page,
