@@ -16,6 +16,7 @@ import {
   SUBSCRIPTION_CREATED_EVENT,
   SUBSCRIPTION_DELETED_EVENT,
 } from "../command/stripe-lifecycle";
+import { buildPlanMix } from "../command/plan-mix";
 import {
   commandPaginationResult,
   parseCommandPagination,
@@ -1742,5 +1743,139 @@ export async function getCommandStripeLifecycle(
     sendSuccess(res, payload, "Command Stripe lifecycle");
   } catch (error: unknown) {
     sendError(res, "Failed to load Stripe lifecycle", 500, error);
+  }
+}
+
+/**
+ * Core plan versus core + social, and who moved between them.
+ *
+ * Three questions in one call: how many are on the core plan only, how many
+ * carry the social add-on, and how many existing customers added it recently.
+ *
+ * The classification deliberately reads the Stripe product name rather than a
+ * configured price list. The admin's plan chart used the billing endpoint's
+ * configured prices, which only ever held the two core price IDs, so every
+ * SEO + Social subscription rendered as "not on a listed plan — no backend
+ * entry": an entire product line showing up as a data gap.
+ *
+ * The upgrade count cannot come from current state at all. A subscription on
+ * the social price looks identical whether it started there or moved there last
+ * week, so the move is read from the event log — and only from real Stripe
+ * events, because reconciliation snapshots carry the sync clock.
+ */
+export async function getCommandStripePlanMix(
+  req: Request,
+  res: Response,
+): Promise<void> {
+  try {
+    const parsed = parseLifecycleRange(req.query);
+    if ("error" in parsed) {
+      sendError(res, "Invalid query", 400, parsed.error);
+      return;
+    }
+    const { range } = parsed;
+    const cacheKey = `stripe-plan-mix-v1:${range.from}:${range.to}`;
+    const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
+    if (cached) {
+      sendSuccess(res, cached, "Command Stripe plan mix");
+      return;
+    }
+
+    const plans = await getUpliftPlanDefinitions();
+    const socialPriceIds = new Set(
+      plans
+        .filter((plan) => /social/i.test(plan.name))
+        .map((plan) => plan.priceId),
+    );
+
+    const snapshots = await prisma.commandStripeSubscriptionSnapshot.findMany({
+      where: { status: { in: LIFECYCLE_LIVE_STATUSES } },
+      select: {
+        stripeSubscriptionId: true,
+        stripeCustomerId: true,
+        status: true,
+        stripePriceIds: true,
+        monthlyRecurringMinor: true,
+        currency: true,
+      },
+    });
+    const subscriptionIds = snapshots.map((row) => row.stripeSubscriptionId);
+
+    const events = subscriptionIds.length
+      ? await prisma.commandStripeSubscriptionEvent.findMany({
+          where: { stripeSubscriptionId: { in: subscriptionIds } },
+          select: {
+            stripeSubscriptionId: true,
+            stripeCustomerId: true,
+            eventType: true,
+            stripePriceIds: true,
+            occurredAt: true,
+          },
+          orderBy: { occurredAt: "asc" },
+        })
+      : [];
+
+    const mix = buildPlanMix({
+      snapshots,
+      events,
+      socialPriceIds,
+      from: range.from,
+      to: range.to,
+    });
+
+    // Put a name on the recent upgrades so the panel can list who, not just
+    // how many — an upgrade nobody can identify is not actionable.
+    const upgradeCustomerIds = [
+      ...new Set(
+        mix.upgrades.recent.flatMap((upgrade) =>
+          upgrade.stripeCustomerId ? [upgrade.stripeCustomerId] : [],
+        ),
+      ),
+    ];
+    const accounts = upgradeCustomerIds.length
+      ? await prisma.commandAccount.findMany({
+          where: { stripeCustomerId: { in: upgradeCustomerIds } },
+          select: { stripeCustomerId: true, name: true, normalizedEmail: true },
+        })
+      : [];
+    const accountByCustomer = new Map(
+      accounts.flatMap((row) =>
+        row.stripeCustomerId ? [[row.stripeCustomerId, row] as const] : [],
+      ),
+    );
+
+    const payload = {
+      range: {
+        from: range.from,
+        to: range.to,
+        dayCount: range.dayCount,
+        timeZone: range.timeZone,
+      },
+      plans: plans.map((plan) => ({
+        priceId: plan.priceId,
+        name: plan.name,
+        billingPeriod: plan.billingPeriod,
+        isSocial: socialPriceIds.has(plan.priceId),
+      })),
+      ...mix,
+      upgrades: {
+        ...mix.upgrades,
+        recent: mix.upgrades.recent.map((upgrade) => {
+          const account = upgrade.stripeCustomerId
+            ? accountByCustomer.get(upgrade.stripeCustomerId)
+            : undefined;
+          return {
+            ...upgrade,
+            name: account?.name ?? null,
+            email: account?.normalizedEmail ?? null,
+          };
+        }),
+      },
+    };
+
+    await writeCommandCache(cacheKey, payload, 120);
+    sendSuccess(res, payload, "Command Stripe plan mix");
+  } catch (error: unknown) {
+    sendError(res, "Failed to load Stripe plan mix", 500, error);
   }
 }

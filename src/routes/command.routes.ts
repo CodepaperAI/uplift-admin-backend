@@ -11,6 +11,7 @@ import {
 } from "../middleware/require-command-capability";
 import {
   getCommandStripeLifecycle,
+  getCommandStripePlanMix,
   getCommandStripeOverview,
   getCommandStripeHealth,
   getCommandStripeSyncRuns,
@@ -86,6 +87,11 @@ CommandRouter.get(
   "/stripe/overview",
   requireCommandCapability("view.financials"),
   getCommandStripeOverview,
+);
+CommandRouter.get(
+  "/stripe/plan-mix",
+  requireCommandCapability("view.financials"),
+  getCommandStripePlanMix,
 );
 CommandRouter.get(
   "/stripe/lifecycle",
