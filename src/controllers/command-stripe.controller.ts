@@ -21,7 +21,7 @@ import {
   classifyEntryPath,
   tallyEntryPaths,
   type EntryClassification,
-  type EntryPath,
+  type EntryRoute,
   type InvoiceFact,
 } from "../command/entry-path";
 import {
@@ -309,7 +309,7 @@ export async function getCommandStripeOverview(
       page: req.query.page,
       pageSize: req.query.pageSize,
     });
-    const cacheKey = `stripe-overview-v9:${period.month}:${page}:${pageSize}`;
+    const cacheKey = `stripe-overview-v10:${period.month}:${page}:${pageSize}`;
     const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
     if (cached) {
       sendSuccess(res, cached, "Command Stripe overview");
@@ -1434,8 +1434,10 @@ export async function getCommandStripeOverview(
           // One label per account only when its subscriptions agree. An account
           // that bought the trial once and a second plan at full price took
           // both routes, and picking one would throw the other away.
-          const distinctEntryPaths = [...new Set(entries.map((entry) => entry.path))];
-          const entryPath: EntryPath | "mixed" | null =
+          const distinctEntryPaths = [
+            ...new Set(entries.map((entry) => entry.route)),
+          ];
+          const entryRoute: EntryRoute | "mixed" | null =
             distinctEntryPaths.length === 0
               ? null
               : distinctEntryPaths.length === 1
@@ -1514,7 +1516,8 @@ export async function getCommandStripeOverview(
             ),
             // Null when nothing authoritative is known, so a reader is told
             // rather than shown the day the sync happened to run.
-            entryPath,
+            entryRoute,
+            entryReachedFullPrice: entryOpening?.reachedFullPrice ?? null,
             entryFirstPaidMinor: entryOpening?.firstPaidMinor ?? null,
             entryCurrency: entryOpening?.currency ?? null,
             entryPaidInvoiceCount: entryOpening?.paidInvoiceCount ?? null,
