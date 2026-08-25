@@ -292,7 +292,7 @@ export async function getCommandStripeOverview(
       page: req.query.page,
       pageSize: req.query.pageSize,
     });
-    const cacheKey = `stripe-overview-v5:${period.month}:${page}:${pageSize}`;
+    const cacheKey = `stripe-overview-v6:${period.month}:${page}:${pageSize}`;
     const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
     if (cached) {
       sendSuccess(res, cached, "Command Stripe overview");
@@ -471,7 +471,15 @@ export async function getCommandStripeOverview(
       rosterSubscriptionIds.push(subscription.stripeSubscriptionId);
     }
 
-    const [users, businesses, invoiceTotals, firstEvents, commandAccounts] = await Promise.all([
+    const [
+      users,
+      businesses,
+      invoiceTotals,
+      firstEvents,
+      createdEvents,
+      subscriptionRecords,
+      commandAccounts,
+    ] = await Promise.all([
       prisma.user.findMany({
         where: { id: { in: [...userIds] } },
         select: { id: true, name: true, email: true },
@@ -493,6 +501,24 @@ export async function getCommandStripeOverview(
         by: ["stripeSubscriptionId"],
         where: { stripeSubscriptionId: { in: rosterSubscriptionIds } },
         _min: { occurredAt: true },
+      }),
+      // The only rows whose occurredAt is when the subscription actually began.
+      // The groupBy above spans every row including reconciliation snapshots,
+      // which are stamped with the sync run's clock — see stripe-lifecycle.ts.
+      prisma.commandStripeSubscriptionEvent.groupBy({
+        by: ["stripeSubscriptionId"],
+        where: {
+          stripeSubscriptionId: { in: rosterSubscriptionIds },
+          eventType: SUBSCRIPTION_CREATED_EVENT,
+        },
+        _min: { occurredAt: true },
+      }),
+      // Stripe's own start date, kept on our subscription records. Covers
+      // subscriptions that predate the webhook wiring, where no created event
+      // was ever received.
+      prisma.subscription.findMany({
+        where: { stripeSubscriptionId: { in: rosterSubscriptionIds } },
+        select: { stripeSubscriptionId: true, startDate: true },
       }),
       prisma.commandAccount.findMany({
         where: { stripeCustomerId: { in: rosterCustomerIds } },
@@ -534,6 +560,40 @@ export async function getCommandStripeOverview(
         row._min.occurredAt ?? null,
       ]),
     );
+    /**
+     * When each subscription genuinely started, and where that came from.
+     *
+     * `firstEventBySubscription` above is the earliest row of any kind, which
+     * for anything predating the sync is the moment reconciliation first saw
+     * it — not a start date. Sorting a roster by that produces a "newest wins"
+     * list where the oldest customer in the company appears to have joined the
+     * day the sync was switched on. Preferred order: Stripe's own created
+     * event, then the start date on our subscription record, then nothing.
+     * Nothing is a real answer here; first-seen is not a substitute for it.
+     */
+    const createdEventBySubscription = new Map(
+      createdEvents.flatMap((row) =>
+        row._min.occurredAt
+          ? ([[row.stripeSubscriptionId, row._min.occurredAt]] as const)
+          : [],
+      ),
+    );
+    const recordStartBySubscription = new Map(
+      subscriptionRecords.flatMap((row) =>
+        row.stripeSubscriptionId
+          ? ([[row.stripeSubscriptionId, row.startDate]] as const)
+          : [],
+      ),
+    );
+    const trueStartFor = (
+      stripeSubscriptionId: string,
+    ): { at: Date; source: "stripe_event" | "subscription_record" } | null => {
+      const fromEvent = createdEventBySubscription.get(stripeSubscriptionId);
+      if (fromEvent) return { at: fromEvent, source: "stripe_event" };
+      const fromRecord = recordStartBySubscription.get(stripeSubscriptionId);
+      if (fromRecord) return { at: fromRecord, source: "subscription_record" };
+      return null;
+    };
     const commandAccountByStripeCustomerId = new Map(
       commandAccounts.flatMap((account) =>
         account.stripeCustomerId
@@ -1233,10 +1293,21 @@ export async function getCommandStripeOverview(
               );
             }
           }
-          const startDates = subscriptions.flatMap((subscription) => {
+          const firstSeenDates = subscriptions.flatMap((subscription) => {
             const value = firstEventBySubscription.get(subscription.stripeSubscriptionId);
             return value ? [value] : [];
           });
+          const trueStarts = subscriptions.flatMap((subscription) => {
+            const value = trueStartFor(subscription.stripeSubscriptionId);
+            return value ? [value] : [];
+          });
+          const earliestTrueStart = trueStarts.reduce<
+            { at: Date; source: "stripe_event" | "subscription_record" } | null
+          >(
+            (earliest, candidate) =>
+              earliest === null || candidate.at < earliest.at ? candidate : earliest,
+            null,
+          );
           const renewalDates = subscriptions.flatMap((subscription) =>
             subscription.currentPeriodEnd ? [subscription.currentPeriodEnd] : [],
           );
@@ -1278,9 +1349,15 @@ export async function getCommandStripeOverview(
                 amount.toString(),
               ]),
             ),
-            startedAt:
-              startDates.length > 0
-                ? new Date(Math.min(...startDates.map((value) => value.getTime())))
+            // Null when nothing authoritative is known, so a reader is told
+            // rather than shown the day the sync happened to run.
+            startedAt: earliestTrueStart?.at ?? null,
+            startedAtSource: earliestTrueStart?.source ?? null,
+            // What `startedAt` used to be. Kept under a name that says what it
+            // is, so anything still reading it is not silently changed.
+            firstSeenAt:
+              firstSeenDates.length > 0
+                ? new Date(Math.min(...firstSeenDates.map((value) => value.getTime())))
                 : null,
             nextRenewalAt:
               renewalDates.length > 0
