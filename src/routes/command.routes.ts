@@ -1,3 +1,4 @@
+import { getCommandDailySignups } from "../controllers/command-signups.controller";
 import { Router } from "express";
 import {
   getCommandAccessMatrix,
@@ -85,6 +86,11 @@ const CommandRouter = Router();
 
 CommandRouter.use(requireAdminSession);
 CommandRouter.get("/session", requireCommandPanel, getCommandSession);
+CommandRouter.get(
+  "/signups",
+  requireCommandCapability("view.financials"),
+  getCommandDailySignups,
+);
 CommandRouter.get(
   "/stripe/overview",
   requireCommandCapability("view.financials"),
