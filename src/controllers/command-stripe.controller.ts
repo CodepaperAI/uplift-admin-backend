@@ -2022,7 +2022,7 @@ export async function getCommandStripeMonthMovement(
   try {
     const month = parseMovementMonth(req.query.month) ?? currentCommandMonth();
     const range = commandMonthRange(month);
-    const cacheKey = `stripe-month-movement-v2:${month}`;
+    const cacheKey = `stripe-month-movement-v3:${month}`;
     const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
     if (cached) {
       sendSuccess(res, cached, "Command Stripe month movement");
@@ -2141,8 +2141,15 @@ export async function getCommandStripeMonthMovement(
 
     const starts: MovementFact[] = [];
     const cancellations: MovementFact[] = [];
-    let undatableStarts = 0;
+    let undatableSubscriptions = 0;
     let undatedCancellations = 0;
+    // An account is only genuinely missing from the series when *none* of its
+    // subscriptions can be dated. Counting undatable subscriptions alone
+    // overstates the gap badly: a two-website customer has one `Subscription`
+    // row, so its second subscription is always undatable while the account
+    // itself is already counted.
+    const datableAccounts = new Set<string>();
+    const undatableAccounts = new Set<string>();
 
     for (const snapshot of snapshots) {
       const record = recordBySubscription.get(snapshot.stripeSubscriptionId);
@@ -2155,16 +2162,17 @@ export async function getCommandStripeMonthMovement(
       const createdAt = createdEvents.get(snapshot.stripeSubscriptionId);
       if (createdAt) {
         starts.push({ accountKey, at: createdAt, source: "stripe_event" });
+        datableAccounts.add(accountKey);
       } else if (record) {
         starts.push({
           accountKey,
           at: record.startDate,
           source: "subscription_record",
         });
+        datableAccounts.add(accountKey);
       } else {
-        // One account can hold several Stripe subscriptions but only one
-        // `Subscription` row, so the extras have no record date to fall back on.
-        undatableStarts += 1;
+        undatableSubscriptions += 1;
+        undatableAccounts.add(accountKey);
       }
 
       if (!MOVEMENT_ENDED_STATUSES.includes(snapshot.status)) continue;
@@ -2204,7 +2212,11 @@ export async function getCommandStripeMonthMovement(
       coverage: {
         ...movement.coverage,
         knownSubscriptions: snapshots.length,
-        undatableStarts,
+        undatableSubscriptions,
+        /** Accounts with no datable subscription at all — the real blind spot. */
+        undatableAccounts: [...undatableAccounts].filter(
+          (key) => !datableAccounts.has(key),
+        ).length,
       },
     };
 
