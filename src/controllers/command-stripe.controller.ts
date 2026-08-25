@@ -1984,8 +1984,8 @@ export async function getCommandStripePlanMix(
 /** Invoice states that mean Stripe tried to take the money and did not get it. */
 const FAILED_INVOICE_STATUSES = ["open", "uncollectible"];
 
-/** `Subscription.status` values that mean the customer is gone. */
-const CANCELED_RECORD_STATUSES = ["canceled", "cancelled"];
+/** Snapshot statuses that mean this subscription has ended. */
+const MOVEMENT_ENDED_STATUSES = ["canceled", "cancelled", "incomplete_expired"];
 
 /**
  * One month of arrivals against departures, counted in accounts.
@@ -1997,12 +1997,23 @@ const CANCELED_RECORD_STATUSES = ["canceled", "cancelled"];
  * new MRR came back exactly equal to the whole MRR book, and churn came back as
  * zero for want of an opening state. See `command/month-movement.ts`.
  *
- * The fix is source selection, not arithmetic. Arrivals and departures come from
- * `Subscription`, the app's own table, which carries a real `startDate` for
- * every row and predates the webhooks; a Stripe `created`/`deleted` event
- * overrides it wherever one exists, because that is the provider's own clock.
+ * Two things have to be right for the replacement to mean anything.
+ *
+ * **The universe is Stripe's, not the app's.** `Subscription` rows are created
+ * the moment a Stripe *customer* is made — at checkout entry, with
+ * `status: "incomplete"` — and again for free trials, so `Subscription.startDate`
+ * dates *checkout attempts*, not paying subscribers. Counting it directly
+ * returned 357 arrivals for a month against a book of 183 accounts. So the row
+ * set here is `CommandStripeSubscriptionSnapshot`, which only holds
+ * subscriptions Stripe actually created; ended ones are kept, so a customer who
+ * arrived and churned inside the same month appears on both sides.
+ *
+ * **The dates come from the best available source, and we say which.** A Stripe
+ * `created`/`deleted` event is the provider's own clock and wins wherever one
+ * exists. Before 2026-08-18 there are none, so the fallback is the matching
+ * `Subscription` record — which is why the whole month is visible at all.
  * Payment failures come from the invoice table, which reconciliation fills from
- * Stripe's invoice list and so also reaches back past the webhooks.
+ * Stripe's own invoice list and so also reaches back past the webhooks.
  */
 export async function getCommandStripeMonthMovement(
   req: Request,
@@ -2011,7 +2022,7 @@ export async function getCommandStripeMonthMovement(
   try {
     const month = parseMovementMonth(req.query.month) ?? currentCommandMonth();
     const range = commandMonthRange(month);
-    const cacheKey = `stripe-month-movement-v1:${month}`;
+    const cacheKey = `stripe-month-movement-v2:${month}`;
     const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
     if (cached) {
       sendSuccess(res, cached, "Command Stripe month movement");
@@ -2019,13 +2030,6 @@ export async function getCommandStripeMonthMovement(
     }
 
     const inMonth = { gte: range.start, lt: range.end };
-    const recordSelect = {
-      userId: true,
-      stripeCustomerId: true,
-      stripeSubscriptionId: true,
-      startDate: true,
-      canceledAt: true,
-    } as const;
     const eventSelect = {
       stripeSubscriptionId: true,
       stripeCustomerId: true,
@@ -2033,29 +2037,43 @@ export async function getCommandStripeMonthMovement(
     } as const;
 
     const [
-      startRecords,
-      cancelRecords,
-      createdInMonth,
-      deletedInMonth,
+      snapshots,
+      records,
+      createdEventRows,
+      deletedEventRows,
       failedInvoiceRows,
-      undatedCancellations,
       oldestRealEvent,
     ] = await Promise.all([
-      prisma.subscription.findMany({
-        where: { startDate: inMonth },
-        select: recordSelect,
+      // Every subscription Stripe ever made, live or ended. Small — hundreds.
+      prisma.commandStripeSubscriptionSnapshot.findMany({
+        select: {
+          stripeSubscriptionId: true,
+          stripeCustomerId: true,
+          userId: true,
+          status: true,
+        },
       }),
+      // Record dates, keyed by Stripe id. Only rows that reached Stripe at all
+      // are useful here; a checkout that never converted has no Stripe id.
       prisma.subscription.findMany({
-        where: { canceledAt: inMonth },
-        select: recordSelect,
+        where: { stripeSubscriptionId: { not: null } },
+        select: {
+          userId: true,
+          stripeCustomerId: true,
+          stripeSubscriptionId: true,
+          startDate: true,
+          canceledAt: true,
+        },
       }),
       prisma.commandStripeSubscriptionEvent.findMany({
-        where: { eventType: SUBSCRIPTION_CREATED_EVENT, occurredAt: inMonth },
+        where: { eventType: SUBSCRIPTION_CREATED_EVENT },
         select: eventSelect,
+        orderBy: { occurredAt: "asc" },
       }),
       prisma.commandStripeSubscriptionEvent.findMany({
-        where: { eventType: SUBSCRIPTION_DELETED_EVENT, occurredAt: inMonth },
+        where: { eventType: SUBSCRIPTION_DELETED_EVENT },
         select: eventSelect,
+        orderBy: { occurredAt: "asc" },
       }),
       prisma.commandStripeInvoice.findMany({
         where: {
@@ -2072,11 +2090,6 @@ export async function getCommandStripeMonthMovement(
           providerCreatedAt: true,
         },
       }),
-      // Known departures with no usable date. Counted so the panel can admit
-      // them rather than drawing a quieter month than we actually had.
-      prisma.subscription.count({
-        where: { status: { in: CANCELED_RECORD_STATUSES }, canceledAt: null },
-      }),
       prisma.commandStripeSubscriptionEvent.findFirst({
         where: {
           eventType: { in: [SUBSCRIPTION_CREATED_EVENT, SUBSCRIPTION_DELETED_EVENT] },
@@ -2086,53 +2099,34 @@ export async function getCommandStripeMonthMovement(
       }),
     ]);
 
-    // A record whose own date sits inside the month may still have a Stripe
-    // event that dates it differently, and that event wins. Only the records we
-    // actually found need checking, so this second read stays small.
-    const recordSubscriptionIds = [
-      ...new Set(
-        [...startRecords, ...cancelRecords].flatMap((row) =>
-          row.stripeSubscriptionId ? [row.stripeSubscriptionId] : [],
-        ),
-      ),
-    ];
-    const [createdForRecords, deletedForRecords] = recordSubscriptionIds.length
-      ? await Promise.all([
-          prisma.commandStripeSubscriptionEvent.findMany({
-            where: {
-              eventType: SUBSCRIPTION_CREATED_EVENT,
-              stripeSubscriptionId: { in: recordSubscriptionIds },
-            },
-            select: eventSelect,
-          }),
-          prisma.commandStripeSubscriptionEvent.findMany({
-            where: {
-              eventType: SUBSCRIPTION_DELETED_EVENT,
-              stripeSubscriptionId: { in: recordSubscriptionIds },
-            },
-            select: eventSelect,
-          }),
-        ])
-      : [[], []];
-
-    type EventRow = { stripeSubscriptionId: string; stripeCustomerId: string | null; occurredAt: Date };
+    type EventRow = {
+      stripeSubscriptionId: string;
+      stripeCustomerId: string | null;
+      occurredAt: Date;
+    };
+    /** Earliest wins: Stripe can deliver one logical event under two ids. */
     const earliestBySubscription = (rows: readonly EventRow[]) => {
-      const earliest = new Map<string, EventRow>();
+      const earliest = new Map<string, Date>();
       for (const row of rows) {
         const current = earliest.get(row.stripeSubscriptionId);
-        if (!current || row.occurredAt < current.occurredAt) {
-          earliest.set(row.stripeSubscriptionId, row);
+        if (!current || row.occurredAt < current) {
+          earliest.set(row.stripeSubscriptionId, row.occurredAt);
         }
       }
       return earliest;
     };
-    const createdEvents = earliestBySubscription([...createdInMonth, ...createdForRecords]);
-    const deletedEvents = earliestBySubscription([...deletedInMonth, ...deletedForRecords]);
+    const createdEvents = earliestBySubscription(createdEventRows);
+    const deletedEvents = earliestBySubscription(deletedEventRows);
+    const recordBySubscription = new Map(
+      records.flatMap((row) =>
+        row.stripeSubscriptionId ? [[row.stripeSubscriptionId, row] as const] : [],
+      ),
+    );
 
     /**
-     * What we count by. Stripe's customer id where we have one, so the totals
-     * agree with the roster's account count; otherwise the most specific id
-     * available, which still keeps one real customer as one row.
+     * What we count by. Stripe's customer id where we have one, so these totals
+     * agree with the roster's account count rather than quietly counting a
+     * two-website customer twice.
      */
     const accountKeyFor = (input: {
       stripeCustomerId?: string | null;
@@ -2145,86 +2139,56 @@ export async function getCommandStripeMonthMovement(
           ? `user:${input.userId}`
           : `sub:${input.stripeSubscriptionId ?? "unknown"}`;
 
-    const resolve = (
-      records: readonly {
-        userId: string;
-        stripeCustomerId: string | null;
-        stripeSubscriptionId: string | null;
-        startDate: Date;
-        canceledAt: Date | null;
-      }[],
-      recordDate: (row: (typeof records)[number]) => Date | null,
-      events: Map<string, EventRow>,
-      eventsInMonth: readonly EventRow[],
-    ): MovementFact[] => {
-      const facts = new Map<string, MovementFact>();
-      const claim = (key: string, fact: MovementFact) => {
-        const existing = facts.get(key);
-        // An earlier date for the same subscription wins, so a duplicated
-        // Stripe delivery cannot become a second arrival.
-        if (!existing || fact.at < existing.at) facts.set(key, fact);
-      };
+    const starts: MovementFact[] = [];
+    const cancellations: MovementFact[] = [];
+    let undatableStarts = 0;
+    let undatedCancellations = 0;
 
-      for (const row of records) {
-        const date = recordDate(row);
-        if (!date) continue;
-        const fromEvent = row.stripeSubscriptionId
-          ? events.get(row.stripeSubscriptionId)
-          : undefined;
-        const key = row.stripeSubscriptionId
-          ? `sub:${row.stripeSubscriptionId}`
-          : `user:${row.userId}`;
-        claim(
-          key,
-          fromEvent
-            ? {
-                accountKey: accountKeyFor({
-                  stripeCustomerId: row.stripeCustomerId ?? fromEvent.stripeCustomerId,
-                  userId: row.userId,
-                  stripeSubscriptionId: row.stripeSubscriptionId,
-                }),
-                at: fromEvent.occurredAt,
-                source: "stripe_event",
-              }
-            : {
-                accountKey: accountKeyFor(row),
-                at: date,
-                source: "subscription_record",
-              },
-        );
-      }
+    for (const snapshot of snapshots) {
+      const record = recordBySubscription.get(snapshot.stripeSubscriptionId);
+      const accountKey = accountKeyFor({
+        stripeCustomerId: snapshot.stripeCustomerId ?? record?.stripeCustomerId,
+        userId: snapshot.userId ?? record?.userId,
+        stripeSubscriptionId: snapshot.stripeSubscriptionId,
+      });
 
-      // Events for subscriptions the app table does not know about at all.
-      for (const event of eventsInMonth) {
-        claim(`sub:${event.stripeSubscriptionId}`, {
-          accountKey: accountKeyFor(event),
-          at: event.occurredAt,
-          source: "stripe_event",
+      const createdAt = createdEvents.get(snapshot.stripeSubscriptionId);
+      if (createdAt) {
+        starts.push({ accountKey, at: createdAt, source: "stripe_event" });
+      } else if (record) {
+        starts.push({
+          accountKey,
+          at: record.startDate,
+          source: "subscription_record",
         });
+      } else {
+        // One account can hold several Stripe subscriptions but only one
+        // `Subscription` row, so the extras have no record date to fall back on.
+        undatableStarts += 1;
       }
 
-      return [...facts.values()];
-    };
+      if (!MOVEMENT_ENDED_STATUSES.includes(snapshot.status)) continue;
+      const deletedAt = deletedEvents.get(snapshot.stripeSubscriptionId);
+      if (deletedAt) {
+        cancellations.push({ accountKey, at: deletedAt, source: "stripe_event" });
+      } else if (record?.canceledAt) {
+        cancellations.push({
+          accountKey,
+          at: record.canceledAt,
+          source: "subscription_record",
+        });
+      } else {
+        undatedCancellations += 1;
+      }
+    }
 
-    const starts = resolve(
-      startRecords,
-      (row) => row.startDate,
-      createdEvents,
-      createdInMonth,
-    );
-    const cancellations = resolve(
-      cancelRecords,
-      (row) => row.canceledAt,
-      deletedEvents,
-      deletedInMonth,
-    );
     const failedInvoices: FailedInvoiceFact[] = failedInvoiceRows.map((row) => ({
       accountKey: accountKeyFor(row),
       stripeInvoiceId: row.stripeInvoiceId,
       at: row.providerCreatedAt,
     }));
 
-    const payload = buildMonthMovement({
+    const movement = buildMonthMovement({
       month,
       starts,
       cancellations,
@@ -2234,6 +2198,15 @@ export async function getCommandStripeMonthMovement(
         ? commandDayForDate(oldestRealEvent.occurredAt)
         : null,
     });
+
+    const payload = {
+      ...movement,
+      coverage: {
+        ...movement.coverage,
+        knownSubscriptions: snapshots.length,
+        undatableStarts,
+      },
+    };
 
     await writeCommandCache(cacheKey, payload, 120);
     sendSuccess(res, payload, "Command Stripe month movement");
