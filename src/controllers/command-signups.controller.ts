@@ -23,14 +23,34 @@ import type { InvoiceFact } from "../command/entry-path";
 
 const LIVE_STATUSES = ["trialing", "active", "past_due"];
 
-/** A day, defaulting to today in Toronto. */
-function parseSignupDay(query: Request["query"]) {
-  const raw =
-    typeof query.date === "string" && query.date.trim() !== ""
-      ? query.date.trim()
-      : commandDayForDate(new Date());
+/**
+ * How many signups the list itself will carry.
+ *
+ * Counts are computed over the whole range; only the rows are capped. Six months
+ * reaches nearly the entire user base, and a table of several thousand rows is
+ * not a call list — it is a page that takes seconds to render and that nobody
+ * reads to the end. The cap is reported so a truncated list never passes for a
+ * complete one.
+ */
+const SIGNUP_ROW_CAP = 500;
+
+/** A day or a span of them, defaulting to today in Toronto. */
+function parseSignupRange(query: Request["query"]) {
+  const text = (value: unknown): string | null =>
+    typeof value === "string" && value.trim() !== "" ? value.trim() : null;
+  const today = commandDayForDate(new Date());
+  // `date` stays supported: it is what the single-day links already carry.
+  const single = text(query.date);
+  const from = single ?? text(query.from) ?? today;
+  const to = single ?? text(query.to) ?? today;
   try {
-    return { range: commandDayRange(raw, raw) } as const;
+    const range = commandDayRange(from, to);
+    if (range.dayCount > 400) {
+      return {
+        error: new Error("Range cannot exceed 400 days"),
+      } as const;
+    }
+    return { range } as const;
   } catch (error) {
     return { error } as const;
   }
@@ -41,44 +61,55 @@ export async function getCommandDailySignups(
   res: Response,
 ): Promise<void> {
   try {
-    const parsed = parseSignupDay(req.query);
+    const parsed = parseSignupRange(req.query);
     if ("error" in parsed) {
-      sendError(res, "Invalid date", 400, parsed.error);
+      sendError(res, "Invalid date range", 400, parsed.error);
       return;
     }
     const { range } = parsed;
-    const cacheKey = `command-signups-v1:${range.from}`;
+    const cacheKey = `command-signups-v2:${range.from}:${range.to}`;
     const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
     if (cached) {
       sendSuccess(res, cached, "Command daily signups");
       return;
     }
 
-    const users = await prisma.user.findMany({
-      where: {
-        createdAt: { gte: range.start, lt: range.end },
-        // Staff accounts are not leads. Without this the list would tell a rep
-        // to ring their own colleagues.
-        role: "USER",
-      },
-      select: {
-        id: true,
-        name: true,
-        email: true,
-        phone: true,
-        createdAt: true,
-      },
-      orderBy: { createdAt: "desc" },
-    });
+    const where = {
+      createdAt: { gte: range.start, lt: range.end },
+      // Staff accounts are not leads. Without this the list would tell a rep
+      // to ring their own colleagues.
+      role: "USER" as const,
+    };
+    const [signupsInRange, users] = await Promise.all([
+      prisma.user.count({ where }),
+      prisma.user.findMany({
+        where,
+        select: {
+          id: true,
+          name: true,
+          email: true,
+          phone: true,
+          createdAt: true,
+        },
+        orderBy: { createdAt: "desc" },
+        take: SIGNUP_ROW_CAP,
+      }),
+    ]);
 
     if (users.length === 0) {
       const empty = {
         day: {
           date: range.from,
+          from: range.from,
+          to: range.to,
+          dayCount: range.dayCount,
           start: range.start.toISOString(),
           endExclusive: range.end.toISOString(),
           timeZone: COMMAND_TIME_ZONE,
         },
+        signupsInRange: 0,
+        rowCap: SIGNUP_ROW_CAP,
+        truncated: false,
         rows: [],
         totals: {
           signups: 0,
@@ -189,12 +220,23 @@ export async function getCommandDailySignups(
     const payload = {
       day: {
         date: range.from,
+        from: range.from,
+        to: range.to,
+        dayCount: range.dayCount,
         start: range.start.toISOString(),
         endExclusive: range.end.toISOString(),
         timeZone: COMMAND_TIME_ZONE,
       },
       rows,
       totals,
+      /**
+       * Signups in the whole range, which is what the headline should say.
+       * `totals.signups` counts the rows actually loaded, so on a long range the
+       * two differ and the panel has to show this one.
+       */
+      signupsInRange,
+      rowCap: SIGNUP_ROW_CAP,
+      truncated: signupsInRange > rows.length,
       /**
        * Live subscription count for the same users, so the panel can say when
        * its own state derivation and the raw Stripe state disagree rather than
