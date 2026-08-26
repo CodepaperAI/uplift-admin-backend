@@ -133,6 +133,8 @@ type GhlClientConfig = {
   conversationsVersion?: string;
   calendarsVersion?: string;
   usersVersion?: string;
+  funnelsVersion?: string;
+  locationsVersion?: string;
   fetchImpl?: typeof fetch;
 };
 
@@ -146,6 +148,8 @@ export class GhlReadOnlyClient {
   private readonly conversationsVersion: string;
   private readonly calendarsVersion: string;
   private readonly usersVersion: string;
+  private readonly funnelsVersion: string;
+  private readonly locationsVersion: string;
   private readonly fetchImpl: typeof fetch;
 
   constructor(config: GhlClientConfig) {
@@ -163,6 +167,8 @@ export class GhlReadOnlyClient {
     this.conversationsVersion = config.conversationsVersion ?? "v3";
     this.calendarsVersion = config.calendarsVersion ?? "2021-04-15";
     this.usersVersion = config.usersVersion ?? "2021-07-28";
+    this.funnelsVersion = config.funnelsVersion ?? "2021-07-28";
+    this.locationsVersion = config.locationsVersion ?? "2021-07-28";
     this.fetchImpl = config.fetchImpl ?? fetch;
   }
 
@@ -246,6 +252,44 @@ export class GhlReadOnlyClient {
       throw new Error("GHL users response did not contain a users array");
     }
     return result.users;
+  }
+
+  /**
+   * The funnels on the location, and the pages inside one.
+   *
+   * Added to answer a specific question with evidence rather than memory: does
+   * GHL's API expose a funnel's tracking-code fields, and what is the live
+   * booking page's actual path. Both are read-only lookups.
+   */
+  async funnels() {
+    const query = new URLSearchParams({ locationId: this.locationId, limit: "100" });
+    const result = await this.get<{ funnels?: unknown[] }>(
+      `/funnels/lookup?${query.toString()}`,
+      this.funnelsVersion,
+    );
+    return Array.isArray(result.funnels) ? result.funnels : [];
+  }
+
+  async funnelPages(funnelId: string) {
+    const query = new URLSearchParams({
+      locationId: this.locationId,
+      funnelId,
+      limit: "100",
+      offset: "0",
+    });
+    const result = await this.get<{ pages?: unknown[] }>(
+      `/funnels/page?${query.toString()}`,
+      this.funnelsVersion,
+    );
+    return Array.isArray(result.pages) ? result.pages : [];
+  }
+
+  /** The location record. Field names only are ever surfaced — see the caller. */
+  async location() {
+    return this.get<Record<string, unknown>>(
+      `/locations/${this.locationId}`,
+      this.locationsVersion,
+    );
   }
 
   async pipelines() {
