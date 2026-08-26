@@ -172,11 +172,25 @@ jobs:
             echo "::error::Digest queried: $scan_digest"
             exit 1
           fi
-          critical=$(aws ecr describe-image-scan-findings \
+          # Same pagination trap as the status probe, and the reason the last
+          # run died with no message at all: under enhanced scanning the CLI
+          # walks several pages and prints the count once per page, so
+          # "None\nNone\nNone" never equalled "None" — and a bare [[ ]] as the
+          # final command under `bash -e` exits 1 silently. Sum the pages
+          # instead, and say what was found either way.
+          critical_raw=$(aws ecr describe-image-scan-findings \
             --repository-name "$ECR_REPOSITORY" \
             --image-id imageDigest="$scan_digest" \
+            --no-paginate \
             --query 'imageScanFindings.findingSeverityCounts.CRITICAL' --output text)
-          [[ "$critical" == "None" || "$critical" == "0" ]]
+          critical=$(printf '%s\n' "$critical_raw" \
+            | awk '{ if ($1 ~ /^[0-9]+$/) sum += $1 } END { print sum + 0 }')
+          echo "Scan status: $status. Critical findings: $critical (raw: $(printf '%s' "$critical_raw" | tr '\n' ' '))"
+          if [[ "$critical" != "0" ]]; then
+            echo "::error::ECR scan reports $critical critical finding(s) on $scan_digest. Refusing to deploy."
+            exit 1
+          fi
+          echo "No critical findings. Proceeding."
 
       - name: Deploy through Systems Manager
         env:
