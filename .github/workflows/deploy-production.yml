@@ -101,18 +101,25 @@ jobs:
           # IN_PROGRESS, so empty always meant the call itself was failing — and
           # the one thing needed to know why had just been discarded. Keep the
           # error instead, and print it when the loop gives up.
+          # Keep the two streams apart. Merging them with 2>&1 to capture the
+          # error meant anything the CLI wrote to stderr on a *successful* call
+          # landed in the value too, so a finished scan arrived as
+          # "ACTIVE\n<noise>" and never matched "ACTIVE" — the gate could not
+          # pass even when the scan was complete. Trim the result as well: a
+          # trailing newline alone was enough to break the comparison.
           status=""
           last_error=""
+          scan_stderr="$(mktemp)"
           for attempt in $(seq 1 60); do
             if probe=$(aws ecr describe-image-scan-findings \
               --repository-name "$ECR_REPOSITORY" \
               --image-id imageDigest="$scan_digest" \
-              --query 'imageScanStatus.status' --output text 2>&1); then
-              status="$probe"
+              --query 'imageScanStatus.status' --output text 2>"$scan_stderr"); then
+              status="$(tr -d '[:space:]' <<<"$probe")"
               last_error=""
             else
               status=""
-              last_error="$probe"
+              last_error="$(cat "$scan_stderr")"
             fi
             if [[ "$status" == "COMPLETE" || "$status" == "ACTIVE" ]]; then break; fi
             if [[ "$status" == "FAILED" ]]; then
