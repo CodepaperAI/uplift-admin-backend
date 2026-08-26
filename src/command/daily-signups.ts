@@ -1,5 +1,13 @@
 import { Prisma } from "@prisma/client";
 import { classifyEntryPath, type InvoiceFact } from "./entry-path";
+import {
+  classifyCountry,
+  classifyPlanTag,
+  stageFromPaymentState,
+  type PlanTag,
+  type SignupCountry,
+  type SignupStage,
+} from "./signup-segments";
 
 /**
  * Today's signups, and whether anyone has actually paid.
@@ -71,6 +79,12 @@ export type SignupRow = {
    */
   nextBillAt: string | null;
   daysToNextBill: number | null;
+  /** Funnel stage, plan and country — the three things a rep slices by. */
+  stage: SignupStage;
+  planTag: PlanTag;
+  country: SignupCountry;
+  /** Which source placed them, so a country can be trusted or questioned. */
+  countrySource: "business" | "phone" | null;
 };
 
 export type SignupSubscriptionFact = {
@@ -81,6 +95,8 @@ export type SignupSubscriptionFact = {
   stripeSubscriptionId: string;
   /** When Stripe next bills them. The first bill, for a brand-new signup. */
   currentPeriodEnd: Date | null;
+  /** Which Stripe prices the subscription carries, for the plan tag. */
+  stripePriceIds?: string[];
 };
 
 const ENDED_STATUSES = new Set([
@@ -121,12 +137,21 @@ export function buildDailySignups(input: {
   }[];
   businessesByUser: ReadonlyMap<
     string,
-    { businessName: string; businessWebsiteUrl: string }[]
+    {
+      businessName: string;
+      businessWebsiteUrl: string;
+      businessCountry?: string | null;
+    }[]
   >;
+  socialPriceIds?: ReadonlySet<string>;
+  annualPriceIds?: ReadonlySet<string>;
   subscriptionsByUser: ReadonlyMap<string, SignupSubscriptionFact[]>;
   invoicesBySubscription: ReadonlyMap<string, InvoiceFact[]>;
   planNameBySubscription?: ReadonlyMap<string, string | null>;
 }): { rows: SignupRow[]; totals: Record<SignupPaymentState | "signups" | "reachable", number> } {
+  const socialPriceIds = input.socialPriceIds ?? new Set<string>();
+  const annualPriceIds = input.annualPriceIds ?? new Set<string>();
+
   const rows: SignupRow[] = input.users
     .map((user): SignupRow => {
       const businesses = input.businessesByUser.get(user.id) ?? [];
@@ -135,8 +160,48 @@ export function buildDailySignups(input: {
         input.subscriptionsByUser.get(user.id) ?? [],
       );
 
+      /**
+       * The payment state, decided first and once.
+       *
+       * It used to be returned from five separate branches, which meant every
+       * field derived *from* it had to be repeated five times — and the next
+       * field added would have been forgotten in one of them. Now the branches
+       * only pick a state and the row is assembled once.
+       */
+      const entry = subscription
+        ? classifyEntryPath({
+            invoices:
+              input.invoicesBySubscription.get(
+                subscription.stripeSubscriptionId,
+              ) ?? [],
+            recurringMinor: subscription.monthlyRecurringMinor,
+          })
+        : null;
+      const state: SignupPaymentState = !subscription
+        ? "none"
+        : ENDED_STATUSES.has(subscription.status)
+          ? "cancelled"
+          : entry === null || entry.route === "none" || entry.route === "unknown"
+            ? "pending"
+            : entry.reachedFullPrice
+              ? "paid"
+              : entry.route === "trial"
+                ? "trial"
+                : "discounted";
+
+      const stage = stageFromPaymentState(state);
+      // The country of the first business they built, falling back to their
+      // dialling code. A business with no country set is not an answer, so the
+      // fallback still runs.
+      const located = classifyCountry({
+        businessCountry:
+          businesses.find((business) => (business.businessCountry ?? "").trim())
+            ?.businessCountry ?? null,
+        phone: user.phone,
+      });
       const billAt = subscription?.currentPeriodEnd ?? null;
-      const base = {
+
+      return {
         userId: user.id,
         name: user.name,
         email: user.email,
@@ -151,44 +216,29 @@ export function buildDailySignups(input: {
               (billAt.getTime() - user.createdAt.getTime()) / 86_400_000,
             )
           : null,
-      };
-
-      if (!subscription) {
-        return {
-          ...base,
-          state: "none",
-          firstPaidMinor: null,
-          mrrMinor: null,
-          currency: null,
-          planName: null,
-        };
-      }
-
-      const entry = classifyEntryPath({
-        invoices:
-          input.invoicesBySubscription.get(subscription.stripeSubscriptionId) ?? [],
-        recurringMinor: subscription.monthlyRecurringMinor,
-      });
-      const shared = {
-        ...base,
-        firstPaidMinor: entry.firstPaidMinor,
-        mrrMinor: subscription.monthlyRecurringMinor.toFixed(0),
-        currency: subscription.currency ?? entry.currency,
-        planName:
-          input.planNameBySubscription?.get(subscription.stripeSubscriptionId) ??
-          null,
-      };
-
-      if (ENDED_STATUSES.has(subscription.status)) {
-        return { ...shared, state: "cancelled" };
-      }
-      if (entry.route === "none" || entry.route === "unknown") {
-        return { ...shared, state: "pending" };
-      }
-      if (entry.reachedFullPrice) return { ...shared, state: "paid" };
-      return {
-        ...shared,
-        state: entry.route === "trial" ? "trial" : "discounted",
+        state,
+        stage,
+        planTag: classifyPlanTag({
+          stage,
+          priceIds: subscription?.stripePriceIds ?? [],
+          socialPriceIds,
+          annualPriceIds,
+          hasSubscription: subscription !== null,
+        }),
+        country: located.country,
+        countrySource: located.source,
+        firstPaidMinor: entry?.firstPaidMinor ?? null,
+        mrrMinor: subscription
+          ? subscription.monthlyRecurringMinor.toFixed(0)
+          : null,
+        currency: subscription
+          ? (subscription.currency ?? entry?.currency ?? null)
+          : null,
+        planName: subscription
+          ? (input.planNameBySubscription?.get(
+              subscription.stripeSubscriptionId,
+            ) ?? null)
+          : null,
       };
     })
     // Newest first: a signup from twenty minutes ago is the one still warm.

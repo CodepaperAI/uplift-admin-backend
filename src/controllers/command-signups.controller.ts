@@ -11,6 +11,8 @@ import {
   buildDailySignups,
   type SignupSubscriptionFact,
 } from "../command/daily-signups";
+import { classifyCountry, tallySegments } from "../command/signup-segments";
+import { upliftPriceSets } from "../command/uplift-prices";
 import type { InvoiceFact } from "../command/entry-path";
 
 /**
@@ -67,7 +69,7 @@ export async function getCommandDailySignups(
       return;
     }
     const { range } = parsed;
-    const cacheKey = `command-signups-v3:${range.from}:${range.to}`;
+    const cacheKey = `command-signups-v4:${range.from}:${range.to}`;
     const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
     if (cached) {
       sendSuccess(res, cached, "Command daily signups");
@@ -93,6 +95,11 @@ export async function getCommandDailySignups(
      * the current book — a couple of thousand rows — it is cheaper than the
      * second count query it replaces.
      */
+    const stageFilter = typeof req.query.stage === "string" ? req.query.stage : null;
+    const planFilter = typeof req.query.plan === "string" ? req.query.plan : null;
+    const countryFilter =
+      typeof req.query.country === "string" ? req.query.country : null;
+
     const rangeUsers = await prisma.user.findMany({
       where,
       select: {
@@ -140,16 +147,25 @@ export async function getCommandDailySignups(
 
     const userIds = users.map((user) => user.id);
     const rangeUserIds = new Set(rangeUsers.map((user) => user.id));
-    const [businesses, allSnapshots, appSubscriptions] = await Promise.all([
+    const [businesses, allBusinessCountries, allSnapshots, appSubscriptions] =
+      await Promise.all([
       prisma.business.findMany({
         where: { userId: { in: userIds } },
         select: {
           userId: true,
           businessName: true,
           businessWebsiteUrl: true,
+          businessCountry: true,
           createdAt: true,
         },
         orderBy: { createdAt: "asc" },
+      }),
+      // Country for every business, two small columns and no where clause.
+      // The country segment has to cover the whole range — it is the one
+      // dimension that means something for people who never paid — and the
+      // full business list is smaller than the id list needed to filter it.
+      prisma.business.findMany({
+        select: { userId: true, businessCountry: true },
       }),
       // Every snapshot, not just the table's page. The table is a few hundred
       // rows at most, and filtering it in memory against the range beats
@@ -162,6 +178,7 @@ export async function getCommandDailySignups(
           currency: true,
           stripeSubscriptionId: true,
           currentPeriodEnd: true,
+          stripePriceIds: true,
         },
       }),
       // The plan name lives on the app's own record, not on the Stripe snapshot.
@@ -192,13 +209,18 @@ export async function getCommandDailySignups(
 
     const businessesByUser = new Map<
       string,
-      { businessName: string; businessWebsiteUrl: string }[]
+      {
+        businessName: string;
+        businessWebsiteUrl: string;
+        businessCountry: string | null;
+      }[]
     >();
     for (const business of businesses) {
       const list = businessesByUser.get(business.userId) ?? [];
       list.push({
         businessName: business.businessName,
         businessWebsiteUrl: business.businessWebsiteUrl,
+        businessCountry: business.businessCountry,
       });
       businessesByUser.set(business.userId, list);
     }
@@ -227,12 +249,15 @@ export async function getCommandDailySignups(
       ),
     );
 
+    const prices = upliftPriceSets();
     const { rows } = buildDailySignups({
       users,
       businessesByUser,
       subscriptionsByUser,
       invoicesBySubscription,
       planNameBySubscription,
+      socialPriceIds: prices.socialPriceIds,
+      annualPriceIds: prices.annualPriceIds,
     });
 
     /**
@@ -252,6 +277,8 @@ export async function getCommandDailySignups(
       subscriptionsByUser,
       invoicesBySubscription,
       planNameBySubscription,
+      socialPriceIds: prices.socialPriceIds,
+      annualPriceIds: prices.annualPriceIds,
     });
     const totals = {
       ...classified.totals,
@@ -273,7 +300,17 @@ export async function getCommandDailySignups(
         endExclusive: range.end.toISOString(),
         timeZone: COMMAND_TIME_ZONE,
       },
-      rows,
+      rows: rows.filter(
+        (row) =>
+          (stageFilter === null || row.stage === stageFilter) &&
+          (planFilter === null || row.planTag === planFilter) &&
+          (countryFilter === null || row.country === countryFilter),
+      ),
+      appliedFilters: {
+        stage: stageFilter,
+        plan: planFilter,
+        country: countryFilter,
+      },
       totals,
       /**
        * Signups in the whole range, which is what the headline should say.
@@ -283,6 +320,43 @@ export async function getCommandDailySignups(
       signupsInRange,
       rowCap: SIGNUP_ROW_CAP,
       truncated: signupsInRange > rows.length,
+      /**
+       * Stage, plan and country counts over the whole range.
+       *
+       * The subscription-holding subset is classified properly; everyone else
+       * is a `signed_up` row with no plan, so they are added in rather than run
+       * through the classifier. Country needs the whole range though — it is
+       * the one segment that means something for people who never paid — so
+       * those rows are built for it.
+       */
+      segments: (() => {
+        const countryByUser = new Map<string, string | null>();
+        for (const row of allBusinessCountries) {
+          const existing = countryByUser.get(row.userId);
+          // First non-empty wins; a business with no country set is not an
+          // answer, so keep looking through that user's other businesses.
+          if (!existing && (row.businessCountry ?? "").trim()) {
+            countryByUser.set(row.userId, row.businessCountry);
+          }
+        }
+        const subscribedIds = new Set(
+          classified.rows.map((row) => row.userId),
+        );
+        // Everyone without a subscription is the same shape — signed up, no
+        // plan — so they are counted directly rather than pushed back through
+        // the classifier that would only tell us that again.
+        const unsubscribed = rangeUsers
+          .filter((user) => !subscribedIds.has(user.id))
+          .map((user) => ({
+            stage: "signed_up" as const,
+            planTag: "none" as const,
+            country: classifyCountry({
+              businessCountry: countryByUser.get(user.id) ?? null,
+              phone: user.phone,
+            }).country,
+          }));
+        return tallySegments([...classified.rows, ...unsubscribed]);
+      })(),
       /**
        * Live subscription count for the same users, so the panel can say when
        * its own state derivation and the raw Stripe state disagree rather than
