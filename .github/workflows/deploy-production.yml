@@ -110,7 +110,17 @@ jobs:
             sleep 10
           done
           if [[ "$status" != "COMPLETE" && "$status" != "ACTIVE" ]]; then
-            echo "::error::ECR image scan did not finish within 10 minutes (last status: ${status:-none returned}). Refusing to deploy an unscanned image."
+            # Say which of the two actually happened. After the fail-fast break
+            # above, "did not finish within 10 minutes" would be a lie about a
+            # run that gave up in seconds.
+            case "$last_error" in
+              *AccessDenied*|*not\ authorized*)
+                echo "::error::ECR scan status could not be read at all — the call was denied, not slow. Refusing to deploy an unscanned image."
+                ;;
+              *)
+                echo "::error::ECR image scan did not finish within 10 minutes (last status: ${status:-none returned}). Refusing to deploy an unscanned image."
+                ;;
+            esac
             if [[ -n "$last_error" ]]; then
               echo "::error::Last error from describe-image-scan-findings: $last_error"
               case "$last_error" in
