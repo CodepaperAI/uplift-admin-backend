@@ -188,6 +188,15 @@ jobs:
           echo "Scan status: $status. Critical findings: $critical (raw: $(printf '%s' "$critical_raw" | tr '\n' ' '))"
           if [[ "$critical" != "0" ]]; then
             echo "::error::ECR scan reports $critical critical finding(s) on $scan_digest. Refusing to deploy."
+            # A count is not actionable. List them so whoever picks this up
+            # knows whether it is a base-image bump or a dependency override,
+            # instead of running the pipeline again to find out.
+            aws ecr describe-image-scan-findings \
+              --repository-name "$ECR_REPOSITORY" \
+              --image-id imageDigest="$scan_digest" \
+              --no-paginate \
+              --query 'imageScanFindings.enhancedFindings[?severity==`CRITICAL`].{cve:packageVulnerabilityDetails.vulnerabilityId,pkg:packageVulnerabilityDetails.vulnerablePackages[0].name,installed:packageVulnerabilityDetails.vulnerablePackages[0].version,fixed:packageVulnerabilityDetails.vulnerablePackages[0].fixedInVersion,type:packageVulnerabilityDetails.vulnerablePackages[0].packageManager}' \
+              --output table 2>&1 | head -60 || echo "(could not list findings)"
             exit 1
           fi
           echo "No critical findings. Proceeding."
