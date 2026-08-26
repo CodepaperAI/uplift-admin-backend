@@ -45,7 +45,7 @@ variable "instance_type" {
 
 variable "root_volume_gib" {
   type    = number
-  default = 30
+  default = 60
 }
 
 variable "github_repository" {

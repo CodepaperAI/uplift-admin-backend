@@ -80,18 +80,59 @@ cat >/opt/uplift-admin-api/deploy.sh <<'DEPLOY'
 #!/usr/bin/env bash
 set -euo pipefail
 
-image_tag="$${1:?immutable image tag required}"
 source /opt/uplift-admin-api/infrastructure.env
 runtime_dir=/opt/uplift-admin-api/runtime
 registry="$${ECR_REPOSITORY_URL%%/*}"
-new_image="$${ECR_REPOSITORY_URL}:$${image_tag}"
-previous_image=""
+minimum_free_kib=$((5 * 1024 * 1024))
+current_image=""
 if [[ -f "$${runtime_dir}/image.env" ]]; then
-  previous_image="$(sed -n 's/^ADMIN_IMAGE=//p' "$${runtime_dir}/image.env" | head -1)"
+  current_image="$(sed -n 's/^ADMIN_IMAGE=//p' "$${runtime_dir}/image.env" | head -1)"
+fi
+rollback_image=""
+if [[ -f "$${runtime_dir}/rollback-image.env" ]]; then
+  rollback_image="$(sed -n 's/^ADMIN_ROLLBACK_IMAGE=//p' "$${runtime_dir}/rollback-image.env" | head -1)"
 fi
 
+cleanup_unused_admin_images() {
+  while IFS= read -r image_ref; do
+    [[ -z "$${image_ref}" ]] && continue
+    if [[ "$${image_ref}" == "$${current_image}" || "$${image_ref}" == "$${rollback_image}" ]]; then
+      continue
+    fi
+    docker image rm "$${image_ref}" >/dev/null 2>&1 || true
+  done < <(docker image ls "$${ECR_REPOSITORY_URL}" --format '{{.Repository}}:{{.Tag}}')
+  docker image prune --force >/dev/null
+}
+
+require_free_space() {
+  local available_kib
+  available_kib="$(df -Pk /var/lib/docker | awk 'NR == 2 {print $4}')"
+  if [[ ! "$${available_kib}" =~ ^[0-9]+$ || "$${available_kib}" -lt "$${minimum_free_kib}" ]]; then
+    echo "Admin deployment requires at least 5 GiB free under /var/lib/docker; currently $${available_kib:-unknown} KiB is available." >&2
+    exit 1
+  fi
+}
+
+cleanup_unused_admin_images
+require_free_space
+
+if [[ "$${1:-}" == "--preflight" ]]; then
+  echo "Admin deployment preflight passed with current and rollback images preserved."
+  exit 0
+fi
+
+image_tag="$${1:?immutable image tag required}"
+new_image="$${ECR_REPOSITORY_URL}:$${image_tag}"
+
 secret_tmp="$(mktemp /opt/uplift-admin-api/admin.env.XXXXXX)"
-trap 'rm -f "$${secret_tmp}"' EXIT
+docker_config_dir="$(mktemp -d /tmp/uplift-admin-ecr.XXXXXX)"
+cleanup() {
+  rm -f "$${secret_tmp}"
+  if [[ "$${docker_config_dir}" == /tmp/uplift-admin-ecr.* ]]; then
+    find "$${docker_config_dir}" -depth -delete
+  fi
+}
+trap cleanup EXIT
 aws secretsmanager get-secret-value \
   --region "$${AWS_REGION}" \
   --secret-id "$${RUNTIME_SECRET_ARN}" \
@@ -102,6 +143,7 @@ aws secretsmanager get-secret-value \
 chmod 0600 "$${secret_tmp}"
 install -m 0600 "$${secret_tmp}" "$${runtime_dir}/admin.env"
 
+export DOCKER_CONFIG="$${docker_config_dir}"
 aws ecr get-login-password --region "$${AWS_REGION}" \
   | docker login --username AWS --password-stdin "$${registry}"
 docker pull "$${new_image}"
@@ -119,7 +161,13 @@ container_id="$(docker compose ps -q admin-api)"
 for attempt in $(seq 1 30); do
   status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$${container_id}")"
   if [[ "$${status}" == "healthy" ]]; then
-    docker image prune -f >/dev/null
+    if [[ -n "$${current_image}" && "$${current_image}" != "$${new_image}" ]]; then
+      printf 'ADMIN_ROLLBACK_IMAGE=%s\n' "$${current_image}" >"$${runtime_dir}/rollback-image.env"
+      chmod 0600 "$${runtime_dir}/rollback-image.env"
+      rollback_image="$${current_image}"
+    fi
+    current_image="$${new_image}"
+    cleanup_unused_admin_images
     exit 0
   fi
   if [[ "$${status}" == "unhealthy" || "$${status}" == "exited" ]]; then
@@ -129,9 +177,9 @@ for attempt in $(seq 1 30); do
 done
 
 docker compose logs --tail=100 admin-api
-if [[ -n "$${previous_image}" ]]; then
-  printf 'ADMIN_IMAGE=%s\n' "$${previous_image}" >"$${runtime_dir}/image.env"
-  export ADMIN_IMAGE="$${previous_image}"
+if [[ -n "$${current_image}" ]]; then
+  printf 'ADMIN_IMAGE=%s\n' "$${current_image}" >"$${runtime_dir}/image.env"
+  export ADMIN_IMAGE="$${current_image}"
   docker compose --env-file ./image.env up -d --remove-orphans
 fi
 exit 1

@@ -15,6 +15,7 @@ concurrency:
 
 jobs:
   verify-build-deploy:
+    if: github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip deploy]')
     runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 30
@@ -44,6 +45,23 @@ jobs:
           role-to-assume: arn:aws:iam::574521704327:role/uplift-production-admin-api-github-deploy
           aws-region: us-east-1
 
+      - name: Verify target capacity before build
+        run: |
+          instance_id=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=$INSTANCE_NAME" "Name=instance-state-name,Values=running" \
+            --query 'Reservations[0].Instances[0].InstanceId' --output text)
+          [[ "$instance_id" =~ ^i-[a-f0-9]+$ ]]
+          command_id=$(aws ssm send-command \
+            --instance-ids "$instance_id" \
+            --document-name AWS-RunShellScript \
+            --parameters 'commands=sudo /opt/uplift-admin-api/deploy.sh --preflight' \
+            --comment "Preflight admin API deployment capacity" \
+            --query 'Command.CommandId' --output text)
+          aws ssm wait command-executed --command-id "$command_id" --instance-id "$instance_id"
+          aws ssm get-command-invocation \
+            --command-id "$command_id" --instance-id "$instance_id" \
+            --query '{Status:Status,Output:StandardOutputContent,Error:StandardErrorContent}'
+
       - uses: docker/setup-buildx-action@v3
 
       - uses: aws-actions/amazon-ecr-login@v2
@@ -71,7 +89,7 @@ jobs:
           scan_digest=$(jq -er \
             '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest' \
             <<<"$index_manifest")
-          # Basic scan-on-push needs longer than the old 30x5s window on an
+          # ECR/Inspector scanning needs longer than the old 30x5s window on an
           # image this size. When it overran, the loop fell through and the
           # findings call below crashed the AWS CLI with "'NoneType' object does
           # not support item assignment" — a closed gate, but an unreadable one,
@@ -129,7 +147,7 @@ jobs:
                   ;;
                 *inspector2*)
                   echo "::error::This repository is on Amazon Inspector (enhanced scanning), not basic scanning, so describe-image-scan-findings now reads through inspector2 — and the deploy role has no inspector2 permissions. Attach this to uplift-production-admin-api-github-deploy:"
-                  echo '::error::{"Effect":"Allow","Action":["inspector2:ListCoverage","inspector2:ListFindings","inspector2:BatchGetFindingDetails"],"Resource":"*"}'
+                  echo '::error::{"Effect":"Allow","Action":["inspector2:ListAccountPermissions","inspector2:ListCoverage","inspector2:ListFindings","inspector2:BatchGetFindingDetails"],"Resource":"*"}'
                   echo "::error::Nothing here is slow or flaky — every probe was denied. Fix the policy; do not bypass the gate."
                   ;;
                 *AccessDenied*|*not\ authorized*)

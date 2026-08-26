@@ -4,6 +4,19 @@ data "aws_ssm_parameter" "amazon_linux_2023_x86_64" {
   name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
 }
 
+resource "aws_ecr_registry_scanning_configuration" "production" {
+  scan_type = "ENHANCED"
+
+  rule {
+    scan_frequency = "CONTINUOUS_SCAN"
+
+    repository_filter {
+      filter      = "uplift-production-*"
+      filter_type = "WILDCARD"
+    }
+  }
+}
+
 resource "aws_ecr_repository" "admin_api" {
   name                 = "uplift-production-admin-api"
   image_tag_mutability = "IMMUTABLE"
@@ -282,6 +295,16 @@ resource "aws_iam_role_policy" "github_deploy" {
       {
         Effect   = "Allow"
         Action   = ["ec2:DescribeInstances", "ecr:DescribeImageScanFindings"]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "inspector2:BatchGetFindingDetails",
+          "inspector2:ListAccountPermissions",
+          "inspector2:ListCoverage",
+          "inspector2:ListFindings"
+        ]
         Resource = "*"
       }
     ]
