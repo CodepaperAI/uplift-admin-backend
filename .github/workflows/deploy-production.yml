@@ -114,8 +114,15 @@ jobs:
             if probe=$(aws ecr describe-image-scan-findings \
               --repository-name "$ECR_REPOSITORY" \
               --image-id imageDigest="$scan_digest" \
+              --no-paginate \
               --query 'imageScanStatus.status' --output text 2>"$scan_stderr"); then
-              status="$(tr -d '[:space:]' <<<"$probe")"
+              # The CLI auto-paginates describe-image-scan-findings, and under
+              # enhanced scanning there are several pages — it printed the
+              # status once per page, so the value arrived as
+              # "ACTIVE\nNone\nNone\nNone" and stripping whitespace glued it
+              # into ACTIVENoneNoneNone. Take the first line only, and stop it
+              # walking pages just to read one field.
+              status="$(printf '%s\n' "$probe" | head -1 | tr -d '[:space:]')"
               last_error=""
             else
               status=""
