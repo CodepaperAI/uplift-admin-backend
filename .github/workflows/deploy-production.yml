@@ -76,12 +76,26 @@ jobs:
           # findings call below crashed the AWS CLI with "'NoneType' object does
           # not support item assignment" — a closed gate, but an unreadable one,
           # and unrepeatable because the tag is immutable and already pushed.
+          # The previous version sent stderr to /dev/null and forced a zero exit,
+          # so a call that failed every single time was indistinguishable from a
+          # scan that was merely slow: `status` stayed empty for all 60 attempts
+          # and the gate reported "last status: unknown". A slow scan returns
+          # IN_PROGRESS, so empty always meant the call itself was failing — and
+          # the one thing needed to know why had just been discarded. Keep the
+          # error instead, and print it when the loop gives up.
           status=""
+          last_error=""
           for attempt in $(seq 1 60); do
-            status=$(aws ecr describe-image-scan-findings \
+            if probe=$(aws ecr describe-image-scan-findings \
               --repository-name "$ECR_REPOSITORY" \
               --image-id imageDigest="$scan_digest" \
-              --query 'imageScanStatus.status' --output text 2>/dev/null || true)
+              --query 'imageScanStatus.status' --output text 2>&1); then
+              status="$probe"
+              last_error=""
+            else
+              status=""
+              last_error="$probe"
+            fi
             if [[ "$status" == "COMPLETE" || "$status" == "ACTIVE" ]]; then break; fi
             if [[ "$status" == "FAILED" ]]; then
               echo "::error::ECR image scan reported FAILED for $scan_digest"
@@ -90,7 +104,19 @@ jobs:
             sleep 10
           done
           if [[ "$status" != "COMPLETE" && "$status" != "ACTIVE" ]]; then
-            echo "::error::ECR image scan did not finish within 10 minutes (last status: ${status:-unknown}). Refusing to deploy an unscanned image."
+            echo "::error::ECR image scan did not finish within 10 minutes (last status: ${status:-none returned}). Refusing to deploy an unscanned image."
+            if [[ -n "$last_error" ]]; then
+              echo "::error::Last error from describe-image-scan-findings: $last_error"
+              case "$last_error" in
+                *ScanNotFound*)
+                  echo "::error::No scan exists for this digest. Scan-on-push is most likely disabled on $ECR_REPOSITORY — check ECR > Repositories > $ECR_REPOSITORY > Edit > Scan on push. The gate is failing closed on purpose; do not bypass it."
+                  ;;
+                *AccessDenied*|*not\ authorized*)
+                  echo "::error::The deploy role cannot read scan findings. Grant ecr:DescribeImageScanFindings to the OIDC role."
+                  ;;
+              esac
+            fi
+            echo "::error::Digest queried: $scan_digest"
             exit 1
           fi
           critical=$(aws ecr describe-image-scan-findings \
