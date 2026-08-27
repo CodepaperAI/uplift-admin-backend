@@ -305,9 +305,32 @@ export async function getCommandStripeOverview(
 ): Promise<void> {
   try {
     const period = commandMonthRange(currentCommandMonth());
+    /**
+     * A ceiling high enough that the roster arrives in one page.
+     *
+     * This endpoint computes the entire Command payload — nineteen parallel
+     * aggregations, three months of movement, the rep leaderboard, growth
+     * economics — and *then* slices out one page of the roster. The cost is per
+     * request, not per row. So a reader who needs the whole roster and can only
+     * have 100 accounts at a time pays for that whole aggregation once per
+     * hundred accounts: at 183 live accounts the Command page was running it
+     * twice, on top of a third for its own metrics at a different page size.
+     *
+     * The default stays 50 for anything that just wants a page. Raising only
+     * the ceiling means one request can now cover the roster outright, and
+     * because every page in the panel asks at the same size they share a single
+     * cache entry rather than warming one each.
+     *
+     * The better shape is a `stripe/roster` endpoint that reads only what a
+     * roster needs — around eleven queries rather than thirty — so the two
+     * concerns stop sharing a response at all. That is recorded in
+     * docs/command-panel/backend-asks.md and is a refactor of the roster row
+     * builder, not a parameter change; it should not ride along with this.
+     */
     const { page, pageSize, skip } = parseCommandPagination({
       page: req.query.page,
       pageSize: req.query.pageSize,
+      maxPageSize: 500,
     });
     const cacheKey = `stripe-overview-v10:${period.month}:${page}:${pageSize}`;
     const cached = await readCommandCache<Record<string, unknown>>(cacheKey);

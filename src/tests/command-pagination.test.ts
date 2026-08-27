@@ -19,6 +19,26 @@ describe("Command pagination", () => {
     ).toEqual({ page: 3, pageSize: 100, skip: 200 });
   });
 
+  it("lets an endpoint raise its own ceiling without moving the default", () => {
+    // The overview does this so the whole roster fits in one request: that
+    // endpoint recomputes the entire Command payload before slicing out a page,
+    // so a caller who needs every account should not have to pay for the
+    // aggregation once per hundred of them.
+    expect(
+      parseCommandPagination({ page: "1", pageSize: "250", maxPageSize: 500 }),
+    ).toEqual({ page: 1, pageSize: 250, skip: 0 });
+    // Raising the ceiling must not raise what an unasked-for request gets.
+    expect(parseCommandPagination({ maxPageSize: 500 })).toEqual({
+      page: 1,
+      pageSize: 50,
+      skip: 0,
+    });
+    // And the ceiling is still a ceiling.
+    expect(
+      parseCommandPagination({ pageSize: "50000", maxPageSize: 500 }),
+    ).toEqual({ page: 1, pageSize: 500, skip: 0 });
+  });
+
   it("reports one empty page instead of page zero", () => {
     expect(
       commandPaginationResult({ page: 1, pageSize: 50, total: 0 }),
