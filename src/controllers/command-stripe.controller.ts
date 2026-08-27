@@ -2178,7 +2178,7 @@ export async function getCommandStripeMonthMovement(
   try {
     const month = parseMovementMonth(req.query.month) ?? currentCommandMonth();
     const range = commandMonthRange(month);
-    const cacheKey = `stripe-month-movement-v7:${month}`;
+    const cacheKey = `stripe-month-movement-v8:${month}`;
     const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
     if (cached) {
       sendSuccess(res, cached, "Command Stripe month movement");
@@ -2576,6 +2576,16 @@ export async function getCommandStripeMonthMovement(
         ...movement.coverage,
         /** GHL rows dropped as the same payment Stripe already reported. */
         ghlDuplicatesExcluded,
+        /**
+         * The first month any GHL payment exists for.
+         *
+         * The table holds nothing before 2026-07, so the combined figure for
+         * every month before that is Stripe alone — and a reader has no way to
+         * tell "GHL earned nothing" from "we have no GHL records" unless the
+         * panel says which. Same reason `eventLogStartsOn` exists for the
+         * webhook log.
+         */
+        ghlCollectedFromMonth: earliestFactMonth(ghlCollected),
         /** GHL rows whose amount was finer than its currency's minor unit. */
         ghlAmountsSkipped: history.ghlAmountsSkipped,
         knownSubscriptions: snapshots.length,
