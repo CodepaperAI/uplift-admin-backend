@@ -54,6 +54,9 @@ export type FailedInvoiceFact = {
   accountKey: string;
   stripeInvoiceId: string;
   at: Date;
+  /** What Stripe is still owed on this invoice, minor units. For the call list. */
+  amountRemainingMinor?: string | null;
+  currency?: string | null;
 };
 
 export type MonthMovementDay = {
@@ -241,7 +244,29 @@ export type MovementHistoryMonth = {
   /** Distinct accounts in either churn bucket. Never their sum. */
   churned: number;
   net: number;
+  /**
+   * Every account created that month, not only the ones that bought something.
+   *
+   * Sits beside `newSubscribers` because the pair is the month's conversion
+   * story: 219 arrived and 10 took a plan is a different month from 12 arrived
+   * and 10 took a plan, and the churn chart could not tell them apart.
+   */
+  signups: number;
+  /**
+   * Cash Stripe actually settled that month, by currency, in minor units.
+   *
+   * Subscription invoices *and* one-off invoices, which is what makes it
+   * "revenue collected" rather than "subscription revenue" — a manually
+   * invoiced retainer counts here and does not appear in MRR.
+   *
+   * Never summed across currencies: CAD and USD sit side by side because adding
+   * them would invent an exchange rate.
+   */
+  collectedMinorByCurrency: Record<string, string>;
 };
+
+/** Sums of minor-unit amounts keyed by currency, as strings out. */
+export type MinorByCurrency = Record<string, string>;
 
 /**
  * The same arrivals and departures, bucketed by month instead of by day.
@@ -258,6 +283,10 @@ export function buildMovementHistory(input: {
   starts: readonly MovementFact[];
   cancellations: readonly MovementFact[];
   failedInvoices: readonly FailedInvoiceFact[];
+  /** When each account was created, for the per-month signup count. */
+  signups?: readonly { at: Date }[];
+  /** Settled invoices, for the per-month collected figure. */
+  collected?: readonly { at: Date; currency: string; amountMinor: string }[];
 }): {
   range: { from: string; to: string; timeZone: string };
   months: MovementHistoryMonth[];
@@ -292,11 +321,43 @@ export function buildMovementHistory(input: {
   const cancelled = collect(input.cancellations);
   const failed = collect(input.failedInvoices);
 
+  // Signups are counted per event, not per distinct account: two accounts on
+  // one day are two signups. That is the opposite of the churn buckets above,
+  // where three failed retries for one customer is one customer in trouble.
+  const signupsByMonth = new Map<string, number>();
+  for (const signup of input.signups ?? []) {
+    const month = commandMonthForDate(signup.at);
+    if (!monthIndex.has(month)) continue;
+    signupsByMonth.set(month, (signupsByMonth.get(month) ?? 0) + 1);
+  }
+
+  // Summed as integers in minor units. These are amounts in cents, so there is
+  // nothing to round and no float to drift.
+  const collectedByMonth = new Map<string, Map<string, bigint>>();
+  for (const entry of input.collected ?? []) {
+    const month = commandMonthForDate(entry.at);
+    if (!monthIndex.has(month)) continue;
+    const currency = entry.currency.toLowerCase();
+    const bucket = collectedByMonth.get(month) ?? new Map<string, bigint>();
+    let amount: bigint;
+    try {
+      amount = BigInt(entry.amountMinor);
+    } catch {
+      // A malformed amount is skipped rather than crashing the panel, and it
+      // cannot silently read as zero revenue for the month: every other
+      // invoice in the month still counts.
+      continue;
+    }
+    bucket.set(currency, (bucket.get(currency) ?? 0n) + amount);
+    collectedByMonth.set(month, bucket);
+  }
+
   const series = months.map((month) => {
     const cancels = cancelled.byMonth.get(month) ?? new Set<string>();
     const fails = failed.byMonth.get(month) ?? new Set<string>();
     const churned = new Set([...cancels, ...fails]).size;
     const newSubscribers = (arrived.byMonth.get(month) ?? new Set()).size;
+    const collected = collectedByMonth.get(month) ?? new Map<string, bigint>();
     return {
       month,
       newSubscribers,
@@ -304,6 +365,12 @@ export function buildMovementHistory(input: {
       paymentFailures: fails.size,
       churned,
       net: newSubscribers - churned,
+      signups: signupsByMonth.get(month) ?? 0,
+      collectedMinorByCurrency: Object.fromEntries(
+        [...collected.entries()]
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([currency, amount]) => [currency, amount.toString()]),
+      ),
     };
   });
 
@@ -318,6 +385,150 @@ export function buildMovementHistory(input: {
       paymentFailures: failed.overall.size,
       churned: churnedOverall,
       net: arrived.overall.size - churnedOverall,
+    },
+  };
+}
+
+
+/* -------------------------------------------------------------------------- */
+/*  The churn call list                                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Why this account is on the list.
+ *
+ * `both` is its own value rather than a cancellation that happens to have a
+ * failed payment behind it, because the two need different opening lines: a card
+ * that failed and then a cancellation is usually a billing problem wearing a
+ * churn costume, and it is the most recoverable row on the page.
+ */
+export type ChurnReason = "cancelled" | "payment_failed" | "both";
+
+/** What we know about the person behind an account key. */
+export type ChurnIdentity = {
+  stripeCustomerId?: string | null;
+  name?: string | null;
+  email?: string | null;
+  phone?: string | null;
+  businessName?: string | null;
+  planName?: string | null;
+  /** What they were paying, so the list can be worked by value. */
+  mrrMinor?: string | null;
+  currency?: string | null;
+};
+
+export type ChurnedAccount = ChurnIdentity & {
+  accountKey: string;
+  reason: ChurnReason;
+  cancelledAt: string | null;
+  paymentFailedAt: string | null;
+  failedInvoiceCount: number;
+  /** Sum of what is unpaid across this month's failed invoices, minor units. */
+  amountOutstandingMinor: string | null;
+  outstandingCurrency: string | null;
+};
+
+/** Highest recurring value first — the biggest loss is the first call. */
+function byValueThenRecency(left: ChurnedAccount, right: ChurnedAccount): number {
+  const value = (row: ChurnedAccount): bigint => {
+    try {
+      return BigInt(row.mrrMinor ?? "0");
+    } catch {
+      return 0n;
+    }
+  };
+  const difference = value(right) - value(left);
+  if (difference !== 0n) return difference > 0n ? 1 : -1;
+  const at = (row: ChurnedAccount) => row.cancelledAt ?? row.paymentFailedAt ?? "";
+  return at(right).localeCompare(at(left));
+}
+
+/**
+ * Everyone who cancelled or missed a payment in one month, as a call list.
+ *
+ * The panel already counted these two things; a count is not something a rep can
+ * act on. This is the same facts with a name, a number and an amount attached,
+ * so "43 cancelled" becomes forty-three conversations someone can have today.
+ *
+ * One row per **account**, not per event, matching how the counts above are
+ * made: an account that failed three retries and then cancelled is one person to
+ * ring, and the row says so rather than appearing three times and overstating
+ * the work. Accounts with no identity on record are still listed — a Stripe
+ * customer id and an amount is enough to look someone up, and dropping them
+ * would make the list quietly disagree with the count beside it.
+ */
+export function buildChurnCallList(input: {
+  month: string;
+  cancellations: readonly MovementFact[];
+  failedInvoices: readonly FailedInvoiceFact[];
+  identities?: ReadonlyMap<string, ChurnIdentity>;
+}): {
+  rows: ChurnedAccount[];
+  totals: { cancelled: number; paymentFailed: number; both: number; accounts: number };
+} {
+  const inMonth = (at: Date) => commandMonthForDate(at) === input.month;
+
+  /** Earliest event in the month wins: it is when the trouble started. */
+  const cancelledAt = new Map<string, Date>();
+  for (const fact of input.cancellations) {
+    if (!inMonth(fact.at)) continue;
+    const current = cancelledAt.get(fact.accountKey);
+    if (!current || fact.at < current) cancelledAt.set(fact.accountKey, fact.at);
+  }
+
+  const failedAt = new Map<string, Date>();
+  const failedCount = new Map<string, number>();
+  const outstanding = new Map<string, Map<string, bigint>>();
+  for (const fact of input.failedInvoices) {
+    if (!inMonth(fact.at)) continue;
+    const current = failedAt.get(fact.accountKey);
+    if (!current || fact.at < current) failedAt.set(fact.accountKey, fact.at);
+    failedCount.set(fact.accountKey, (failedCount.get(fact.accountKey) ?? 0) + 1);
+    if (fact.amountRemainingMinor && fact.currency) {
+      const currency = fact.currency.toLowerCase();
+      const bucket = outstanding.get(fact.accountKey) ?? new Map<string, bigint>();
+      try {
+        bucket.set(currency, (bucket.get(currency) ?? 0n) + BigInt(fact.amountRemainingMinor));
+        outstanding.set(fact.accountKey, bucket);
+      } catch {
+        // A malformed amount costs this row its total, not the whole list.
+      }
+    }
+  }
+
+  const keys = new Set([...cancelledAt.keys(), ...failedAt.keys()]);
+  const rows: ChurnedAccount[] = [];
+  for (const accountKey of keys) {
+    const cancelled = cancelledAt.get(accountKey) ?? null;
+    const failed = failedAt.get(accountKey) ?? null;
+    const reason: ChurnReason =
+      cancelled && failed ? "both" : cancelled ? "cancelled" : "payment_failed";
+    // Only one currency is ever reported, because summing across them would
+    // invent an exchange rate. Where an account somehow owes in two, the larger
+    // is shown — the point of the number is to rank the call, not to reconcile.
+    const owed = [...(outstanding.get(accountKey)?.entries() ?? [])].sort(
+      ([, left], [, right]) => (right > left ? 1 : right < left ? -1 : 0),
+    )[0];
+    rows.push({
+      ...(input.identities?.get(accountKey) ?? {}),
+      accountKey,
+      reason,
+      cancelledAt: cancelled ? cancelled.toISOString() : null,
+      paymentFailedAt: failed ? failed.toISOString() : null,
+      failedInvoiceCount: failedCount.get(accountKey) ?? 0,
+      amountOutstandingMinor: owed ? owed[1].toString() : null,
+      outstandingCurrency: owed ? owed[0] : null,
+    });
+  }
+  rows.sort(byValueThenRecency);
+
+  return {
+    rows,
+    totals: {
+      cancelled: rows.filter((row) => row.reason === "cancelled").length,
+      paymentFailed: rows.filter((row) => row.reason === "payment_failed").length,
+      both: rows.filter((row) => row.reason === "both").length,
+      accounts: rows.length,
     },
   };
 }

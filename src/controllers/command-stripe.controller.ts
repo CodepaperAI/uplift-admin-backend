@@ -25,11 +25,13 @@ import {
   type InvoiceFact,
 } from "../command/entry-path";
 import {
+  buildChurnCallList,
   buildMonthMovement,
   buildMovementHistory,
   commandMonthSpan,
   earliestFactMonth,
   parseMovementMonth,
+  type ChurnIdentity,
   type FailedInvoiceFact,
   type MovementFact,
 } from "../command/month-movement";
@@ -332,7 +334,7 @@ export async function getCommandStripeOverview(
       pageSize: req.query.pageSize,
       maxPageSize: 500,
     });
-    const cacheKey = `stripe-overview-v10:${period.month}:${page}:${pageSize}`;
+    const cacheKey = `stripe-overview-v11:${period.month}:${page}:${pageSize}`;
     const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
     if (cached) {
       sendSuccess(res, cached, "Command Stripe overview");
@@ -1028,17 +1030,40 @@ export async function getCommandStripeOverview(
       subscriptionIds: new Set(upliftSubscriptionIds),
       upliftPriceIds: new Set(upliftPlanByPriceId.keys()),
     });
-    const upliftMonthlyPaidGroups = upliftSubscriptionIds.length
-      ? await prisma.commandStripeInvoice.groupBy({
-          by: ["currency"],
-          where: {
-            status: "paid",
-            paidAt: { gte: period.start, lt: period.end },
-            stripeSubscriptionId: { in: upliftSubscriptionIds },
-          },
-          _sum: { amountPaidMinor: true },
-        })
-      : [];
+    /**
+     * Cash collected on Uplift plans: this month, and since the beginning.
+     *
+     * Both, because the panel needs both and they answer different questions —
+     * "is this month tracking" against "what has this product ever earned". Run
+     * together so the second costs a query rather than a round trip.
+     *
+     * Scoped to Uplift subscription invoices, matching every other figure in the
+     * snapshot block. Total collected across *everything* Stripe has settled,
+     * one-off invoices included, is `paidToDateMinorByCurrency` further down.
+     */
+    const [upliftMonthlyPaidGroups, upliftAllTimePaidGroups] =
+      upliftSubscriptionIds.length
+        ? await Promise.all([
+            prisma.commandStripeInvoice.groupBy({
+              by: ["currency"],
+              where: {
+                status: "paid",
+                paidAt: { gte: period.start, lt: period.end },
+                stripeSubscriptionId: { in: upliftSubscriptionIds },
+              },
+              _sum: { amountPaidMinor: true },
+            }),
+            prisma.commandStripeInvoice.groupBy({
+              by: ["currency"],
+              where: {
+                status: "paid",
+                paidAt: { not: null },
+                stripeSubscriptionId: { in: upliftSubscriptionIds },
+              },
+              _sum: { amountPaidMinor: true },
+            }),
+          ])
+        : [[], []];
     const upliftMrrByCurrency = new Map<string, Prisma.Decimal>();
     const upliftPlanBuckets = new Map<
       string,
@@ -1179,6 +1204,12 @@ export async function getCommandStripeOverview(
         row._sum.amountPaidMinor?.toString() ?? "0",
       ]),
     );
+    const upliftCollectedAllTimeMinorByCurrency = Object.fromEntries(
+      upliftAllTimePaidGroups.map((row) => [
+        row.currency,
+        row._sum.amountPaidMinor?.toString() ?? "0",
+      ]),
+    );
     const payingUpliftCustomerIds = new Set(
       upliftSubscriptions.flatMap((subscription) =>
         subscription.status !== "trialing" &&
@@ -1292,6 +1323,8 @@ export async function getCommandStripeOverview(
           mrrMinorByCurrency: upliftMrrMinorByCurrency,
           collectedThisMonthMinorByCurrency:
             upliftCollectedThisMonthMinorByCurrency,
+          collectedAllTimeMinorByCurrency:
+            upliftCollectedAllTimeMinorByCurrency,
           arrRunRateMinorByCurrency: upliftArrRunRateMinorByCurrency,
           plans: [...upliftPlanBuckets.values()]
             .map((bucket) => ({
@@ -2142,7 +2175,7 @@ export async function getCommandStripeMonthMovement(
   try {
     const month = parseMovementMonth(req.query.month) ?? currentCommandMonth();
     const range = commandMonthRange(month);
-    const cacheKey = `stripe-month-movement-v4:${month}`;
+    const cacheKey = `stripe-month-movement-v5:${month}`;
     const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
     if (cached) {
       sendSuccess(res, cached, "Command Stripe month movement");
@@ -2163,6 +2196,9 @@ export async function getCommandStripeMonthMovement(
       deletedEventRows,
       failedInvoiceRows,
       oldestRealEvent,
+      userRows,
+      businessRows,
+      settledInvoiceRows,
     ] = await Promise.all([
       // Every subscription Stripe ever made, live or ended. Small — hundreds.
       prisma.commandStripeSubscriptionSnapshot.findMany({
@@ -2170,7 +2206,13 @@ export async function getCommandStripeMonthMovement(
           stripeSubscriptionId: true,
           stripeCustomerId: true,
           userId: true,
+          businessId: true,
           status: true,
+          // For the churn call list: what the account was worth and what it was
+          // on, so the list can be worked highest-value first.
+          monthlyRecurringMinor: true,
+          currency: true,
+          stripePriceIds: true,
         },
       }),
       // Record dates, keyed by Stripe id. Only rows that reached Stripe at all
@@ -2210,6 +2252,10 @@ export async function getCommandStripeMonthMovement(
           stripeSubscriptionId: true,
           userId: true,
           providerCreatedAt: true,
+          // What Stripe is still owed, so a rep opens the call knowing the
+          // amount rather than having to look it up mid-conversation.
+          amountRemainingMinor: true,
+          currency: true,
         },
       }),
       prisma.commandStripeSubscriptionEvent.findFirst({
@@ -2218,6 +2264,32 @@ export async function getCommandStripeMonthMovement(
         },
         select: { occurredAt: true },
         orderBy: { occurredAt: "asc" },
+      }),
+      // Every account, serving two purposes so it is one read rather than two:
+      // `createdAt` gives the per-month signup count, and the contact fields
+      // give the churn call list a name and a number to ring.
+      //
+      // Months are bucketed in Toronto here rather than by the database,
+      // because a timezone-aware truncation is not portable through Prisma and
+      // the arrivals beside it are already bucketed by the same helper — two
+      // different month boundaries on one chart would be worse than this read.
+      prisma.user.findMany({
+        select: {
+          id: true,
+          name: true,
+          email: true,
+          phone: true,
+          createdAt: true,
+        },
+      }),
+      prisma.business.findMany({ select: { id: true, businessName: true } }),
+      // Every settled invoice, for the per-month collected figure. Subscription
+      // invoices *and* one-off invoices: that is what makes the number "revenue
+      // collected" rather than "subscription revenue", and it is why a manually
+      // invoiced retainer appears here while never appearing in MRR.
+      prisma.commandStripeInvoice.findMany({
+        where: { status: "paid", paidAt: { not: null } },
+        select: { paidAt: true, amountPaidMinor: true, currency: true },
       }),
     ]);
 
@@ -2316,6 +2388,8 @@ export async function getCommandStripeMonthMovement(
       accountKey: accountKeyFor(row),
       stripeInvoiceId: row.stripeInvoiceId,
       at: row.providerCreatedAt,
+      amountRemainingMinor: row.amountRemainingMinor.toFixed(0),
+      currency: row.currency,
     }));
 
     const movement = buildMonthMovement({
@@ -2350,11 +2424,83 @@ export async function getCommandStripeMonthMovement(
       starts,
       cancellations,
       failedInvoices,
+      signups: userRows.map((row) => ({ at: row.createdAt })),
+      collected: settledInvoiceRows.flatMap((row) =>
+        row.paidAt
+          ? [
+              {
+                at: row.paidAt,
+                currency: row.currency,
+                amountMinor: row.amountPaidMinor.toFixed(0),
+              },
+            ]
+          : [],
+      ),
+    });
+
+    /**
+     * Who to ring about this month's churn.
+     *
+     * The two tiles already counted cancellations and failed payments. A count
+     * is not something a rep can act on, so the same facts are joined to a name,
+     * a number and an amount — "43 cancelled" becomes forty-three conversations
+     * someone can have today. One row per account, matching how the tiles count,
+     * so the list and the number beside it cannot drift apart.
+     */
+    const businessNameById = new Map(
+      businessRows.map((row) => [row.id, row.businessName]),
+    );
+    const userById = new Map(userRows.map((row) => [row.id, row]));
+    const upliftPlanNames = await getUpliftPlanDefinitions();
+    const planNameByPriceId = new Map(
+      upliftPlanNames.map((plan) => [plan.priceId, plan.name]),
+    );
+    const identities = new Map<string, ChurnIdentity>();
+    for (const snapshot of snapshots) {
+      const record = recordBySubscription.get(snapshot.stripeSubscriptionId);
+      const accountKey = accountKeyFor({
+        stripeCustomerId: snapshot.stripeCustomerId ?? record?.stripeCustomerId,
+        userId: snapshot.userId ?? record?.userId,
+        stripeSubscriptionId: snapshot.stripeSubscriptionId,
+      });
+      const user = snapshot.userId ? userById.get(snapshot.userId) : undefined;
+      const existing = identities.get(accountKey);
+      // An account can hold several subscriptions. Keep the dearest one's value
+      // and plan, so a customer who also had a cheap add-on is not ranked by
+      // the add-on.
+      const value = snapshot.monthlyRecurringMinor.toFixed(0);
+      const dearer =
+        existing?.mrrMinor === undefined ||
+        existing.mrrMinor === null ||
+        Number(value) > Number(existing.mrrMinor);
+      identities.set(accountKey, {
+        stripeCustomerId: snapshot.stripeCustomerId ?? existing?.stripeCustomerId ?? null,
+        name: user?.name ?? existing?.name ?? null,
+        email: user?.email ?? existing?.email ?? null,
+        phone: user?.phone ?? existing?.phone ?? null,
+        businessName: snapshot.businessId
+          ? (businessNameById.get(snapshot.businessId) ?? existing?.businessName ?? null)
+          : (existing?.businessName ?? null),
+        planName: dearer
+          ? (snapshot.stripePriceIds
+              .map((priceId) => planNameByPriceId.get(priceId))
+              .find((name): name is string => Boolean(name)) ?? null)
+          : (existing?.planName ?? null),
+        mrrMinor: dearer ? value : existing?.mrrMinor,
+        currency: dearer ? snapshot.currency : existing?.currency,
+      });
+    }
+    const churnList = buildChurnCallList({
+      month,
+      cancellations,
+      failedInvoices,
+      identities,
     });
 
     const payload = {
       ...movement,
       history,
+      churnList,
       coverage: {
         ...movement.coverage,
         knownSubscriptions: snapshots.length,

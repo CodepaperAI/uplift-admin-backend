@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
+  buildChurnCallList,
   buildMonthMovement,
   buildMovementHistory,
   commandMonthSpan,
   earliestFactMonth,
   parseMovementMonth,
+  type ChurnIdentity,
   type FailedInvoiceFact,
   type MovementFact,
 } from "../command/month-movement";
@@ -329,5 +331,260 @@ describe("earliestFactMonth", () => {
 
   test("no facts means no month to start from", () => {
     expect(earliestFactMonth([])).toBeNull();
+  });
+});
+
+
+describe("per-month signups and revenue", () => {
+  const range = { from: "2026-07", to: "2026-08" };
+  const monthOf = (
+    result: ReturnType<typeof buildMovementHistory>,
+    month: string,
+  ) => result.months.find((row) => row.month === month)!;
+
+  test("signups are counted per account created, not per distinct account", () => {
+    // Deliberately the opposite rule from the churn buckets: two accounts on
+    // one day are two signups, where three failed retries are one customer.
+    const history = buildMovementHistory({
+      ...range,
+      starts: [],
+      cancellations: [],
+      failedInvoices: [],
+      signups: [
+        { at: new Date("2026-08-03T12:00:00Z") },
+        { at: new Date("2026-08-03T18:00:00Z") },
+        { at: new Date("2026-07-11T09:00:00Z") },
+      ],
+    });
+    expect(monthOf(history, "2026-08").signups).toBe(2);
+    expect(monthOf(history, "2026-07").signups).toBe(1);
+  });
+
+  test("a month with no signups reports nought rather than being absent", () => {
+    const history = buildMovementHistory({
+      ...range,
+      starts: [],
+      cancellations: [],
+      failedInvoices: [],
+      signups: [{ at: new Date("2026-08-03T12:00:00Z") }],
+    });
+    expect(monthOf(history, "2026-07").signups).toBe(0);
+    expect(monthOf(history, "2026-07").collectedMinorByCurrency).toEqual({});
+  });
+
+  test("collected is summed per currency and never across them", () => {
+    const history = buildMovementHistory({
+      ...range,
+      starts: [],
+      cancellations: [],
+      failedInvoices: [],
+      collected: [
+        { at: new Date("2026-08-04T12:00:00Z"), currency: "usd", amountMinor: "14900" },
+        { at: new Date("2026-08-20T12:00:00Z"), currency: "usd", amountMinor: "9900" },
+        { at: new Date("2026-08-21T12:00:00Z"), currency: "cad", amountMinor: "9900" },
+        { at: new Date("2026-07-02T12:00:00Z"), currency: "usd", amountMinor: "100" },
+      ],
+    });
+    expect(monthOf(history, "2026-08").collectedMinorByCurrency).toEqual({
+      cad: "9900",
+      usd: "24800",
+    });
+    expect(monthOf(history, "2026-07").collectedMinorByCurrency).toEqual({
+      usd: "100",
+    });
+  });
+
+  test("currency case does not split a bucket", () => {
+    const history = buildMovementHistory({
+      ...range,
+      starts: [],
+      cancellations: [],
+      failedInvoices: [],
+      collected: [
+        { at: new Date("2026-08-04T12:00:00Z"), currency: "USD", amountMinor: "100" },
+        { at: new Date("2026-08-05T12:00:00Z"), currency: "usd", amountMinor: "100" },
+      ],
+    });
+    expect(monthOf(history, "2026-08").collectedMinorByCurrency).toEqual({ usd: "200" });
+  });
+
+  test("a malformed amount costs its own row, not the month", () => {
+    const history = buildMovementHistory({
+      ...range,
+      starts: [],
+      cancellations: [],
+      failedInvoices: [],
+      collected: [
+        { at: new Date("2026-08-04T12:00:00Z"), currency: "usd", amountMinor: "oops" },
+        { at: new Date("2026-08-05T12:00:00Z"), currency: "usd", amountMinor: "500" },
+      ],
+    });
+    expect(monthOf(history, "2026-08").collectedMinorByCurrency).toEqual({ usd: "500" });
+  });
+
+  test("months outside the range are ignored on both new fields", () => {
+    const history = buildMovementHistory({
+      ...range,
+      starts: [],
+      cancellations: [],
+      failedInvoices: [],
+      signups: [{ at: new Date("2026-03-01T12:00:00Z") }],
+      collected: [
+        { at: new Date("2026-03-01T12:00:00Z"), currency: "usd", amountMinor: "999" },
+      ],
+    });
+    expect(history.months.every((row) => row.signups === 0)).toBe(true);
+    expect(
+      history.months.every(
+        (row) => Object.keys(row.collectedMinorByCurrency).length === 0,
+      ),
+    ).toBe(true);
+  });
+});
+
+describe("buildChurnCallList", () => {
+  const identities = new Map<string, ChurnIdentity>([
+    [
+      "cus:a",
+      {
+        stripeCustomerId: "cus_a",
+        name: "Ramesh Patel",
+        email: "ramesh@example.invalid",
+        phone: "+14165550101",
+        businessName: "Patel Realty",
+        planName: "Core + Social",
+        mrrMinor: "14900",
+        currency: "usd",
+      },
+    ],
+    ["cus:b", { name: "Simran Kaur", mrrMinor: "9900", currency: "usd" }],
+  ]);
+
+  function failed(
+    account: string,
+    at: string,
+    remaining: string | null = "9900",
+    id = `in_${account}_${at}`,
+  ): FailedInvoiceFact {
+    return {
+      accountKey: account,
+      stripeInvoiceId: id,
+      at: new Date(at),
+      amountRemainingMinor: remaining,
+      currency: "usd",
+    };
+  }
+
+  test("a cancellation and a failed payment on one account is one row", () => {
+    // The row a rep should call first: a card that failed and then a
+    // cancellation is usually a billing problem, not a decision.
+    const list = buildChurnCallList({
+      month: MONTH,
+      cancellations: [start("cus:a", "2026-08-20T10:00:00Z")],
+      failedInvoices: [failed("cus:a", "2026-08-17T10:00:00Z")],
+      identities,
+    });
+    expect(list.rows).toHaveLength(1);
+    expect(list.rows[0]?.reason).toBe("both");
+    expect(list.rows[0]?.name).toBe("Ramesh Patel");
+    expect(list.rows[0]?.phone).toBe("+14165550101");
+    expect(list.totals).toEqual({
+      cancelled: 0,
+      paymentFailed: 0,
+      both: 1,
+      accounts: 1,
+    });
+  });
+
+  test("three failed retries are one person to ring", () => {
+    const list = buildChurnCallList({
+      month: MONTH,
+      cancellations: [],
+      failedInvoices: [
+        failed("cus:b", "2026-08-10T10:00:00Z", "9900", "in_1"),
+        failed("cus:b", "2026-08-13T10:00:00Z", "9900", "in_2"),
+        failed("cus:b", "2026-08-16T10:00:00Z", "9900", "in_3"),
+      ],
+      identities,
+    });
+    expect(list.rows).toHaveLength(1);
+    expect(list.rows[0]?.failedInvoiceCount).toBe(3);
+    // The retries are separate invoices, so the outstanding total is their sum.
+    expect(list.rows[0]?.amountOutstandingMinor).toBe("29700");
+    expect(list.rows[0]?.outstandingCurrency).toBe("usd");
+  });
+
+  test("the earliest event in the month is when the trouble started", () => {
+    const list = buildChurnCallList({
+      month: MONTH,
+      cancellations: [
+        start("cus:a", "2026-08-25T10:00:00Z"),
+        start("cus:a", "2026-08-06T10:00:00Z"),
+      ],
+      failedInvoices: [],
+      identities,
+    });
+    expect(list.rows[0]?.cancelledAt).toBe("2026-08-06T10:00:00.000Z");
+  });
+
+  test("the list is ordered by what is being lost, biggest first", () => {
+    const list = buildChurnCallList({
+      month: MONTH,
+      cancellations: [
+        start("cus:b", "2026-08-05T10:00:00Z"),
+        start("cus:a", "2026-08-06T10:00:00Z"),
+      ],
+      failedInvoices: [],
+      identities,
+    });
+    expect(list.rows.map((row) => row.accountKey)).toEqual(["cus:a", "cus:b"]);
+  });
+
+  test("an account with no identity is still listed", () => {
+    // Dropping it would make the list disagree with the count beside it, and a
+    // Stripe customer id is enough to look someone up.
+    const list = buildChurnCallList({
+      month: MONTH,
+      cancellations: [start("cus:unknown", "2026-08-05T10:00:00Z")],
+      failedInvoices: [],
+      identities,
+    });
+    expect(list.rows).toHaveLength(1);
+    expect(list.rows[0]?.accountKey).toBe("cus:unknown");
+    expect(list.rows[0]?.name).toBeUndefined();
+  });
+
+  test("events outside the month do not reach the list", () => {
+    const list = buildChurnCallList({
+      month: MONTH,
+      cancellations: [start("cus:a", "2026-07-31T10:00:00Z")],
+      failedInvoices: [failed("cus:b", "2026-09-01T10:00:00Z")],
+      identities,
+    });
+    expect(list.rows).toHaveLength(0);
+    expect(list.totals.accounts).toBe(0);
+  });
+
+  test("the row count matches the churn count for the same facts", () => {
+    // The guarantee that makes the list trustworthy: it is the same accounts
+    // the tile counts, so "43 cancelled" and 43 rows cannot drift apart.
+    const cancellations = [
+      start("cus:a", "2026-08-05T10:00:00Z"),
+      start("cus:b", "2026-08-07T10:00:00Z"),
+    ];
+    const failedInvoices = [failed("cus:b", "2026-08-06T10:00:00Z")];
+    const movement = buildMonthMovement({
+      month: MONTH,
+      starts: [],
+      cancellations,
+      failedInvoices,
+    });
+    const list = buildChurnCallList({
+      month: MONTH,
+      cancellations,
+      failedInvoices,
+      identities,
+    });
+    expect(list.rows).toHaveLength(movement.totals.churned);
   });
 });
