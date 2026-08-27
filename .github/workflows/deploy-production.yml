@@ -189,13 +189,36 @@ jobs:
           # final command under `bash -e` exits 1 silently. Read the findings
           # themselves rather than a per-page count, so there is one number and
           # it is the one being acted on.
+          findings_stderr="$(mktemp)"
           aws ecr describe-image-scan-findings \
             --repository-name "$ECR_REPOSITORY" \
             --image-id imageDigest="$scan_digest" \
             --no-paginate \
             --query 'imageScanFindings.enhancedFindings[?severity==`CRITICAL`].{cve:packageVulnerabilityDetails.vulnerabilityId,pkg:packageVulnerabilityDetails.vulnerablePackages[0].name,installed:packageVulnerabilityDetails.vulnerablePackages[0].version,fixed:packageVulnerabilityDetails.vulnerablePackages[0].fixedInVersion}' \
-            --output json > /tmp/criticals.json
-          jq -e 'type == "array"' /tmp/criticals.json > /dev/null
+            --output json > /tmp/criticals.json 2>"$findings_stderr" || {
+              echo "::error::Could not read scan findings for $scan_digest"
+              cat "$findings_stderr"
+              exit 1
+            }
+
+          # A JMESPath filter that matches nothing on a *missing* list comes back
+          # as `null` rather than `[]` — which is exactly what an image with no
+          # critical findings returns, and the first version of this check died
+          # on it with no output at all. Normalise the two empty shapes, and if
+          # something else arrives, print it instead of exiting quietly.
+          findings=$(jq -c \
+            'if . == null then [] elif type == "array" then . else empty end' \
+            /tmp/criticals.json 2>&1) || {
+              echo "::error::Scan findings for $scan_digest were not JSON"
+              head -c 400 /tmp/criticals.json
+              exit 1
+            }
+          if [[ -z "$findings" ]]; then
+            echo "::error::Unexpected shape from describe-image-scan-findings"
+            head -c 400 /tmp/criticals.json
+            exit 1
+          fi
+          printf '%s' "$findings" > /tmp/criticals.json
 
           # An accepted risk has an owner and an expiry date. See
           # .github/ecr-critical-allowlist.txt for why this exists at all.
