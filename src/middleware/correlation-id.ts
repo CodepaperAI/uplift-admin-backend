@@ -1,5 +1,5 @@
 import type { Request, Response, NextFunction } from "express";
-import crypto from "crypto";
+import crypto from "node:crypto";
 
 export type RequestWithCorrelationId = Request & { correlationId?: string };
 

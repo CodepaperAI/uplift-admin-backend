@@ -1,11 +1,20 @@
 FROM oven/bun:1.3.14-alpine AS deps
 
 WORKDIR /app
+# Belt to the braces below: if the --production flag is ever dropped, this stops
+# a Chromium download landing in the image rather than letting it in quietly.
 ENV PUPPETEER_SKIP_DOWNLOAD=true
 
 COPY package.json bun.lock ./
 COPY prisma ./prisma/
-RUN bun install --frozen-lockfile
+# --production, because this image serves three route groups and can reach 15 of
+# the 37 packages the fork inherited from seo-be. Installing the other 22 put
+# their vulnerabilities on the deploy gate's desk: nine unfixable criticals on
+# puppeteer, in an image with no Chromium and no code path that could launch it.
+# scripts/check-admin-surface.ts fails the build if anything reachable from the
+# entrypoint starts importing one of them, so this cannot rot into a runtime
+# MODULE_NOT_FOUND.
+RUN bun install --frozen-lockfile --production
 
 FROM oven/bun:1.3.14-alpine AS runner
 
