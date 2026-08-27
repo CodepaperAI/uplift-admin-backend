@@ -337,7 +337,7 @@ export async function getCommandStripeOverview(
       pageSize: req.query.pageSize,
       maxPageSize: 500,
     });
-    const cacheKey = `stripe-overview-v11:${period.month}:${page}:${pageSize}`;
+    const cacheKey = `stripe-overview-v12:${period.month}:${page}:${pageSize}`;
     const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
     if (cached) {
       sendSuccess(res, cached, "Command Stripe overview");
@@ -388,6 +388,9 @@ export async function getCommandStripeOverview(
       mrrGroups,
       paidGroups,
       monthlyPaidGroups,
+      allTimeSubscriptionPaidGroups,
+      allTimeOneOffPaidGroups,
+      allTimeGhlTransactions,
       monthlyCostGroups,
       monthlyMovements,
       ghlRevenueTransactions,
@@ -450,6 +453,47 @@ export async function getCommandStripeOverview(
           paidAt: { gte: period.start, lt: period.end },
         },
         _sum: { amountPaidMinor: true },
+      }),
+      /**
+       * The same all-time cash, split by whether an invoice belongs to a
+       * subscription.
+       *
+       * Two queries rather than one grouped by the id, because the question is
+       * "recurring or not" and grouping by `stripeSubscriptionId` would return a
+       * row per subscription for the caller to fold back up. `null` there is
+       * exactly a one-off: a manually raised invoice, a retainer, an ad-hoc
+       * charge. Nothing is double counted, because an invoice is in one set or
+       * the other and never both.
+       */
+      prisma.commandStripeInvoice.groupBy({
+        by: ["currency"],
+        where: {
+          status: "paid",
+          paidAt: { not: null },
+          stripeSubscriptionId: { not: null },
+        },
+        _sum: { amountPaidMinor: true },
+      }),
+      prisma.commandStripeInvoice.groupBy({
+        by: ["currency"],
+        where: {
+          status: "paid",
+          paidAt: { not: null },
+          stripeSubscriptionId: null,
+        },
+        _sum: { amountPaidMinor: true },
+      }),
+      // Unscoped, unlike the month-scoped read below it: the split has to cover
+      // all time, and GHL is where the one-off invoices actually live.
+      prisma.commandGhlPaymentTransaction.findMany({
+        where: { isActive: true, fulfilledAt: { not: null } },
+        select: {
+          amount: true,
+          amountRefunded: true,
+          currency: true,
+          status: true,
+          providerSubscriptionId: true,
+        },
       }),
       prisma.commandCostEntry.groupBy({
         by: ["category", "currency"],
@@ -729,6 +773,104 @@ export async function getCommandStripeOverview(
           : [],
       ),
     );
+    /**
+     * All cash ever collected, split into recurring and everything else.
+     *
+     * Answers "how much have we made from subscriptions, and how much from
+     * everything else" — which the snapshot above deliberately cannot, because it
+     * is scoped to Uplift product plans and excludes retainers, one-off invoices
+     * and all of GHL. This block is the opposite: every source, no scope.
+     *
+     * Both systems are read, and each is split by its own notion of recurring:
+     * a Stripe invoice with a subscription id, and a GHL payment with a provider
+     * subscription id. GHL reports whole-currency amounts where Stripe reports
+     * minor units, so the two are merged through `majorToMinorExact` rather than
+     * added — a hundredfold error otherwise, and on a revenue figure.
+     *
+     * The four sources are reported alongside the totals so the split can be
+     * checked against its parts rather than taken on trust.
+     */
+    const minorBuckets = (
+      groups: readonly { currency: string; _sum: { amountPaidMinor: Prisma.Decimal | null } }[],
+    ) =>
+      Object.fromEntries(
+        groups.map((row) => [
+          row.currency.toLowerCase(),
+          row._sum.amountPaidMinor?.toString() ?? "0",
+        ]),
+      );
+    // Built once and shared with the month-scoped aggregation below: a GHL
+    // payment against a subscription Stripe already invoiced is the same money
+    // seen twice, and must not be counted on both sides.
+    const knownStripeSubscriptionIdSet = new Set(
+      knownStripeSubscriptionIds.map((row) => row.stripeSubscriptionId),
+    );
+    const stripeSubscriptionCash = minorBuckets(allTimeSubscriptionPaidGroups);
+    const stripeOneOffCash = minorBuckets(allTimeOneOffPaidGroups);
+    const ghlAllTime = aggregateGhlRevenue(
+      allTimeGhlTransactions,
+      knownStripeSubscriptionIdSet,
+    );
+    const ghlRecurringCash = Object.fromEntries(
+      Object.entries(ghlAllTime.byCurrency).map(([currency, totals]) => [
+        currency,
+        totals.recurring,
+      ]),
+    );
+    const ghlOneOffCash = Object.fromEntries(
+      Object.entries(ghlAllTime.byCurrency).map(([currency, totals]) => [
+        currency,
+        totals.oneTime,
+      ]),
+    );
+    const subscriptionCash = mergeMajorCurrencyBucketsIntoMinor({
+      minorByCurrency: stripeSubscriptionCash,
+      majorByCurrency: ghlRecurringCash,
+    });
+    const oneOffCash = mergeMajorCurrencyBucketsIntoMinor({
+      minorByCurrency: stripeOneOffCash,
+      majorByCurrency: ghlOneOffCash,
+    });
+    // Both sides are already minor units, so this is a plain per-currency sum —
+    // never across currencies, which would invent an exchange rate.
+    const addMinorBuckets = (
+      left: Record<string, string>,
+      right: Record<string, string>,
+    ): Record<string, string> => {
+      const totals = new Map<string, Prisma.Decimal>();
+      for (const source of [left, right]) {
+        for (const [currency, amount] of Object.entries(source)) {
+          totals.set(
+            currency,
+            (totals.get(currency) ?? new Prisma.Decimal(0)).add(
+              new Prisma.Decimal(amount),
+            ),
+          );
+        }
+      }
+      return Object.fromEntries(
+        [...totals.entries()]
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([currency, amount]) => [currency, amount.toString()]),
+      );
+    };
+    const cashCollectedAllTime = {
+      subscriptionsMinorByCurrency: subscriptionCash.combinedMinorByCurrency,
+      oneOffMinorByCurrency: oneOffCash.combinedMinorByCurrency,
+      totalMinorByCurrency: addMinorBuckets(
+        subscriptionCash.combinedMinorByCurrency,
+        oneOffCash.combinedMinorByCurrency,
+      ),
+      /** The four parts, so the two totals above can be audited. */
+      sources: {
+        stripeSubscriptionsMinorByCurrency: stripeSubscriptionCash,
+        stripeOneOffMinorByCurrency: stripeOneOffCash,
+        ghlRecurringMinorByCurrency: subscriptionCash.addedMinorByCurrency,
+        ghlOneOffMinorByCurrency: oneOffCash.addedMinorByCurrency,
+      },
+      ghlDuplicatesExcluded: ghlAllTime.excludedStripeDuplicates,
+    };
+
     const paidToDateMinorByCurrency = Object.fromEntries(
       paidGroups.map((row) => [
         row.currency,
@@ -737,9 +879,7 @@ export async function getCommandStripeOverview(
     );
     const ghlRevenue = aggregateGhlRevenue(
       ghlRevenueTransactions,
-      new Set(
-        knownStripeSubscriptionIds.map((row) => row.stripeSubscriptionId),
-      ),
+      knownStripeSubscriptionIdSet,
     );
     const ghlRecurringMajorByCurrency = Object.fromEntries(
       Object.entries(ghlRevenue.byCurrency).map(([currency, values]) => [
@@ -1394,6 +1534,7 @@ export async function getCommandStripeOverview(
         mrrMinorByCurrency: combinedMrr.combinedMinorByCurrency,
         arrRunRateMinorByCurrency: combinedArrRunRateMinorByCurrency,
         paidToDateMinorByCurrency,
+        cashCollectedAllTime,
         unitEconomics: {
           period,
           byCurrency: unitEconomicsByCurrency,
