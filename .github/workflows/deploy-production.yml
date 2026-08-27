@@ -33,9 +33,19 @@ jobs:
           bun-version: 1.3.14
 
       - name: Install and verify
+        env:
+          # `db.config` builds the Prisma client at import time, so any module
+          # that reaches it — including ones a test imports only for a pure
+          # helper — needs this set or it throws "DATABASE_URL is required".
+          # Nothing here connects: `prisma generate` reads the schema, and the
+          # tests in `check` exercise logic, not the database. The same dummy
+          # value `prisma generate` has always been given, now also in scope for
+          # the tests, because until this commit the gate ran 5 of them and
+          # never noticed.
+          DATABASE_URL: postgresql://prisma:prisma@localhost:5432/prisma
         run: |
           bun install --frozen-lockfile
-          DATABASE_URL=postgresql://prisma:prisma@localhost:5432/prisma bunx prisma generate
+          bunx prisma generate
           bun run check
           bun run build
 
