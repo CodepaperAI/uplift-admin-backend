@@ -1,5 +1,6 @@
 import { getCommandDailySignups } from "../controllers/command-signups.controller";
 import { getCommandGhlUsers } from "../controllers/command-ghl-users.controller";
+import { getCommandGhlContacts } from "../controllers/command-ghl-contacts.controller";
 import { getCommandGhlSites } from "../controllers/command-ghl-sites.controller";
 import { Router } from "express";
 import {
@@ -142,6 +143,11 @@ CommandRouter.get(
   "/ghl/overview",
   requireCommandCapability("view.ghl"),
   getCommandGhlOverview,
+);
+CommandRouter.get(
+  "/ghl/contacts",
+  requireCommandCapability("view.ghl"),
+  getCommandGhlContacts,
 );
 CommandRouter.get(
   "/ghl/revenue",
