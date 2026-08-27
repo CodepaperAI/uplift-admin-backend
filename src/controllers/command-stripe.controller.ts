@@ -2178,7 +2178,7 @@ export async function getCommandStripeMonthMovement(
   try {
     const month = parseMovementMonth(req.query.month) ?? currentCommandMonth();
     const range = commandMonthRange(month);
-    const cacheKey = `stripe-month-movement-v8:${month}`;
+    const cacheKey = `stripe-month-movement-v9:${month}`;
     const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
     if (cached) {
       sendSuccess(res, cached, "Command Stripe month movement");
@@ -2561,8 +2561,20 @@ export async function getCommandStripeMonthMovement(
         currency: dearer ? snapshot.currency : existing?.currency,
       });
     }
-    const churnList = buildChurnCallList({
-      month,
+    /**
+     * Every cancellation on record, not just the requested month's.
+     *
+     * This feeds the subscriber roster, which is a directory rather than a dated
+     * report: "find me the customer who left" has no reason to stop at the first
+     * of the month, and it did — the roster's churn chip only reached back to the
+     * 1st, so anyone who cancelled in July was unfindable in the one place
+     * people look customers up. The month-scoped counts the chart above draws
+     * are unaffected; they come from `movement.totals`.
+     *
+     * No extra queries: the facts below were already read unscoped, because the
+     * month-on-month series needs them all.
+     */
+    const churnedAccountsAllTime = buildChurnCallList({
       cancellations,
       failedInvoices,
       identities,
@@ -2571,7 +2583,7 @@ export async function getCommandStripeMonthMovement(
     const payload = {
       ...movement,
       history,
-      churnList,
+      churnedAccountsAllTime,
       coverage: {
         ...movement.coverage,
         /** GHL rows dropped as the same payment Stripe already reported. */

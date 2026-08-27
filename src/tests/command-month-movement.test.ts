@@ -674,6 +674,20 @@ describe("buildChurnCallList", () => {
     expect(list.rows[0]?.phoneSource).toBe("business");
   });
 
+  test("with no month given, every cancellation on record is listed", () => {
+    // The roster is a directory, not a dated report: someone who cancelled in
+    // July has to be findable in the one place people look customers up.
+    const list = buildChurnCallList({
+      cancellations: [
+        start("cus:a", "2026-07-05T10:00:00Z"),
+        start("cus:b", "2026-08-05T10:00:00Z"),
+      ],
+      failedInvoices: [failed("cus:c", "2026-05-01T10:00:00Z")],
+      identities,
+    });
+    expect(list.totals.accounts).toBe(3);
+  });
+
   test("events outside the month do not reach the list", () => {
     const list = buildChurnCallList({
       month: MONTH,

@@ -528,9 +528,20 @@ function byValueThenRecency(left: ChurnedAccount, right: ChurnedAccount): number
  * the work. Accounts with no identity on record are still listed — a Stripe
  * customer id and an amount is enough to look someone up, and dropping them
  * would make the list quietly disagree with the count beside it.
+ *
+ * `month` is optional, and omitting it is the normal case now: this feeds the
+ * subscriber roster, which is a directory rather than a dated report — "find me
+ * the customer who left" has no reason to stop at the first of the month. Pass a
+ * month only when the answer genuinely belongs to one.
+ *
+ * A note on the failure side reaching back safely: the invoices behind it are
+ * the ones still open with an amount outstanding, so an old one means still
+ * unpaid today. An invoice that was eventually settled has left that set, which
+ * is why widening the window does not drag in resolved history.
  */
 export function buildChurnCallList(input: {
-  month: string;
+  /** Restrict to one Toronto month. Omit for every cancellation on record. */
+  month?: string;
   cancellations: readonly MovementFact[];
   failedInvoices: readonly FailedInvoiceFact[];
   identities?: ReadonlyMap<string, ChurnIdentity>;
@@ -538,12 +549,15 @@ export function buildChurnCallList(input: {
   rows: ChurnedAccount[];
   totals: { cancelled: number; paymentFailed: number; both: number; accounts: number };
 } {
-  const inMonth = (at: Date) => commandMonthForDate(at) === input.month;
+  const { month } = input;
+  const inScope = month
+    ? (at: Date) => commandMonthForDate(at) === month
+    : () => true;
 
   /** Earliest event in the month wins: it is when the trouble started. */
   const cancelledAt = new Map<string, Date>();
   for (const fact of input.cancellations) {
-    if (!inMonth(fact.at)) continue;
+    if (!inScope(fact.at)) continue;
     const current = cancelledAt.get(fact.accountKey);
     if (!current || fact.at < current) cancelledAt.set(fact.accountKey, fact.at);
   }
@@ -552,7 +566,7 @@ export function buildChurnCallList(input: {
   const failedCount = new Map<string, number>();
   const outstanding = new Map<string, Map<string, bigint>>();
   for (const fact of input.failedInvoices) {
-    if (!inMonth(fact.at)) continue;
+    if (!inScope(fact.at)) continue;
     const current = failedAt.get(fact.accountKey);
     if (!current || fact.at < current) failedAt.set(fact.accountKey, fact.at);
     failedCount.set(fact.accountKey, (failedCount.get(fact.accountKey) ?? 0) + 1);
