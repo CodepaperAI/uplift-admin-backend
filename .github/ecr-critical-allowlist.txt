@@ -1,0 +1,19 @@
+# Critical ECR/Inspector findings this deployment accepts, and until when.
+#
+# Format, whitespace separated:
+#   <CVE-ID>  <expires YYYY-MM-DD>  <reason>
+#
+# Rules the gate enforces:
+#   - A critical finding not listed here blocks the deploy.
+#   - A listed finding past its expiry date blocks the deploy, so an accepted
+#     risk has to be re-argued rather than inherited.
+#   - Anything accepted is printed in the run summary, so it is visible in the
+#     deploy log rather than only in this file.
+#
+# This exists because "no critical findings, ever, with no way to say otherwise"
+# is not a security posture — it is an outage waiting for an upstream maintainer.
+# Nine criticals on puppeteer, all fixed: NotAvailable, held ten commits for a
+# day. The answer there was to stop installing puppeteer (see Dockerfile), which
+# is why this file is empty: an unreachable package should be removed, not
+# excused. Reach for this only when the package is genuinely needed at runtime
+# and no fixed version exists.

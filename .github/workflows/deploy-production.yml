@@ -172,34 +172,69 @@ jobs:
             echo "::error::Digest queried: $scan_digest"
             exit 1
           fi
-          # Same pagination trap as the status probe, and the reason the last
-          # run died with no message at all: under enhanced scanning the CLI
-          # walks several pages and prints the count once per page, so
+          # Same pagination trap as the status probe, and the reason an
+          # earlier run died with no message at all: under enhanced scanning the
+          # CLI walks several pages and prints the count once per page, so
           # "None\nNone\nNone" never equalled "None" — and a bare [[ ]] as the
-          # final command under `bash -e` exits 1 silently. Sum the pages
-          # instead, and say what was found either way.
-          critical_raw=$(aws ecr describe-image-scan-findings \
+          # final command under `bash -e` exits 1 silently. Read the findings
+          # themselves rather than a per-page count, so there is one number and
+          # it is the one being acted on.
+          aws ecr describe-image-scan-findings \
             --repository-name "$ECR_REPOSITORY" \
             --image-id imageDigest="$scan_digest" \
             --no-paginate \
-            --query 'imageScanFindings.findingSeverityCounts.CRITICAL' --output text)
-          critical=$(printf '%s\n' "$critical_raw" \
-            | awk '{ if ($1 ~ /^[0-9]+$/) sum += $1 } END { print sum + 0 }')
-          echo "Scan status: $status. Critical findings: $critical (raw: $(printf '%s' "$critical_raw" | tr '\n' ' '))"
-          if [[ "$critical" != "0" ]]; then
-            echo "::error::ECR scan reports $critical critical finding(s) on $scan_digest. Refusing to deploy."
-            # A count is not actionable. List them so whoever picks this up
-            # knows whether it is a base-image bump or a dependency override,
-            # instead of running the pipeline again to find out.
-            aws ecr describe-image-scan-findings \
-              --repository-name "$ECR_REPOSITORY" \
-              --image-id imageDigest="$scan_digest" \
-              --no-paginate \
-              --query 'imageScanFindings.enhancedFindings[?severity==`CRITICAL`].{cve:packageVulnerabilityDetails.vulnerabilityId,pkg:packageVulnerabilityDetails.vulnerablePackages[0].name,installed:packageVulnerabilityDetails.vulnerablePackages[0].version,fixed:packageVulnerabilityDetails.vulnerablePackages[0].fixedInVersion,type:packageVulnerabilityDetails.vulnerablePackages[0].packageManager}' \
-              --output table 2>&1 | head -60 || echo "(could not list findings)"
+            --query 'imageScanFindings.enhancedFindings[?severity==`CRITICAL`].{cve:packageVulnerabilityDetails.vulnerabilityId,pkg:packageVulnerabilityDetails.vulnerablePackages[0].name,installed:packageVulnerabilityDetails.vulnerablePackages[0].version,fixed:packageVulnerabilityDetails.vulnerablePackages[0].fixedInVersion}' \
+            --output json > /tmp/criticals.json
+          jq -e 'type == "array"' /tmp/criticals.json > /dev/null
+
+          # An accepted risk has an owner and an expiry date. See
+          # .github/ecr-critical-allowlist.txt for why this exists at all.
+          today=$(date -u +%F)
+
+          # Kept as shell rather than one heroic jq expression: this is the last
+          # thing standing between a bad image and production, and it has to be
+          # readable by whoever is looking at a red pipeline.
+          blocking=0
+          accepted=0
+          expired=0
+          report=""
+          while IFS=$'\t' read -r cve pkg installed fixed; do
+            [[ -z "$cve" || "$cve" == "null" ]] && continue
+            rule=$(awk -v want="$cve" '$1 == want { print $2; exit }' \
+              .github/ecr-critical-allowlist.txt)
+            if [[ -z "$rule" ]]; then
+              blocking=$((blocking + 1))
+              report+=$'\n'"| \`$cve\` | $pkg $installed | fixed: $fixed | **blocking** |"
+            elif [[ "$rule" < "$today" ]]; then
+              expired=$((expired + 1))
+              blocking=$((blocking + 1))
+              report+=$'\n'"| \`$cve\` | $pkg $installed | fixed: $fixed | **acceptance expired $rule** |"
+            else
+              accepted=$((accepted + 1))
+              report+=$'\n'"| \`$cve\` | $pkg $installed | fixed: $fixed | accepted until $rule |"
+            fi
+          done < <(jq -r '.[] | [.cve, .pkg, .installed, .fixed] | @tsv' /tmp/criticals.json)
+
+          total=$(jq 'length' /tmp/criticals.json)
+          echo "Scan status: $status. Critical findings: $total (blocking: $blocking, accepted: $accepted, expired acceptances: $expired)"
+          if [[ -n "$report" ]]; then
+            {
+              echo "### Critical ECR findings on \`$scan_digest\`"
+              echo
+              echo "| CVE | package | fix | disposition |"
+              echo "| --- | --- | --- | --- |"
+              printf '%s\n' "$report"
+            } >> "${GITHUB_STEP_SUMMARY:-/dev/stdout}"
+          fi
+          if [[ "$blocking" != "0" ]]; then
+            echo "::error::$blocking critical finding(s) on $scan_digest are not accepted in .github/ecr-critical-allowlist.txt. Refusing to deploy."
+            column -t -s $'\t' < <(jq -r '.[] | [.cve, .pkg, .installed, "fixed: " + (.fixed // "NotAvailable")] | @tsv' /tmp/criticals.json)
             exit 1
           fi
-          echo "No critical findings. Proceeding."
+          if [[ "$accepted" != "0" ]]; then
+            echo "::warning::Deploying with $accepted accepted critical finding(s). See .github/ecr-critical-allowlist.txt."
+          fi
+          echo "No blocking critical findings. Proceeding."
 
       - name: Deploy through Systems Manager
         env:
