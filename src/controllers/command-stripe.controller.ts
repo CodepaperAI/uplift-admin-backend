@@ -39,7 +39,10 @@ import {
   commandPaginationResult,
   parseCommandPagination,
 } from "../command/pagination";
-import { aggregateGhlRevenue } from "../command/ghl-payment-metrics";
+import {
+  aggregateGhlRevenue,
+  isSettledGhlPayment,
+} from "../command/ghl-payment-metrics";
 import { mergeMajorCurrencyBucketsIntoMinor } from "../command/money";
 import { aggregateCommandUnitEconomics } from "../command/unit-economics";
 import { activityRatios } from "../command/activity-metrics";
@@ -2175,7 +2178,7 @@ export async function getCommandStripeMonthMovement(
   try {
     const month = parseMovementMonth(req.query.month) ?? currentCommandMonth();
     const range = commandMonthRange(month);
-    const cacheKey = `stripe-month-movement-v6:${month}`;
+    const cacheKey = `stripe-month-movement-v7:${month}`;
     const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
     if (cached) {
       sendSuccess(res, cached, "Command Stripe month movement");
@@ -2199,6 +2202,7 @@ export async function getCommandStripeMonthMovement(
       userRows,
       businessRows,
       settledInvoiceRows,
+      ghlTransactionRows,
     ] = await Promise.all([
       // Every subscription Stripe ever made, live or ended. Small — hundreds.
       prisma.commandStripeSubscriptionSnapshot.findMany({
@@ -2292,6 +2296,21 @@ export async function getCommandStripeMonthMovement(
       prisma.commandStripeInvoice.findMany({
         where: { status: "paid", paidAt: { not: null } },
         select: { paidAt: true, amountPaidMinor: true, currency: true },
+      }),
+      // GHL's own payments, so the month-on-month figure can show the whole
+      // business rather than the half of it Stripe happens to hold. Amounts here
+      // are **major** units — that difference is why they are converted rather
+      // than added.
+      prisma.commandGhlPaymentTransaction.findMany({
+        where: { isActive: true, fulfilledAt: { not: null } },
+        select: {
+          amount: true,
+          amountRefunded: true,
+          currency: true,
+          status: true,
+          providerSubscriptionId: true,
+          fulfilledAt: true,
+        },
       }),
     ]);
 
@@ -2420,12 +2439,47 @@ export async function getCommandStripeMonthMovement(
       commandMonthSpan(firstArrivalMonth, month).length <= MOVEMENT_HISTORY_MAX_MONTHS
         ? firstArrivalMonth
         : commandMonthsEndingAt(month, MOVEMENT_HISTORY_MAX_MONTHS).at(-1)!;
+    /**
+     * GHL payments, net of refunds, minus anything that is the same money twice.
+     *
+     * GHL settles through its own Stripe account, so in practice these are
+     * separate payments from the ones our invoice table holds — measured on
+     * production the duplicate count is zero. The exclusion stays because it is
+     * the one thing that could turn a combined total into an overstatement, and
+     * a rule that only matters occasionally still has to be there when it does.
+     * Same rule the GHL revenue page already applies.
+     */
+    const knownSubscriptionIds = new Set(
+      snapshots.map((snapshot) => snapshot.stripeSubscriptionId),
+    );
+    let ghlDuplicatesExcluded = 0;
+    const ghlCollected = ghlTransactionRows.flatMap((row) => {
+      if (!row.fulfilledAt || !row.amount || !row.currency) return [];
+      if (!isSettledGhlPayment(row.status)) return [];
+      if (
+        row.providerSubscriptionId &&
+        knownSubscriptionIds.has(row.providerSubscriptionId)
+      ) {
+        ghlDuplicatesExcluded += 1;
+        return [];
+      }
+      const net = row.amount.sub(row.amountRefunded ?? new Prisma.Decimal(0));
+      return [
+        {
+          at: row.fulfilledAt,
+          currency: row.currency,
+          amountMajor: net.toString(),
+        },
+      ];
+    });
+
     const history = buildMovementHistory({
       from: historyFrom,
       to: month,
       starts,
       cancellations,
       failedInvoices,
+      ghlCollected,
       signups: userRows.map((row) => ({ at: row.createdAt })),
       collected: settledInvoiceRows.flatMap((row) =>
         row.paidAt
@@ -2520,6 +2574,10 @@ export async function getCommandStripeMonthMovement(
       churnList,
       coverage: {
         ...movement.coverage,
+        /** GHL rows dropped as the same payment Stripe already reported. */
+        ghlDuplicatesExcluded,
+        /** GHL rows whose amount was finer than its currency's minor unit. */
+        ghlAmountsSkipped: history.ghlAmountsSkipped,
         knownSubscriptions: snapshots.length,
         undatableSubscriptions,
         /** Accounts with no datable subscription at all — the real blind spot. */

@@ -1,3 +1,5 @@
+import { Prisma } from "@prisma/client";
+import { majorToMinorExact } from "./money";
 import {
   COMMAND_TIME_ZONE,
   commandDayForDate,
@@ -263,6 +265,16 @@ export type MovementHistoryMonth = {
    * them would invent an exchange rate.
    */
   collectedMinorByCurrency: Record<string, string>;
+  /**
+   * The same month's GHL payments, converted into minor units so it can be
+   * added to the figure above. GHL settles through its own Stripe account, so
+   * these are separate payments from the ones our invoice table holds — not the
+   * same money seen twice. Anything that *is* the same money is excluded before
+   * it gets here; see `ghlDuplicatesExcluded`.
+   */
+  ghlCollectedMinorByCurrency: Record<string, string>;
+  /** Stripe plus GHL. The whole month's cash, whichever system took it. */
+  collectedWithGhlMinorByCurrency: Record<string, string>;
 };
 
 /** Sums of minor-unit amounts keyed by currency, as strings out. */
@@ -287,6 +299,14 @@ export function buildMovementHistory(input: {
   signups?: readonly { at: Date }[];
   /** Settled invoices, for the per-month collected figure. */
   collected?: readonly { at: Date; currency: string; amountMinor: string }[];
+  /**
+   * Settled GHL payments, in **major** units — that is how the provider reports
+   * them, and mixing the two scales is a hundredfold error on a revenue figure,
+   * so the unit is in the name. Converted exactly here; a row carrying more
+   * precision than its currency has minor units is skipped and counted rather
+   * than rounded silently.
+   */
+  ghlCollected?: readonly { at: Date; currency: string; amountMajor: string }[];
 }): {
   range: { from: string; to: string; timeZone: string };
   months: MovementHistoryMonth[];
@@ -297,6 +317,12 @@ export function buildMovementHistory(input: {
     churned: number;
     net: number;
   };
+  /**
+   * GHL rows that could not be converted to minor units, because the provider
+   * reported more precision than the currency has. Counted rather than rounded
+   * away, so a combined total that is quietly short says so.
+   */
+  ghlAmountsSkipped: number;
 } {
   const months = commandMonthSpan(input.from, input.to);
   const monthIndex = new Set(months);
@@ -352,12 +378,54 @@ export function buildMovementHistory(input: {
     collectedByMonth.set(month, bucket);
   }
 
+  /**
+   * GHL, converted from major units to minor so it can be added to Stripe.
+   *
+   * `majorToMinorExact` refuses to round: a currency with two minor digits
+   * cannot represent 100.0001, and quietly turning that into 10000 would make a
+   * revenue figure wrong in a way nobody would ever spot. So a row like that is
+   * skipped and counted, and the count travels with the series.
+   */
+  const ghlByMonth = new Map<string, Map<string, bigint>>();
+  let ghlAmountsSkipped = 0;
+  for (const entry of input.ghlCollected ?? []) {
+    const month = commandMonthForDate(entry.at);
+    if (!monthIndex.has(month)) continue;
+    const currency = entry.currency.toLowerCase();
+    let minor: bigint;
+    try {
+      minor = BigInt(
+        majorToMinorExact(new Prisma.Decimal(entry.amountMajor), currency).toFixed(0),
+      );
+    } catch {
+      ghlAmountsSkipped += 1;
+      continue;
+    }
+    const bucket = ghlByMonth.get(month) ?? new Map<string, bigint>();
+    bucket.set(currency, (bucket.get(currency) ?? 0n) + minor);
+    ghlByMonth.set(month, bucket);
+  }
+
+  const serializeMinor = (values: Map<string, bigint>) =>
+    Object.fromEntries(
+      [...values.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([currency, amount]) => [currency, amount.toString()]),
+    );
+
   const series = months.map((month) => {
     const cancels = cancelled.byMonth.get(month) ?? new Set<string>();
     const fails = failed.byMonth.get(month) ?? new Set<string>();
     const churned = new Set([...cancels, ...fails]).size;
     const newSubscribers = (arrived.byMonth.get(month) ?? new Set()).size;
     const collected = collectedByMonth.get(month) ?? new Map<string, bigint>();
+    const ghl = ghlByMonth.get(month) ?? new Map<string, bigint>();
+    // Per currency, never across them. A month with CAD from GHL and USD from
+    // Stripe reports both, and adding them would invent an exchange rate.
+    const combined = new Map<string, bigint>(collected);
+    for (const [currency, amount] of ghl) {
+      combined.set(currency, (combined.get(currency) ?? 0n) + amount);
+    }
     return {
       month,
       newSubscribers,
@@ -366,11 +434,9 @@ export function buildMovementHistory(input: {
       churned,
       net: newSubscribers - churned,
       signups: signupsByMonth.get(month) ?? 0,
-      collectedMinorByCurrency: Object.fromEntries(
-        [...collected.entries()]
-          .sort(([left], [right]) => left.localeCompare(right))
-          .map(([currency, amount]) => [currency, amount.toString()]),
-      ),
+      collectedMinorByCurrency: serializeMinor(collected),
+      ghlCollectedMinorByCurrency: serializeMinor(ghl),
+      collectedWithGhlMinorByCurrency: serializeMinor(combined),
     };
   });
 
@@ -386,6 +452,7 @@ export function buildMovementHistory(input: {
       churned: churnedOverall,
       net: arrived.overall.size - churnedOverall,
     },
+    ghlAmountsSkipped,
   };
 }
 

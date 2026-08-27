@@ -422,6 +422,101 @@ describe("per-month signups and revenue", () => {
     expect(monthOf(history, "2026-08").collectedMinorByCurrency).toEqual({ usd: "500" });
   });
 
+  test("GHL is converted from major units before it is added to Stripe", () => {
+    // The error this guards against is a hundredfold one: GHL reports 750.00
+    // where Stripe reports 75000, and adding them raw would understate the
+    // month by almost the whole GHL amount.
+    const history = buildMovementHistory({
+      ...range,
+      starts: [],
+      cancellations: [],
+      failedInvoices: [],
+      collected: [
+        { at: new Date("2026-08-04T12:00:00Z"), currency: "usd", amountMinor: "14900" },
+      ],
+      ghlCollected: [
+        { at: new Date("2026-08-06T12:00:00Z"), currency: "usd", amountMajor: "750" },
+      ],
+    });
+    const august = monthOf(history, "2026-08");
+    expect(august.collectedMinorByCurrency).toEqual({ usd: "14900" });
+    expect(august.ghlCollectedMinorByCurrency).toEqual({ usd: "75000" });
+    expect(august.collectedWithGhlMinorByCurrency).toEqual({ usd: "89900" });
+  });
+
+  test("a half-dollar GHL amount converts exactly", () => {
+    // The real August figure was CAD 4,498.50, so the fractional case is the
+    // normal one, not an edge case.
+    const history = buildMovementHistory({
+      ...range,
+      starts: [],
+      cancellations: [],
+      failedInvoices: [],
+      ghlCollected: [
+        { at: new Date("2026-08-06T12:00:00Z"), currency: "cad", amountMajor: "4498.5" },
+      ],
+    });
+    expect(monthOf(history, "2026-08").ghlCollectedMinorByCurrency).toEqual({
+      cad: "449850",
+    });
+  });
+
+  test("a currency present in only one system still reports", () => {
+    const history = buildMovementHistory({
+      ...range,
+      starts: [],
+      cancellations: [],
+      failedInvoices: [],
+      collected: [
+        { at: new Date("2026-08-04T12:00:00Z"), currency: "usd", amountMinor: "100" },
+      ],
+      ghlCollected: [
+        { at: new Date("2026-08-06T12:00:00Z"), currency: "cad", amountMajor: "1" },
+      ],
+    });
+    // Side by side, not added: there is no exchange rate here to invent.
+    expect(monthOf(history, "2026-08").collectedWithGhlMinorByCurrency).toEqual({
+      cad: "100",
+      usd: "100",
+    });
+  });
+
+  test("an amount finer than the currency's minor unit is skipped and counted", () => {
+    // Rounding it would make a revenue figure wrong in a way nobody would spot.
+    const history = buildMovementHistory({
+      ...range,
+      starts: [],
+      cancellations: [],
+      failedInvoices: [],
+      ghlCollected: [
+        { at: new Date("2026-08-06T12:00:00Z"), currency: "usd", amountMajor: "100.0001" },
+        { at: new Date("2026-08-07T12:00:00Z"), currency: "usd", amountMajor: "5" },
+      ],
+    });
+    expect(history.ghlAmountsSkipped).toBe(1);
+    expect(monthOf(history, "2026-08").ghlCollectedMinorByCurrency).toEqual({
+      usd: "500",
+    });
+  });
+
+  test("with no GHL at all, combined equals Stripe", () => {
+    const history = buildMovementHistory({
+      ...range,
+      starts: [],
+      cancellations: [],
+      failedInvoices: [],
+      collected: [
+        { at: new Date("2026-08-04T12:00:00Z"), currency: "usd", amountMinor: "14900" },
+      ],
+    });
+    const august = monthOf(history, "2026-08");
+    expect(august.ghlCollectedMinorByCurrency).toEqual({});
+    expect(august.collectedWithGhlMinorByCurrency).toEqual(
+      august.collectedMinorByCurrency,
+    );
+    expect(history.ghlAmountsSkipped).toBe(0);
+  });
+
   test("months outside the range are ignored on both new fields", () => {
     const history = buildMovementHistory({
       ...range,
