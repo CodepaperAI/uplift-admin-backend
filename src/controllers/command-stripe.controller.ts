@@ -2175,7 +2175,7 @@ export async function getCommandStripeMonthMovement(
   try {
     const month = parseMovementMonth(req.query.month) ?? currentCommandMonth();
     const range = commandMonthRange(month);
-    const cacheKey = `stripe-month-movement-v5:${month}`;
+    const cacheKey = `stripe-month-movement-v6:${month}`;
     const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
     if (cached) {
       sendSuccess(res, cached, "Command Stripe month movement");
@@ -2282,7 +2282,9 @@ export async function getCommandStripeMonthMovement(
           createdAt: true,
         },
       }),
-      prisma.business.findMany({ select: { id: true, businessName: true } }),
+      prisma.business.findMany({
+        select: { id: true, businessName: true, businessPhone: true },
+      }),
       // Every settled invoice, for the per-month collected figure. Subscription
       // invoices *and* one-off invoices: that is what makes the number "revenue
       // collected" rather than "subscription revenue", and it is why a manually
@@ -2447,9 +2449,7 @@ export async function getCommandStripeMonthMovement(
      * someone can have today. One row per account, matching how the tiles count,
      * so the list and the number beside it cannot drift apart.
      */
-    const businessNameById = new Map(
-      businessRows.map((row) => [row.id, row.businessName]),
-    );
+    const businessById = new Map(businessRows.map((row) => [row.id, row]));
     const userById = new Map(userRows.map((row) => [row.id, row]));
     const upliftPlanNames = await getUpliftPlanDefinitions();
     const planNameByPriceId = new Map(
@@ -2464,7 +2464,25 @@ export async function getCommandStripeMonthMovement(
         stripeSubscriptionId: snapshot.stripeSubscriptionId,
       });
       const user = snapshot.userId ? userById.get(snapshot.userId) : undefined;
+      const business = snapshot.businessId
+        ? businessById.get(snapshot.businessId)
+        : undefined;
       const existing = identities.get(accountKey);
+      /**
+       * A number to ring, and which number it is.
+       *
+       * Same order as the subscriber roster: the person first, the business line
+       * as the fallback. Many signups leave no personal number, and for a call
+       * list a business line is far better than "no number" — but a rep should
+       * know a receptionist may answer before the call connects, so the source
+       * travels with it rather than being inferred later.
+       */
+      const phone = user?.phone ?? business?.businessPhone ?? null;
+      const phoneSource: "user" | "business" | null = user?.phone
+        ? "user"
+        : business?.businessPhone
+          ? "business"
+          : null;
       // An account can hold several subscriptions. Keep the dearest one's value
       // and plan, so a customer who also had a cheap add-on is not ranked by
       // the add-on.
@@ -2477,10 +2495,9 @@ export async function getCommandStripeMonthMovement(
         stripeCustomerId: snapshot.stripeCustomerId ?? existing?.stripeCustomerId ?? null,
         name: user?.name ?? existing?.name ?? null,
         email: user?.email ?? existing?.email ?? null,
-        phone: user?.phone ?? existing?.phone ?? null,
-        businessName: snapshot.businessId
-          ? (businessNameById.get(snapshot.businessId) ?? existing?.businessName ?? null)
-          : (existing?.businessName ?? null),
+        phone: phone ?? existing?.phone ?? null,
+        phoneSource: phone ? phoneSource : (existing?.phoneSource ?? null),
+        businessName: business?.businessName ?? existing?.businessName ?? null,
         planName: dearer
           ? (snapshot.stripePriceIds
               .map((priceId) => planNameByPriceId.get(priceId))

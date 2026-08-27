@@ -458,6 +458,20 @@ describe("buildChurnCallList", () => {
       },
     ],
     ["cus:b", { name: "Simran Kaur", mrrMinor: "9900", currency: "usd" }],
+    [
+      "cus:c",
+      {
+        name: "Daljit Sandhu",
+        // No personal number on file; the business line is the fallback, and
+        // the list has to say which it is so a rep is not surprised by a
+        // receptionist.
+        phone: "+16045550199",
+        phoneSource: "business",
+        businessName: "Sandhu Autos",
+        mrrMinor: "5000",
+        currency: "usd",
+      },
+    ],
   ]);
 
   function failed(
@@ -552,6 +566,17 @@ describe("buildChurnCallList", () => {
     expect(list.rows).toHaveLength(1);
     expect(list.rows[0]?.accountKey).toBe("cus:unknown");
     expect(list.rows[0]?.name).toBeUndefined();
+  });
+
+  test("a business line is carried with its source, not passed off as personal", () => {
+    const list = buildChurnCallList({
+      month: MONTH,
+      cancellations: [start("cus:c", "2026-08-05T10:00:00Z")],
+      failedInvoices: [],
+      identities,
+    });
+    expect(list.rows[0]?.phone).toBe("+16045550199");
+    expect(list.rows[0]?.phoneSource).toBe("business");
   });
 
   test("events outside the month do not reach the list", () => {

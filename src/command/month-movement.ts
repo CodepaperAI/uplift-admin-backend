@@ -410,6 +410,11 @@ export type ChurnIdentity = {
   name?: string | null;
   email?: string | null;
   phone?: string | null;
+  /**
+   * Which number that is. A business line means a receptionist may answer, and
+   * the rep should know that before the call connects rather than after.
+   */
+  phoneSource?: "user" | "business" | null;
   businessName?: string | null;
   planName?: string | null;
   /** What they were paying, so the list can be worked by value. */
