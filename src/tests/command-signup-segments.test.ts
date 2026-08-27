@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
+  INTRO_PERIOD_MAX_DAYS,
   classifyCountry,
   classifyPlanTag,
+  isIntroPeriod,
   stageFromPaymentState,
   tallySegments,
 } from "../command/signup-segments";
@@ -10,21 +12,65 @@ const SOCIAL = new Set(["price_social_m", "price_social_y"]);
 const ANNUAL = new Set(["price_core_y", "price_social_y"]);
 
 describe("stageFromPaymentState", () => {
+  // A month out. Long enough that no state should read it as an intro window.
+  const SETTLED_CYCLE = 31;
+
   test("no subscription is the top of the funnel", () => {
-    expect(stageFromPaymentState("none")).toBe("signed_up");
+    expect(stageFromPaymentState("none", null)).toBe("signed_up");
   });
 
   test("a coupon payer is a customer, not a prospect", () => {
     // Somebody paying $74 a month is active. The discount is a margin question
     // and stays visible in the amount, not in the funnel stage.
-    expect(stageFromPaymentState("discounted")).toBe("active");
-    expect(stageFromPaymentState("paid")).toBe("active");
+    expect(stageFromPaymentState("discounted", SETTLED_CYCLE)).toBe("active");
+    expect(stageFromPaymentState("paid", SETTLED_CYCLE)).toBe("active");
   });
 
-  test("trial, unbilled and churned each stay distinct", () => {
-    expect(stageFromPaymentState("trial")).toBe("trial");
-    expect(stageFromPaymentState("pending")).toBe("unbilled");
-    expect(stageFromPaymentState("cancelled")).toBe("churned");
+  test("trial and churned are read from the state alone", () => {
+    expect(stageFromPaymentState("trial", SETTLED_CYCLE)).toBe("trial");
+    expect(stageFromPaymentState("cancelled", null)).toBe("churned");
+  });
+
+  /**
+   * The case this whole argument exists for. On 2026-08-26 ten accounts held
+   * $99 and $149 subscriptions, every one billing three days after signup with
+   * no invoice recorded, and the day reported zero trials and zero paid.
+   */
+  test("a live subscription billing in three days is on a trial, not unbilled", () => {
+    expect(stageFromPaymentState("pending", 3)).toBe("trial");
+  });
+
+  test("a pending subscription on a normal cycle has not been billed", () => {
+    // Nothing settled and a month-long window is a payment that should have
+    // happened. That is a different conversation from a trial in progress.
+    expect(stageFromPaymentState("pending", SETTLED_CYCLE)).toBe("unbilled");
+    expect(stageFromPaymentState("pending", 365)).toBe("unbilled");
+  });
+
+  test("a pending subscription with no bill date at all stays unbilled", () => {
+    // Nothing is known about the window, so nothing is claimed about a trial.
+    expect(stageFromPaymentState("pending", null)).toBe("unbilled");
+  });
+
+  test("the intro window is bounded at both ends", () => {
+    // Zero or negative means the date has passed — that is overdue, not intro.
+    expect(stageFromPaymentState("pending", 0)).toBe("unbilled");
+    expect(stageFromPaymentState("pending", -2)).toBe("unbilled");
+    expect(stageFromPaymentState("pending", INTRO_PERIOD_MAX_DAYS)).toBe("trial");
+    expect(stageFromPaymentState("pending", INTRO_PERIOD_MAX_DAYS + 1)).toBe(
+      "unbilled",
+    );
+  });
+});
+
+describe("isIntroPeriod", () => {
+  test("the window sits well clear of the shortest real billing cycle", () => {
+    // The gap this rule depends on: nothing on the book renews inside 31 days,
+    // so the boundary has three weeks of daylight on either side of it.
+    expect(INTRO_PERIOD_MAX_DAYS).toBeLessThan(31);
+    expect(isIntroPeriod(31)).toBe(false);
+    expect(isIntroPeriod(34)).toBe(false);
+    expect(isIntroPeriod(365)).toBe(false);
   });
 });
 

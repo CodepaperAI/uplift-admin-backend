@@ -121,7 +121,7 @@ describe("buildPlanMix", () => {
     });
     expect(mix.upgrades.allTime).toBe(2);
     expect(mix.upgrades.inRange).toBe(1);
-    expect(mix.upgrades.recent[0].stripeSubscriptionId).toBe("new");
+    expect(mix.upgrades.recent[0]?.stripeSubscriptionId).toBe("new");
   });
 
   test("says how many on social got there by upgrading", () => {
@@ -221,8 +221,8 @@ describe("findUpgradesFromSpans", () => {
       SOCIAL_IDS,
     );
     expect(found).toHaveLength(1);
-    expect(found[0].addedOn).toBe("2026-08-14");
-    expect(found[0].stripeSubscriptionId).toBe("social");
+    expect(found[0]?.addedOn).toBe("2026-08-14");
+    expect(found[0]?.stripeSubscriptionId).toBe("social");
   });
 
   test("counts a cancelled core plan, since dropping it and taking social is still moving up", () => {
@@ -295,7 +295,7 @@ describe("findUpgradesFromSpans", () => {
       SOCIAL_IDS,
     );
     expect(found).toHaveLength(1);
-    expect(found[0].stripeSubscriptionId).toBe("social_first");
+    expect(found[0]?.stripeSubscriptionId).toBe("social_first");
   });
 
   test("subscriptions with no customer cannot be attributed", () => {

@@ -189,7 +189,6 @@ export function buildDailySignups(input: {
                 ? "trial"
                 : "discounted";
 
-      const stage = stageFromPaymentState(state);
       // The country of the first business they built, falling back to their
       // dialling code. A business with no country set is not an answer, so the
       // fallback still runs.
@@ -200,6 +199,12 @@ export function buildDailySignups(input: {
         phone: user.phone,
       });
       const billAt = subscription?.currentPeriodEnd ?? null;
+      // Measured from signup, not from now: the question is how long a window
+      // this subscription opened with, which does not change as the day passes.
+      const daysToNextBill = billAt
+        ? Math.round((billAt.getTime() - user.createdAt.getTime()) / 86_400_000)
+        : null;
+      const stage = stageFromPaymentState(state, daysToNextBill);
 
       return {
         userId: user.id,
@@ -211,11 +216,7 @@ export function buildDailySignups(input: {
         signedUpAt: user.createdAt.toISOString(),
         hasBusiness: businesses.length > 0,
         nextBillAt: billAt ? billAt.toISOString() : null,
-        daysToNextBill: billAt
-          ? Math.round(
-              (billAt.getTime() - user.createdAt.getTime()) / 86_400_000,
-            )
-          : null,
+        daysToNextBill,
         state,
         stage,
         planTag: classifyPlanTag({

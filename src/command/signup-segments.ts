@@ -48,7 +48,43 @@ export type PaymentStateForStage =
   | "cancelled"
   | "none";
 
-export function stageFromPaymentState(state: PaymentStateForStage): SignupStage {
+/**
+ * How short a first billing window has to be to mean "introductory period".
+ *
+ * Every established subscription on the book renews in 31, 34 or 365 days. So a
+ * first bill a few days out is not a normal cycle — it is an opening window, and
+ * it is the only thing separating a subscription waiting on its first charge
+ * from one whose card has failed. Those need opposite responses from a rep.
+ *
+ * Seven rather than the three days observed, because the number to pick is the
+ * gap between the shortest plausible intro window and the shortest real cycle,
+ * and there is three and a half weeks of daylight in between.
+ */
+export const INTRO_PERIOD_MAX_DAYS = 7;
+
+export function isIntroPeriod(daysToNextBill: number | null): boolean {
+  return (
+    daysToNextBill !== null &&
+    daysToNextBill > 0 &&
+    daysToNextBill <= INTRO_PERIOD_MAX_DAYS
+  );
+}
+
+/**
+ * The funnel stage for a payment state.
+ *
+ * `daysToNextBill` is required rather than optional on purpose. A `pending`
+ * subscription is either mid-trial or mid-failure depending on it, and the two
+ * were reported identically for as long as this took only the state: on
+ * 2026-08-26, ten accounts on $99 and $149 plans — every one of them billing
+ * three days out, with no invoice yet — were counted as neither paid nor
+ * trialling, so a day with ten trials on it read as zero. An optional argument
+ * would have let the next caller reintroduce that silently.
+ */
+export function stageFromPaymentState(
+  state: PaymentStateForStage,
+  daysToNextBill: number | null,
+): SignupStage {
   switch (state) {
     case "none":
       return "signed_up";
@@ -60,8 +96,11 @@ export function stageFromPaymentState(state: PaymentStateForStage): SignupStage 
     case "paid":
     case "discounted":
       return "active";
+    // Live, nothing settled yet. A short window means the opening charge has
+    // not come due; anything longer is a subscription that should have billed
+    // and has not, which is a different conversation.
     case "pending":
-      return "unbilled";
+      return isIntroPeriod(daysToNextBill) ? "trial" : "unbilled";
     case "cancelled":
       return "churned";
   }

@@ -31,7 +31,14 @@
     "index.ts",
     "src/admin-api-config.ts",
     "src/types/**/*.d.ts",
-    "tests/**/*.test.ts"
+    "tests/**/*.test.ts",
+    // The command tests run in CI, so they are checked in CI. Without this they
+    // ran but were never typechecked, and a test could drift from the signature
+    // it was testing and still pass: `stageFromPaymentState("pending")` kept
+    // asserting the old two-argument-free behaviour by passing `undefined` for
+    // the argument that decides the answer. The rest of `src/tests` stays out —
+    // it belongs to seo-be, is not run here, and does not typecheck clean.
+    "src/tests/command-*.test.ts"
   ],
-  "exclude": ["src/tests", "src/scripts"]
+  "exclude": ["src/scripts"]
 }

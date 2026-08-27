@@ -42,6 +42,70 @@ function invoice(subId: string, paid: number, at = "2026-08-25T14:05:00Z"): Invo
 
 const noBusinesses = new Map<string, { businessName: string; businessWebsiteUrl: string }[]>();
 
+describe("the funnel stage on a built row", () => {
+  /**
+   * The Aug 26 regression, end to end.
+   *
+   * 219 signups that day. Ten of them held $99 or $149 subscriptions that
+   * Stripe reported as active, every one billing three days after signup, none
+   * with an invoice recorded. The panel counted them as neither paid nor
+   * trialling, so a day with ten trials on it showed zero — and a rep looking
+   * at "awaiting first bill" would have gone chasing a payment that was not
+   * due for three days.
+   */
+  test("a live subscription billing three days out is on a trial", () => {
+    const { rows } = buildDailySignups({
+      users: [user("u1", "2026-08-26T22:09:00Z")],
+      businessesByUser: noBusinesses,
+      subscriptionsByUser: new Map([
+        ["u1", [sub("sub_1", "u1", "active", "14900", "2026-08-29T22:09:00Z")]],
+      ]),
+      // The point of the case: nothing settled yet.
+      invoicesBySubscription: new Map(),
+    });
+    expect(rows[0]?.state).toBe("pending");
+    expect(rows[0]?.daysToNextBill).toBe(3);
+    expect(rows[0]?.stage).toBe("trial");
+  });
+
+  test("nothing settled on a normal monthly cycle is genuinely unbilled", () => {
+    const { rows } = buildDailySignups({
+      users: [user("u1", "2026-08-26T22:09:00Z")],
+      businessesByUser: noBusinesses,
+      subscriptionsByUser: new Map([
+        ["u1", [sub("sub_1", "u1", "active", "14900", "2026-09-26T22:09:00Z")]],
+      ]),
+      invoicesBySubscription: new Map(),
+    });
+    expect(rows[0]?.state).toBe("pending");
+    expect(rows[0]?.daysToNextBill).toBe(31);
+    // A month with nothing settled is a payment that should have happened.
+    expect(rows[0]?.stage).toBe("unbilled");
+  });
+
+  test("a paid signup is active regardless of when it next bills", () => {
+    const { rows } = buildDailySignups({
+      users: [user("u1")],
+      businessesByUser: noBusinesses,
+      subscriptionsByUser: new Map([["u1", [sub("sub_1", "u1")]]]),
+      invoicesBySubscription: new Map([["sub_1", [invoice("sub_1", 14900)]]]),
+    });
+    expect(rows[0]?.state).toBe("paid");
+    expect(rows[0]?.stage).toBe("active");
+  });
+
+  test("no subscription is the top of the funnel, not an unbilled one", () => {
+    const { rows } = buildDailySignups({
+      users: [user("u1")],
+      businessesByUser: noBusinesses,
+      subscriptionsByUser: new Map(),
+      invoicesBySubscription: new Map(),
+    });
+    expect(rows[0]?.stage).toBe("signed_up");
+    expect(rows[0]?.planTag).toBe("none");
+  });
+});
+
 describe("buildDailySignups", () => {
   test("a signup with no subscription is the plain case", () => {
     const { rows, totals } = buildDailySignups({
