@@ -16,6 +16,18 @@ function databaseUrl(): string {
   return value;
 }
 
+/**
+ * The pool size this process will use, without building a client.
+ *
+ * Exported so the admin panel can report what the running container actually
+ * has. The value arrives through Secrets Manager and is applied by a script on
+ * the instance, which made it impossible to confirm from outside that a change
+ * had taken effect.
+ */
+export function resolvedPoolMax(): number {
+  return poolMax(process.env.DATABASE_URL ?? "");
+}
+
 function poolMax(connectionString: string): number {
   const configured = Number.parseInt(process.env.PRISMA_POOL_MAX ?? "", 10);
   if (Number.isInteger(configured) && configured >= 1 && configured <= 100) {

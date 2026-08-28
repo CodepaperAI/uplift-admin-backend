@@ -3,6 +3,7 @@ import { prisma } from "../config/db.config";
 import { sendError, sendSuccess } from "../utils/response.utils";
 import { listCommandDecisionCenter } from "../command/decision.service";
 import { readCommandCache, writeCommandCache } from "../utils/command-cache";
+import { resolvedPoolMax } from "../config/prisma-client.factory";
 
 function configured(value: string | undefined): boolean {
   return Boolean(value?.trim());
@@ -44,7 +45,7 @@ export async function getCommandSettings(
   res: Response,
 ): Promise<void> {
   try {
-    const cached = await readCommandCache<Record<string, unknown>>("settings-v3");
+    const cached = await readCommandCache<Record<string, unknown>>("settings-v4");
     if (cached) {
       sendSuccess(res, cached, "Command settings");
       return;
@@ -86,6 +87,26 @@ export async function getCommandSettings(
           activeServices: services,
           activeReps,
           ghlMappedReps,
+        },
+        /**
+         * The database connection pool this process is actually running with.
+         *
+         * Reported because the value lives in Secrets Manager, is applied by a
+         * script on the instance, and was until now unobservable from outside —
+         * so "the pool has been raised" could only be asserted, never checked. A
+         * single overview request issues twenty-five queries in one
+         * `Promise.all`, so a pool below that serialises them, and the number
+         * that matters is the one in the running container rather than the one in
+         * the deploy script.
+         *
+         * Not a secret: it is a concurrency limit, and this endpoint already
+         * requires `edit.settings`.
+         */
+        runtime: {
+          databasePoolMax: resolvedPoolMax(),
+          poolMaxSource: process.env.PRISMA_POOL_MAX?.trim()
+            ? "PRISMA_POOL_MAX"
+            : "application default",
         },
         integrations: {
           stripe: {
@@ -215,7 +236,7 @@ export async function getCommandSettings(
             ? ["FIREFLIES_API_KEY", "FIREFLIES_WEBHOOK_SECRET"]
             : ["Approve D5 meeting_provider"],
     };
-    await writeCommandCache("settings-v3", payload, 120);
+    await writeCommandCache("settings-v4", payload, 120);
     sendSuccess(res, payload, "Command settings");
   } catch (error) {
     sendError(res, "Failed to load Command settings", 500, error);
