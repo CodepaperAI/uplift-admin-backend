@@ -52,7 +52,21 @@ import {
   calculateGrowthEconomics,
 } from "../command/growth-economics";
 import { currencyExponent } from "../command/money";
-import { readCommandCache, writeCommandCache } from "../utils/command-cache";
+import {
+  invalidateCommandProviderCache,
+  readCommandCache,
+  readCommandProviderCache,
+  writeCommandCache,
+  writeCommandProviderCache,
+} from "../utils/command-cache";
+import {
+  PLAN_DEFINITION_TTL_SECONDS,
+  SUBSCRIPTION_BILLING_TTL_SECONDS,
+  deserializePlanDefinitions,
+  deserializeSubscriptionBilling,
+  serializeSubscriptionBilling,
+  upliftPriceSetKey,
+} from "../command/stripe-catalog-cache";
 import { isStripeConfigured, stripe } from "../config/stripe.config";
 import {
   projectUpliftSubscriptionPlanBilling,
@@ -93,6 +107,15 @@ function configuredUpliftPlanLabels(): Map<string, Omit<UpliftPlanDefinition, "p
   );
 }
 
+/**
+ * Plan labels for every Uplift price, read from Stripe.
+ *
+ * Cached because the uncached version was one `prices.retrieve` per price, with
+ * the product expanded, on every miss of a 60-second response cache — and three
+ * separate endpoints (overview, plan mix, month movement) each paid it. The
+ * price ids come from PostgreSQL, so the two database reads stay on the request
+ * and only the Stripe round trips are cached.
+ */
 async function getUpliftPlanDefinitions(): Promise<UpliftPlanDefinition[]> {
   const configured = configuredUpliftPlanLabels();
   const [subscriptionPrices, websitePrices] = await Promise.all([
@@ -117,7 +140,11 @@ async function getUpliftPlanDefinitions(): Promise<UpliftPlanDefinition[]> {
     if (row.stripePriceId) priceIds.add(row.stripePriceId);
   }
 
-  return Promise.all(
+  const cacheKey = `stripe-plan-definitions-v1:${upliftPriceSetKey(priceIds)}`;
+  const cached = deserializePlanDefinitions(await readCommandProviderCache(cacheKey));
+  if (cached) return cached;
+
+  const definitions = await Promise.all(
     [...priceIds].map(async (priceId) => {
       const fallback = configured.get(priceId) ?? {
         name: "Uplift AI legacy plan",
@@ -158,6 +185,17 @@ async function getUpliftPlanDefinitions(): Promise<UpliftPlanDefinition[]> {
       }
     }),
   );
+  // Only worth storing when Stripe actually answered. Caching a page of
+  // fallbacks for an hour would turn one bad minute into an hour of
+  // "Uplift AI legacy plan" across three endpoints.
+  if (isStripeConfigured) {
+    await writeCommandProviderCache(
+      cacheKey,
+      definitions,
+      PLAN_DEFINITION_TTL_SECONDS,
+    );
+  }
+  return definitions;
 }
 
 function stripeObjectId(value: unknown): string | null {
@@ -215,14 +253,37 @@ async function retrieveStripePromotionCodes(
   return new Map(entries.filter((entry) => entry !== null));
 }
 
-async function loadLiveUpliftSubscriptionBilling(input: {
-  subscriptionIds: ReadonlySet<string>;
-  upliftPriceIds: ReadonlySet<string>;
-}): Promise<{
-  bySubscriptionId: Map<string, UpliftSubscriptionPlanBilling[]>;
-  missingSubscriptionCount: number;
-} | null> {
-  if (!isStripeConfigured || input.subscriptionIds.size === 0) return null;
+/**
+ * Live plan-and-discount billing for every Stripe subscription, from Stripe.
+ *
+ * This is the single most expensive thing the Command panel does. It walks
+ * Stripe's subscription list three times — once per live status — with discounts
+ * expanded on both the subscription and each of its items, then retrieves every
+ * distinct coupon and promotion code by id. On production that is the bulk of a
+ * cold overview: seconds of sequential HTTP to api.stripe.com, inside a request
+ * a person is waiting on.
+ *
+ * So it is cached, and cached *whole*. The walk cannot be narrowed to a caller's
+ * subscription ids — Stripe's list API has no id filter, so the old code fetched
+ * everything and then threw most of it away, which made the cost identical for
+ * one subscription and for all of them. Projecting every live subscription
+ * instead makes the result independent of who asked, which is what lets one
+ * cache entry serve every caller. The key is the Uplift price set, because the
+ * projection is computed against it.
+ *
+ * Returns null on any failure, and the caller degrades to
+ * `discountDataStatus: "unavailable"` rather than showing discount-free money as
+ * if it were exact.
+ */
+async function loadAllLiveSubscriptionBilling(
+  upliftPriceIds: ReadonlySet<string>,
+): Promise<Map<string, UpliftSubscriptionPlanBilling[]> | null> {
+  if (!isStripeConfigured) return null;
+  const cacheKey = `stripe-live-subscription-billing-v1:${upliftPriceSetKey(upliftPriceIds)}`;
+  const cached = deserializeSubscriptionBilling(
+    await readCommandProviderCache(cacheKey),
+  );
+  if (cached) return cached;
   try {
     const subscriptions = new Map<string, Stripe.Subscription>();
     const statuses = ["active", "trialing", "past_due"] as const;
@@ -233,9 +294,7 @@ async function loadLiveUpliftSubscriptionBilling(input: {
           limit: 100,
           expand: ["data.discounts", "data.items.data.discounts"],
         })) {
-          if (input.subscriptionIds.has(subscription.id)) {
-            subscriptions.set(subscription.id, subscription);
-          }
+          subscriptions.set(subscription.id, subscription);
         }
       }),
     );
@@ -281,20 +340,22 @@ async function loadLiveUpliftSubscriptionBilling(input: {
       if (resolved) discountsById.set(resolved.id, resolved);
     }
 
-    return {
-      bySubscriptionId: new Map(
-        [...subscriptions.entries()].map(([subscriptionId, subscription]) => [
-          subscriptionId,
-          projectUpliftSubscriptionPlanBilling({
-            subscription,
-            upliftPriceIds: input.upliftPriceIds,
-            discountsById,
-          }),
-        ]),
-      ),
-      missingSubscriptionCount:
-        input.subscriptionIds.size - subscriptions.size,
-    };
+    const bySubscriptionId = new Map(
+      [...subscriptions.entries()].map(([subscriptionId, subscription]) => [
+        subscriptionId,
+        projectUpliftSubscriptionPlanBilling({
+          subscription,
+          upliftPriceIds,
+          discountsById,
+        }),
+      ]),
+    );
+    await writeCommandProviderCache(
+      cacheKey,
+      serializeSubscriptionBilling(bySubscriptionId),
+      SUBSCRIPTION_BILLING_TTL_SECONDS,
+    );
+    return bySubscriptionId;
   } catch (error) {
     console.error(
       "[command-stripe] Could not load live subscription discounts",
@@ -302,6 +363,37 @@ async function loadLiveUpliftSubscriptionBilling(input: {
     );
     return null;
   }
+}
+
+/**
+ * The caller's slice of the projection above, plus how much of it Stripe could
+ * not account for.
+ *
+ * `missingSubscriptionCount` is counted against what was asked for, not against
+ * what Stripe returned: a subscription our snapshot believes is live but which
+ * Stripe's live list does not contain is exactly the discrepancy the panel
+ * reports as "partial", and it has to survive the cache being shared.
+ */
+async function loadLiveUpliftSubscriptionBilling(input: {
+  subscriptionIds: ReadonlySet<string>;
+  upliftPriceIds: ReadonlySet<string>;
+}): Promise<{
+  bySubscriptionId: Map<string, UpliftSubscriptionPlanBilling[]>;
+  missingSubscriptionCount: number;
+} | null> {
+  if (!isStripeConfigured || input.subscriptionIds.size === 0) return null;
+  const bySubscriptionId = await loadAllLiveSubscriptionBilling(
+    input.upliftPriceIds,
+  );
+  if (!bySubscriptionId) return null;
+  let found = 0;
+  for (const subscriptionId of input.subscriptionIds) {
+    if (bySubscriptionId.has(subscriptionId)) found += 1;
+  }
+  return {
+    bySubscriptionId,
+    missingSubscriptionCount: input.subscriptionIds.size - found,
+  };
 }
 
 export async function getCommandStripeOverview(
@@ -346,7 +438,7 @@ export async function getCommandStripeOverview(
     // How fresh the facts below actually are. Without this the panel is a
     // confident table with no way to tell a live number from one the sync
     // stopped updating three days ago.
-    const [newestSnapshot, lastSyncRun] = await Promise.all([
+    const [newestSnapshot, lastSyncRun, upliftPlans] = await Promise.all([
       prisma.commandStripeSubscriptionSnapshot.aggregate({
         _max: { occurredAt: true, updatedAt: true },
       }),
@@ -363,9 +455,12 @@ export async function getCommandStripeOverview(
           error: true,
         },
       }),
+      // Hoisted into this wave deliberately. Nothing between here and its first
+      // use depended on it, so awaiting it on its own line put a Stripe round
+      // trip in front of every query below for no reason.
+      getUpliftPlanDefinitions(),
     ]);
 
-    const upliftPlans = await getUpliftPlanDefinitions();
     const upliftPlanByPriceId = new Map(
       upliftPlans.map((plan) => [plan.priceId, plan]),
     );
@@ -378,7 +473,6 @@ export async function getCommandStripeOverview(
     };
 
     const [
-      rosterAccountRefs,
       subscriptionCount,
       paidSubscriptionRefs,
       trialingCount,
@@ -397,18 +491,14 @@ export async function getCommandStripeOverview(
       knownStripeSubscriptionIds,
       activeReps,
       allAssignments,
-      leaderboardSubscriptions,
+      liveSubscriptions,
       wonByGhlUser,
       leaderboardActivity,
+      lockedCommissionRun,
+      newStripeEvents,
+      priorStripeCustomers,
+      liveGhlSubscriptions,
     ] = await Promise.all([
-      prisma.commandStripeSubscriptionSnapshot.findMany({
-        where: { ...liveWhere, stripeCustomerId: { not: null } },
-        distinct: ["stripeCustomerId"],
-        orderBy: { stripeCustomerId: "asc" },
-        skip,
-        take: pageSize,
-        select: { stripeCustomerId: true },
-      }),
       prisma.commandStripeSubscriptionSnapshot.count({ where: liveWhere }),
       prisma.commandStripeInvoice.findMany({
         where: {
@@ -431,9 +521,21 @@ export async function getCommandStripeOverview(
           pauseCollectionBehavior: { not: null },
         },
       }),
+      /**
+       * Every live account, ordered, and the roster page is a slice of it.
+       *
+       * This used to be two queries: this one for the count, and a second
+       * identical one carrying `skip`/`take` for the page. Paginating a
+       * `distinct` query is also the kind of thing that quietly returns short
+       * pages — the limit applies to rows, the deduplication to customers, and a
+       * customer holding two subscriptions costs the page a slot. Slicing an
+       * ordered list in memory is exact, and there are a few hundred rows here,
+       * not a few hundred thousand.
+       */
       prisma.commandStripeSubscriptionSnapshot.findMany({
         where: { ...liveWhere, stripeCustomerId: { not: null } },
         distinct: ["stripeCustomerId"],
+        orderBy: { stripeCustomerId: "asc" },
         select: { stripeCustomerId: true },
       }),
       prisma.commandStripeSubscriptionSnapshot.groupBy({
@@ -532,8 +634,18 @@ export async function getCommandStripeOverview(
       prisma.salesCustomerAssignment.findMany({
         select: { businessId: true, salespersonId: true },
       }),
+      /**
+       * Every live subscription, once.
+       *
+       * Two reads used to cover this: one for the leaderboard over
+       * `mrrWhere`, and one for entry-path classification over `liveWhere` — a
+       * wave later, and a strict superset, differing only by whether collection
+       * is paused. Reading the superset with both field sets and splitting in
+       * memory is the same data, one round trip, and no risk of the two drifting
+       * apart.
+       */
       prisma.commandStripeSubscriptionSnapshot.findMany({
-        where: mrrWhere,
+        where: liveWhere,
         select: {
           stripeSubscriptionId: true,
           stripeCustomerId: true,
@@ -542,6 +654,7 @@ export async function getCommandStripeOverview(
           currency: true,
           monthlyRecurringMinor: true,
           stripePriceIds: true,
+          pauseCollectionBehavior: true,
         },
       }),
       prisma.commandGhlOpportunity.groupBy({
@@ -558,20 +671,102 @@ export async function getCommandStripeOverview(
         where: { periodMonth: period.month },
         orderBy: [{ repId: "asc" }, { source: "asc" }],
       }),
+      // The four below ran in their own wave two hundred lines down, after the
+      // roster and the entry-path reads, none of which they use. Nothing about
+      // them needs to wait, so they no longer do.
+      prisma.commandCommissionRun.findUnique({
+        where: { periodMonth: period.month },
+        include: { repSnapshots: true },
+      }),
+      prisma.commandStripeSubscriptionEvent.findMany({
+        where: {
+          occurredAt: { gte: period.start, lt: period.end },
+          stripeCustomerId: { not: null },
+          status: { in: ["trialing", "active", "past_due"] },
+          pauseCollectionBehavior: null,
+        },
+        orderBy: { occurredAt: "asc" },
+        select: { stripeCustomerId: true, currency: true },
+      }),
+      /**
+       * Which customers existed before this month — a GROUP BY, not a scan.
+       *
+       * This was `findMany({ distinct: ["stripeCustomerId"] })` over every
+       * subscription event ever recorded before the period start. The event table
+       * is append-only, so that read grows for as long as the business does, and
+       * every row crossed the wire only to be discarded by the deduplication.
+       * Grouping returns one row per customer and does the work in PostgreSQL.
+       */
+      prisma.commandStripeSubscriptionEvent.groupBy({
+        by: ["stripeCustomerId"],
+        where: {
+          occurredAt: { lt: period.start },
+          stripeCustomerId: { not: null },
+        },
+      }),
+      prisma.commandGhlPaymentSubscription.findMany({
+        where: {
+          isActive: true,
+          status: { notIn: ["canceled", "cancelled", "expired", "terminated"] },
+        },
+        select: {
+          ghlSubscriptionRecordId: true,
+          providerSubscriptionId: true,
+          contactId: true,
+          contactEmail: true,
+          currency: true,
+          providerCreatedAt: true,
+        },
+      }),
     ]);
 
+    /**
+     * `mrrWhere` is `liveWhere` plus "collection is not paused", so the
+     * leaderboard set is this filter and nothing else. Keeping the derivation
+     * next to the read is what makes that checkable.
+     */
+    const leaderboardSubscriptions = liveSubscriptions.filter(
+      (subscription) => subscription.pauseCollectionBehavior === null,
+    );
     const monthlyMovement = monthlyMovements[0]!;
     const trailingRevenueChurn = aggregateTrailingRevenueChurn(monthlyMovements);
-    const rosterCustomerIds = rosterAccountRefs.flatMap((row) =>
-      row.stripeCustomerId ? [row.stripeCustomerId] : [],
-    );
-    const roster = await prisma.commandStripeSubscriptionSnapshot.findMany({
-      where: {
-        ...liveWhere,
-        stripeCustomerId: { in: rosterCustomerIds },
-      },
-      orderBy: [{ stripeCustomerId: "asc" }, { occurredAt: "asc" }],
-    });
+    const rosterCustomerIds = accountRows
+      .slice(skip, skip + pageSize)
+      .flatMap((row) => (row.stripeCustomerId ? [row.stripeCustomerId] : []));
+    /**
+     * The roster page, and every invoice the entry-path classifier needs.
+     *
+     * Paired because neither waits on the other: the roster is keyed by the
+     * customer ids sliced above, the invoices by every live subscription. The
+     * invoice read used to sit two waves further down for no reason other than
+     * where it was written.
+     */
+    const [roster, entryInvoiceRows] = await Promise.all([
+      prisma.commandStripeSubscriptionSnapshot.findMany({
+        where: {
+          ...liveWhere,
+          stripeCustomerId: { in: rosterCustomerIds },
+        },
+        orderBy: [{ stripeCustomerId: "asc" }, { occurredAt: "asc" }],
+      }),
+      liveSubscriptions.length
+        ? prisma.commandStripeInvoice.findMany({
+            where: {
+              stripeSubscriptionId: {
+                in: liveSubscriptions.map((row) => row.stripeSubscriptionId),
+              },
+            },
+            select: {
+              stripeSubscriptionId: true,
+              currency: true,
+              amountPaidMinor: true,
+              billingReason: true,
+              paidAt: true,
+              providerCreatedAt: true,
+            },
+          })
+        : Promise.resolve([]),
+    ]);
 
     const userIds = new Set<string>();
     const businessIds = new Set<string>();
@@ -660,32 +855,7 @@ export async function getCommandStripeOverview(
      * different question. The invoice rows are the only record of *entry* that
      * survives conversion — see `command/entry-path.ts`.
      */
-    const liveForEntryPath =
-      await prisma.commandStripeSubscriptionSnapshot.findMany({
-        where: liveWhere,
-        select: {
-          stripeSubscriptionId: true,
-          stripeCustomerId: true,
-          monthlyRecurringMinor: true,
-        },
-      });
-    const entryInvoiceRows = liveForEntryPath.length
-      ? await prisma.commandStripeInvoice.findMany({
-          where: {
-            stripeSubscriptionId: {
-              in: liveForEntryPath.map((row) => row.stripeSubscriptionId),
-            },
-          },
-          select: {
-            stripeSubscriptionId: true,
-            currency: true,
-            amountPaidMinor: true,
-            billingReason: true,
-            paidAt: true,
-            providerCreatedAt: true,
-          },
-        })
-      : [];
+    const liveForEntryPath = liveSubscriptions;
     const invoicesBySubscription = new Map<string, InvoiceFact[]>();
     for (const row of entryInvoiceRows) {
       if (!row.stripeSubscriptionId) continue;
@@ -923,42 +1093,6 @@ export async function getCommandStripeOverview(
         amountMinor: row._sum.amountMinor ?? new Prisma.Decimal(0),
       })),
     });
-    const [lockedCommissionRun, newStripeEvents, priorStripeCustomers, liveGhlSubscriptions] =
-      await Promise.all([
-        prisma.commandCommissionRun.findUnique({
-          where: { periodMonth: period.month },
-          include: { repSnapshots: true },
-        }),
-        prisma.commandStripeSubscriptionEvent.findMany({
-          where: {
-            occurredAt: { gte: period.start, lt: period.end },
-            stripeCustomerId: { not: null },
-            status: { in: ["trialing", "active", "past_due"] },
-            pauseCollectionBehavior: null,
-          },
-          orderBy: { occurredAt: "asc" },
-          select: { stripeCustomerId: true, currency: true },
-        }),
-        prisma.commandStripeSubscriptionEvent.findMany({
-          where: { occurredAt: { lt: period.start }, stripeCustomerId: { not: null } },
-          distinct: ["stripeCustomerId"],
-          select: { stripeCustomerId: true },
-        }),
-        prisma.commandGhlPaymentSubscription.findMany({
-          where: {
-            isActive: true,
-            status: { notIn: ["canceled", "cancelled", "expired", "terminated"] },
-          },
-          select: {
-            ghlSubscriptionRecordId: true,
-            providerSubscriptionId: true,
-            contactId: true,
-            contactEmail: true,
-            currency: true,
-            providerCreatedAt: true,
-          },
-        }),
-      ]);
     const priorCustomerIds = new Set(
       priorStripeCustomers.flatMap((row) =>
         row.stripeCustomerId ? [row.stripeCustomerId] : [],
@@ -996,9 +1130,7 @@ export async function getCommandStripeOverview(
     for (const subscription of liveGhlSubscriptions) {
       if (
         subscription.providerSubscriptionId &&
-        knownStripeSubscriptionIds.some(
-          (row) => row.stripeSubscriptionId === subscription.providerSubscriptionId,
-        )
+        knownStripeSubscriptionIdSet.has(subscription.providerSubscriptionId)
       ) {
         continue;
       }
@@ -1767,6 +1899,18 @@ export async function getCommandStripeHealth(
   res: Response,
 ): Promise<void> {
   try {
+    /**
+     * Thirty seconds rather than sixty, because this is the page someone opens
+     * *because* something looks wrong. It still removes eight of every nine
+     * requests' worth of work, and nothing here moves faster than the Stripe
+     * sync that feeds it.
+     */
+    const cacheKey = "stripe-health-v1";
+    const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
+    if (cached) {
+      sendSuccess(res, cached, "Command Stripe health");
+      return;
+    }
     const [statusGroups, paused, pastDue, pastDueTotal, cancellations, cancellationTotal] =
       await Promise.all([
         prisma.commandStripeSubscriptionSnapshot.groupBy({
@@ -1884,28 +2028,26 @@ export async function getCommandStripeHealth(
       };
     };
 
-    sendSuccess(
-      res,
-      {
-        statusCounts: {
-          ...Object.fromEntries(
-            statusGroups.map((row) => [row.status, row._count._all]),
-          ),
-          paused,
-        },
-        pastDue: {
-          total: pastDueTotal,
-          truncated: pastDueTotal > pastDue.length,
-          rows: pastDue.map(project),
-        },
-        cancellations: {
-          total: cancellationTotal,
-          truncated: cancellationTotal > cancellations.length,
-          rows: cancellations.map(project),
-        },
+    const payload = {
+      statusCounts: {
+        ...Object.fromEntries(
+          statusGroups.map((row) => [row.status, row._count._all]),
+        ),
+        paused,
       },
-      "Command Stripe health",
-    );
+      pastDue: {
+        total: pastDueTotal,
+        truncated: pastDueTotal > pastDue.length,
+        rows: pastDue.map(project),
+      },
+      cancellations: {
+        total: cancellationTotal,
+        truncated: cancellationTotal > cancellations.length,
+        rows: cancellations.map(project),
+      },
+    };
+    await writeCommandCache(cacheKey, payload, 30);
+    sendSuccess(res, payload, "Command Stripe health");
   } catch (error) {
     sendError(res, "Failed to load Stripe health", 500, error);
   }
@@ -1916,6 +2058,11 @@ export async function requestCommandStripeReconciliation(
   res: Response,
 ): Promise<void> {
   try {
+    // Asking for a reconciliation is asking us to go and look at Stripe again,
+    // so the cached view of Stripe should not survive the request. The panel
+    // would otherwise report a reconciliation as queued and then serve the same
+    // plan labels and discounts for the rest of their TTL.
+    await invalidateCommandProviderCache();
     const result = await inngest.send({
       name: "command/stripe.reconcile.requested",
       data: {

@@ -55,7 +55,9 @@ export async function getCommandReps(
   res: Response,
 ): Promise<void> {
   try {
-    const [reps, unlinkedSalesUsers, legacySalespeople] = await Promise.all([
+    const isSuperadmin = req.userRole === "SUPERADMIN";
+    const [reps, unlinkedSalesUsers, legacySalespeople, legacySalesTotals] =
+      await Promise.all([
       prisma.commandRepProfile.findMany({
         include: {
           user: {
@@ -75,7 +77,7 @@ export async function getCommandReps(
         select: { id: true, name: true, email: true },
         orderBy: { name: "asc" },
       }),
-      req.userRole === "SUPERADMIN"
+      isSuperadmin
         ? prisma.user.findMany({
             where: { role: "SALES" },
             orderBy: { createdAt: "desc" },
@@ -90,15 +92,47 @@ export async function getCommandReps(
                   SalesEntries: true,
                 },
               },
-              SalesEntries: { select: { amountCents: true } },
             },
+          })
+        : Promise.resolve([]),
+      /**
+       * Sales revenue per person, summed in PostgreSQL.
+       *
+       * This used to ride along as `SalesEntries: { select: { amountCents } }` —
+       * every sales entry ever recorded, for every salesperson, serialised into
+       * the response so the browser could add them up. The response grew with
+       * the sales history and the arithmetic was in the wrong place.
+       *
+       * Grouped by currency as well as person, because `SalesEntry.currency`
+       * exists and a total that adds CAD to USD is not a total. The old client
+       * loop added them and then formatted the result as USD.
+       */
+      isSuperadmin
+        ? prisma.salesEntry.groupBy({
+            by: ["salespersonId", "currency"],
+            _sum: { amountCents: true },
           })
         : Promise.resolve([]),
     ]);
 
+    const salesRevenueByPerson = new Map<string, Record<string, number>>();
+    for (const row of legacySalesTotals) {
+      const byCurrency = salesRevenueByPerson.get(row.salespersonId) ?? {};
+      byCurrency[row.currency] =
+        (byCurrency[row.currency] ?? 0) + (row._sum.amountCents ?? 0);
+      salesRevenueByPerson.set(row.salespersonId, byCurrency);
+    }
+
     sendSuccess(
       res,
-      { reps: reps.map(serializeRep), unlinkedSalesUsers, legacySalespeople },
+      {
+        reps: reps.map(serializeRep),
+        unlinkedSalesUsers,
+        legacySalespeople: legacySalespeople.map((person) => ({
+          ...person,
+          salesRevenueCentsByCurrency: salesRevenueByPerson.get(person.id) ?? {},
+        })),
+      },
       "Command reps",
     );
   } catch (error) {

@@ -68,7 +68,13 @@ target_json="$(jq -c '
     ADMIN_FRONTEND_URL: "https://admin.upliftai.co",
     COMMAND_FRONTEND_URL: "https://admin.upliftai.co",
     CORS_ALLOWED_ORIGINS: "https://admin.upliftai.co",
-    PRISMA_POOL_MAX: "5",
+    # A single Command overview request issues twenty-six queries in one
+    # Promise.all. At a pool of five those ran in six serialised batches, and a
+    # second reader queued behind them: the pool, not PostgreSQL, was the
+    # ceiling. Twenty covers the widest fan-out with room for concurrent readers,
+    # and stays a small share of the max_connections this service shares with
+    # api.upliftai.co.
+    PRISMA_POOL_MAX: "20",
     PRISMA_QUERY_LOGGING: "false",
     PRISMA_QUERY_LOG: "false",
     COMMAND_GHL_CONFIGURED: (

@@ -6,6 +6,14 @@ const MIN_TTL_SECONDS = 15;
 const MAX_TTL_SECONDS = 30 * 24 * 60 * 60;
 const REVISION_TTL_SECONDS = MAX_TTL_SECONDS + 24 * 60 * 60;
 const MAX_VALUE_BYTES = 1024 * 1024;
+/**
+ * A ceiling a caller may raise for a payload it knows is large.
+ *
+ * Valkey is happy with multi-megabyte values and it sits inside the VPC, so the
+ * transfer is not the constraint. The reason for a limit at all is to catch a
+ * caller accidentally caching something unbounded.
+ */
+const MAX_CONFIGURABLE_VALUE_BYTES = 8 * 1024 * 1024;
 const REDIS_CONNECT_TIMEOUT_MS = 2_000;
 const REDIS_CONNECT_MAX_RETRIES = 1;
 
@@ -67,6 +75,28 @@ function logRedisError(message: string, error?: unknown) {
   if (now - lastErrorLogAt < 60_000) return;
   lastErrorLogAt = now;
   console.error(`[redis-cache] ${message}`, error instanceof Error ? error.message : "");
+}
+
+/**
+ * Never rate-limited, unlike the connection errors above.
+ *
+ * A skipped write is not a transient fault — it means this namespace has grown
+ * past its ceiling and is now recomputed from PostgreSQL on *every* request,
+ * with the endpoint still returning correct data and simply becoming slow. That
+ * is the failure mode nobody notices, so it gets a line every time it happens.
+ */
+function logOversizedValue(namespace: string, bytes: number, limit: number) {
+  console.error(
+    JSON.stringify({
+      level: "error",
+      service: "tenant-response-cache",
+      event: "cache_write_skipped_oversized",
+      namespace,
+      bytes,
+      limit,
+      impact: "namespace is uncached; every request recomputes it",
+    }),
+  );
 }
 
 function configuredRedisUrl(): string | null {
@@ -193,13 +223,19 @@ export async function writeTenantCache<T>(input: {
   businessId?: string | null;
   value: T;
   ttlSeconds: number;
+  maxValueBytes?: number;
 }): Promise<void> {
   try {
     const redis = await getClient();
     if (!redis) return;
     const serialized = JSON.stringify(input.value);
-    if (Buffer.byteLength(serialized, "utf8") > MAX_VALUE_BYTES) {
-      logRedisError(`Skipped oversized ${input.namespace} cache value`);
+    const limit = Math.min(
+      MAX_CONFIGURABLE_VALUE_BYTES,
+      Math.max(MAX_VALUE_BYTES, input.maxValueBytes ?? MAX_VALUE_BYTES),
+    );
+    const bytes = Buffer.byteLength(serialized, "utf8");
+    if (bytes > limit) {
+      logOversizedValue(input.namespace, bytes, limit);
       return;
     }
     const ttl = Math.max(MIN_TTL_SECONDS, Math.min(MAX_TTL_SECONDS, input.ttlSeconds));

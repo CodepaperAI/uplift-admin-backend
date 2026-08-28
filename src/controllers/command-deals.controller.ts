@@ -11,7 +11,11 @@ import {
   COMMAND_DEAL_SOURCE_TYPES,
 } from "../command/deal-service-correction";
 import { resolveApprovedCommandDecisions } from "../command/decision.service";
-import { invalidateCommandCache } from "../utils/command-cache";
+import {
+  invalidateCommandCache,
+  readCommandCache,
+  writeCommandCache,
+} from "../utils/command-cache";
 
 function queryString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
@@ -104,24 +108,52 @@ export async function getCommandDeals(
       return;
     }
 
-    const scopedAssignments = scope.repUserId
-      ? await prisma.salesCustomerAssignment.findMany({
-          where: { salespersonId: scope.repUserId },
-          select: { businessId: true },
-        })
-      : null;
+    /**
+     * Keyed on the resolved rep scope, not on the raw query.
+     *
+     * This endpoint answers a different question for a rep than for the company,
+     * and the answer for one rep must never be served to another. Building the
+     * key from the *resolved* scope — which `resolveRepUserScope` has already
+     * authorised — means a cache entry cannot outrank the permission check: an
+     * unauthorised `repId` is rejected above this line and never reaches a key.
+     *
+     * Twenty-four queries ran here on every request, uncached, while the rest of
+     * the panel shared sixty-second entries. It is the second most expensive
+     * read in Command and was the only heavy one paying full price every time.
+     */
+    const cacheKey = [
+      "command-deals-v1",
+      scope.repId ?? "-",
+      scope.repUserId ?? "-",
+      scope.repGhlUserId ?? "-",
+    ].join(":");
+    const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
+    if (cached) {
+      sendSuccess(res, cached, "Command deals");
+      return;
+    }
+
+    // Independent of each other, so they no longer take a round trip each.
+    const [scopedAssignments, scopedGhlOpportunities] = await Promise.all([
+      scope.repUserId
+        ? prisma.salesCustomerAssignment.findMany({
+            where: { salespersonId: scope.repUserId },
+            select: { businessId: true },
+          })
+        : Promise.resolve(null),
+      scope.repId
+        ? prisma.commandGhlOpportunity.findMany({
+            where: {
+              isActive: true,
+              assignedToGhlId: scope.repGhlUserId ?? "__unmapped_rep__",
+              ghlContactId: { not: null },
+            },
+            select: { ghlContactId: true },
+            distinct: ["ghlContactId"],
+          })
+        : Promise.resolve(null),
+    ]);
     const scopedBusinessIds = scopedAssignments?.map((row) => row.businessId);
-    const scopedGhlOpportunities = scope.repId
-      ? await prisma.commandGhlOpportunity.findMany({
-          where: {
-            isActive: true,
-            assignedToGhlId: scope.repGhlUserId ?? "__unmapped_rep__",
-            ghlContactId: { not: null },
-          },
-          select: { ghlContactId: true },
-          distinct: ["ghlContactId"],
-        })
-      : null;
     const scopedGhlContactIds = scopedGhlOpportunities?.flatMap((row) =>
       row.ghlContactId ? [row.ghlContactId] : [],
     );
@@ -603,19 +635,17 @@ export async function getCommandDeals(
         }];
       });
 
-    sendSuccess(
-      res,
-      {
-        scope: scope.repId ? "rep" : "company",
-        correctionsEnabled: Boolean(decisions.provider_override_policy),
-        serviceOptions: services
-          .filter((service) => service.isActive)
-          .map((service) => ({ id: service.id, name: service.name })),
-        subscriptions: [...subscriptions, ...ghlRecurring],
-        oneTime: [...oneTime, ...ghlOneTime],
-      },
-      "Command deals",
-    );
+    const payload = {
+      scope: scope.repId ? "rep" : "company",
+      correctionsEnabled: Boolean(decisions.provider_override_policy),
+      serviceOptions: services
+        .filter((service) => service.isActive)
+        .map((service) => ({ id: service.id, name: service.name })),
+      subscriptions: [...subscriptions, ...ghlRecurring],
+      oneTime: [...oneTime, ...ghlOneTime],
+    };
+    await writeCommandCache(cacheKey, payload, 60);
+    sendSuccess(res, payload, "Command deals");
   } catch (error) {
     sendError(res, "Failed to load Command deals", 500, error);
   }

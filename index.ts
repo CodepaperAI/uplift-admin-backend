@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import compression from "compression";
 import cookieParser from "cookie-parser";
 import cors from "cors";
 import express, {
@@ -39,6 +40,24 @@ export function createApp(): Application {
   app.set("trust proxy", 1);
   app.use(securityHeaders);
 
+  /**
+   * Every response on this API is JSON, and the panel's JSON is repetitive
+   * enough to compress by roughly an order of magnitude: the Command overview
+   * ships a few hundred roster rows whose keys repeat on every one.
+   *
+   * This sits ahead of the routers so it covers all of them rather than the
+   * handful anyone thought to wrap. Node's fetch — which is what both the Vercel
+   * server components and the panel relay use — already sends
+   * `accept-encoding: gzip, deflate` and decodes transparently, so no caller
+   * changes with it. `compression` sets `Vary: Accept-Encoding` itself, which
+   * matters because a cache in front of this must not hand a gzipped body to a
+   * client that did not ask for one.
+   *
+   * The 1 KB floor is the library default and the right one: below it the gzip
+   * header costs more than the saving.
+   */
+  app.use(compression({ threshold: 1024 }));
+
   const allowedOrigins = configuredCorsOrigins();
   app.use(
     cors({
@@ -60,6 +79,26 @@ export function createApp(): Application {
     const startedAt = performance.now();
     const requestId = req.header("x-request-id")?.trim() || randomUUID();
     res.setHeader("X-Request-Id", requestId);
+    /**
+     * How long the server itself took, on the response.
+     *
+     * The `finish` handler below cannot carry this: it runs after the headers
+     * are on the wire. Wrapping `writeHead` is the last moment a header can
+     * still be added, which makes the number available to anyone holding the
+     * response — `curl -D -`, browser devtools — instead of only to whoever can
+     * read CloudWatch. Separating server time from network time is most of
+     * diagnosing "the panel feels slow".
+     */
+    const writeHead = res.writeHead.bind(res);
+    res.writeHead = ((...args: Parameters<typeof writeHead>) => {
+      if (!res.headersSent) {
+        res.setHeader(
+          "Server-Timing",
+          `app;dur=${Math.round((performance.now() - startedAt) * 10) / 10}`,
+        );
+      }
+      return writeHead(...args);
+    }) as typeof res.writeHead;
     res.on("finish", () => {
       console.info(
         JSON.stringify({
