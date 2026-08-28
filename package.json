@@ -68,7 +68,7 @@
     "dev": "bun --watch index.ts",
     "start": "bun index.ts",
     "prisma:generate": "prisma generate",
-    "test:surface": "bun test tests/*.test.ts src/tests/command-*.test.ts src/tests/single-flight-memo.test.ts src/tests/tenant-response-cache-security.test.ts src/tests/superadmin-daily-metrics.test.ts src/tests/cache-json-response.test.ts src/tests/provider-cache.test.ts"
+    "test:surface": "bun test tests/*.test.ts src/tests/command-*.test.ts src/tests/single-flight-memo.test.ts src/tests/tenant-response-cache-security.test.ts src/tests/superadmin-daily-metrics.test.ts src/tests/cache-json-response.test.ts src/tests/provider-cache.test.ts src/tests/like-pattern.test.ts"
   },
   "dependencies": {
     "@prisma/adapter-pg": "7.9.1",

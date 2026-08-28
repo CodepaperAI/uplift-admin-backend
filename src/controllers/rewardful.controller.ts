@@ -1,4 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
+import { escapeLikePattern } from "../utils/like-pattern";
 import type { Prisma } from "@prisma/client";
 import type { Request, Response } from "express";
 import { prisma } from "../config/db.config";
@@ -262,11 +263,14 @@ function buildAttributionWhere(req: Request): Prisma.RewardfulAttributionWhereIn
   }
 
   if (search) {
+    // Escaped: `contains` compiles to ILIKE and Prisma passes the value through,
+    // so `_` and `%` typed into a search box were acting as wildcards.
+    const searchTerm = escapeLikePattern(search);
     const userSearch: Prisma.RewardfulAttributionWhereInput = {
       user: {
         OR: [
-          { email: { contains: search, mode: "insensitive" } },
-          { name: { contains: search, mode: "insensitive" } },
+          { email: { contains: searchTerm, mode: "insensitive" } },
+          { name: { contains: searchTerm, mode: "insensitive" } },
         ],
       },
     };

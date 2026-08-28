@@ -1,4 +1,5 @@
 import type { Response } from "express";
+import { escapeLikePattern } from "../utils/like-pattern";
 import Stripe from "stripe";
 import type { AuthenticatedRequest } from "../middleware/require-backend-auth";
 import { prisma } from "../config/db.config";
@@ -448,12 +449,23 @@ export async function getSuperadminBillingDashboard(
 
     const businesses = await prisma.business.findMany({
       where: {
+        // Escaped: `contains` compiles to ILIKE and Prisma passes the value
+        // through, so `_` and `%` in a search box were acting as wildcards.
         ...(search
           ? {
               OR: [
-                { businessName: { contains: search, mode: "insensitive" } },
-                { businessWebsiteUrl: { contains: search, mode: "insensitive" } },
-                { User: { email: { contains: search, mode: "insensitive" } } },
+                { businessName: { contains: escapeLikePattern(search), mode: "insensitive" } },
+                {
+                  businessWebsiteUrl: {
+                    contains: escapeLikePattern(search),
+                    mode: "insensitive",
+                  },
+                },
+                {
+                  User: {
+                    email: { contains: escapeLikePattern(search), mode: "insensitive" },
+                  },
+                },
               ],
             }
           : {}),

@@ -4,6 +4,7 @@ import { z } from "zod";
 import Stripe from "stripe";
 import type { AuthenticatedRequest } from "../middleware/require-backend-auth";
 import { prisma } from "../config/db.config";
+import { escapeLikePattern } from "../utils/like-pattern";
 import { createSingleFlightMemo } from "../utils/single-flight-memo";
 import { getCoreInngestMetrics } from "../services/admin-inngest-metrics-relay.service";
 import { estimateUsdFromStoredUsage } from "../services/llm-usage.service";
@@ -536,9 +537,13 @@ async function computeMetricsUsersDataset(input: {
 
   const where: Prisma.UserWhereInput = {};
   if (search !== "") {
+    // Escaped, because `contains` compiles to ILIKE and Prisma does not escape
+    // the value: an underscore was matching any character and a bare `%`
+    // matched every user on record.
+    const term = escapeLikePattern(search);
     where.OR = [
-      { name: { contains: search, mode: "insensitive" } },
-      { email: { contains: search, mode: "insensitive" } },
+      { name: { contains: term, mode: "insensitive" } },
+      { email: { contains: term, mode: "insensitive" } },
     ];
   }
 
