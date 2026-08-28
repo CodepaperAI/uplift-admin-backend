@@ -36,23 +36,52 @@ const LIVE_STATUSES = ["trialing", "active", "past_due"];
  */
 const SIGNUP_ROW_CAP = 500;
 
-/** A day or a span of them, defaulting to today in Toronto. */
-function parseSignupRange(query: Request["query"]) {
+/** How far back an all-time request may reach before it is refused outright. */
+const MAX_RANGE_DAYS = 400;
+
+/**
+ * A day or a span of them, defaulting to today in Toronto.
+ *
+ * `scope=all` asks for every signup on record. It is a distinct request rather
+ * than a very wide `from`, because the caller does not know when the first
+ * signup was and should not have to guess: a hardcoded floor date is wrong the
+ * day someone imports older accounts, and a floor of "400 days ago" silently
+ * answers a narrower question than the one asked. The earliest signup is looked
+ * up instead, so the range is exactly as wide as the data.
+ */
+async function parseSignupRange(query: Request["query"]) {
   const text = (value: unknown): string | null =>
     typeof value === "string" && value.trim() !== "" ? value.trim() : null;
   const today = commandDayForDate(new Date());
   // `date` stays supported: it is what the single-day links already carry.
   const single = text(query.date);
-  const from = single ?? text(query.from) ?? today;
+  const allTime = text(query.scope) === "all";
+
+  let from = single ?? text(query.from) ?? today;
   const to = single ?? text(query.to) ?? today;
+
+  if (allTime) {
+    const earliest = await prisma.user.findFirst({
+      orderBy: { createdAt: "asc" },
+      select: { createdAt: true },
+    });
+    // No users at all is a legitimate answer, not an error: the range collapses
+    // to today and the page reports nought rather than failing.
+    from = earliest ? commandDayForDate(earliest.createdAt) : today;
+  }
+
   try {
     const range = commandDayRange(from, to);
-    if (range.dayCount > 400) {
+    if (range.dayCount > MAX_RANGE_DAYS) {
       return {
-        error: new Error("Range cannot exceed 400 days"),
+        error: new Error(
+          allTime
+            ? `All-time is ${range.dayCount} days, past the ${MAX_RANGE_DAYS}-day ceiling this endpoint scans. Narrow the dates.`
+            : `Range cannot exceed ${MAX_RANGE_DAYS} days`,
+        ),
       } as const;
     }
-    return { range } as const;
+    return { range, allTime } as const;
   } catch (error) {
     return { error } as const;
   }
@@ -63,7 +92,7 @@ export async function getCommandDailySignups(
   res: Response,
 ): Promise<void> {
   try {
-    const parsed = parseSignupRange(req.query);
+    const parsed = await parseSignupRange(req.query);
     if ("error" in parsed) {
       sendError(res, "Invalid date range", 400, parsed.error);
       return;
