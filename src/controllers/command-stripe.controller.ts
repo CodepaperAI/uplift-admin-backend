@@ -831,6 +831,21 @@ export async function getCommandStripeOverview(
         include: { ownerRep: { select: { id: true, name: true } } },
       }),
     ]);
+    /**
+     * The roster grouped by customer, once.
+     *
+     * The payload build below walked the whole roster again for each customer on
+     * the page — two hundred and fifty scans of a few hundred rows to produce
+     * two hundred and fifty groups. The read is already ordered by customer and
+     * then by event time, and grouping preserves both.
+     */
+    const rosterByCustomerId = new Map<string, typeof roster>();
+    for (const row of roster) {
+      if (!row.stripeCustomerId) continue;
+      const list = rosterByCustomerId.get(row.stripeCustomerId) ?? [];
+      list.push(row);
+      rosterByCustomerId.set(row.stripeCustomerId, list);
+    }
     const userById = new Map(users.map((user) => [user.id, user]));
     const businessById = new Map(
       businesses.map((business) => [business.id, business]),
@@ -1716,9 +1731,7 @@ export async function getCommandStripeOverview(
           total: accountRows.length,
         }),
         roster: rosterCustomerIds.map((stripeCustomerId) => {
-          const subscriptions = roster.filter(
-            (row) => row.stripeCustomerId === stripeCustomerId,
-          );
+          const subscriptions = rosterByCustomerId.get(stripeCustomerId) ?? [];
           const first = subscriptions[0];
           const account = commandAccountByStripeCustomerId.get(stripeCustomerId);
           const mrrMinorByCurrency = new Map<string, Prisma.Decimal>();
@@ -2145,7 +2158,8 @@ export async function getCommandStripeLifecycle(
       occurredAt: true,
     } as const;
 
-    const [inRange, liveSubscriptions, createdEventRefs] = await Promise.all([
+    const [inRange, liveSubscriptions, createdEventRefs, oldestReal] =
+      await Promise.all([
       prisma.commandStripeSubscriptionEvent.findMany({
         where: {
           occurredAt: { gte: range.start, lt: range.end },
@@ -2162,6 +2176,16 @@ export async function getCommandStripeLifecycle(
         where: { eventType: SUBSCRIPTION_CREATED_EVENT },
         distinct: ["stripeSubscriptionId"],
         select: { stripeSubscriptionId: true },
+      }),
+      // The oldest believable event overall, so the panel can say where the
+      // series genuinely begins rather than implying it covers all history.
+      // Depends on nothing above it; it used to be awaited two reads later.
+      prisma.commandStripeSubscriptionEvent.findFirst({
+        where: {
+          eventType: { in: [SUBSCRIPTION_CREATED_EVENT, SUBSCRIPTION_DELETED_EVENT] },
+        },
+        select: { occurredAt: true },
+        orderBy: { occurredAt: "asc" },
       }),
     ]);
 
@@ -2185,16 +2209,6 @@ export async function getCommandStripeLifecycle(
           orderBy: { occurredAt: "asc" },
         })
       : [];
-
-    // The oldest believable event overall, so the panel can say where the
-    // series genuinely begins rather than implying it covers all history.
-    const oldestReal = await prisma.commandStripeSubscriptionEvent.findFirst({
-      where: {
-        eventType: { in: [SUBSCRIPTION_CREATED_EVENT, SUBSCRIPTION_DELETED_EVENT] },
-      },
-      select: { occurredAt: true },
-      orderBy: { occurredAt: "asc" },
-    });
 
     const lifecycle = buildStripeLifecycle({
       events: [...inRange, ...priorValues],
@@ -2271,26 +2285,33 @@ export async function getCommandStripePlanMix(
       return;
     }
 
-    const plans = await getUpliftPlanDefinitions();
+    /**
+     * The plan labels and every subscription ever seen. Neither needs the other,
+     * and the labels reach Stripe, so awaiting them one after the other put a
+     * provider round trip in front of a database read for nothing.
+     *
+     * Snapshots are unscoped on purpose: a core plan the customer cancelled in
+     * March is exactly what makes an August social subscription an upgrade
+     * rather than a first purchase.
+     */
+    const [plans, allSnapshots] = await Promise.all([
+      getUpliftPlanDefinitions(),
+      prisma.commandStripeSubscriptionSnapshot.findMany({
+        select: {
+          stripeSubscriptionId: true,
+          stripeCustomerId: true,
+          status: true,
+          stripePriceIds: true,
+          monthlyRecurringMinor: true,
+          currency: true,
+        },
+      }),
+    ]);
     const socialPriceIds = new Set(
       plans
         .filter((plan) => /social/i.test(plan.name))
         .map((plan) => plan.priceId),
     );
-
-    // Every subscription ever seen, not only the live ones: a core plan the
-    // customer cancelled in March is exactly what makes an August social
-    // subscription an upgrade rather than a first purchase.
-    const allSnapshots = await prisma.commandStripeSubscriptionSnapshot.findMany({
-      select: {
-        stripeSubscriptionId: true,
-        stripeCustomerId: true,
-        status: true,
-        stripePriceIds: true,
-        monthlyRecurringMinor: true,
-        currency: true,
-      },
-    });
     const snapshots = allSnapshots.filter((row) =>
       LIFECYCLE_LIVE_STATUSES.includes(row.status),
     );

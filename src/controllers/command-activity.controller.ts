@@ -27,30 +27,43 @@ export async function getCommandActivity(req: Request, res: Response): Promise<v
       sendError(res, "Activity access required", 403);
       return;
     }
-    const reps = await prisma.commandRepProfile.findMany({
-      where: { isActive: true, ...(allowedRepIds ? { id: { in: allowedRepIds } } : {}) },
-      select: { id: true, name: true, ghlUserId: true },
-      orderBy: { name: "asc" },
-    });
+    // The won-opportunity tally is scoped by month, not by rep, so it never
+    // needed to wait for the rep list. Only `entries` does.
+    const [reps, wonByGhlUser] = await Promise.all([
+      prisma.commandRepProfile.findMany({
+        where: { isActive: true, ...(allowedRepIds ? { id: { in: allowedRepIds } } : {}) },
+        select: { id: true, name: true, ghlUserId: true },
+        orderBy: { name: "asc" },
+      }),
+      prisma.commandGhlOpportunity.groupBy({
+        by: ["assignedToGhlId"],
+        where: {
+          isActive: true,
+          status: "won",
+          assignedToGhlId: { not: null },
+          lastStatusChangeAt: { gte: period.start, lt: period.end },
+        },
+        _count: { _all: true },
+      }),
+    ]);
     const repIds = reps.map((rep) => rep.id);
-    const entries = await prisma.commandRepActivity.findMany({
-      where: { repId: { in: repIds }, periodMonth },
-      orderBy: [{ repId: "asc" }, { source: "asc" }],
-    });
-    const wonByGhlUser = await prisma.commandGhlOpportunity.groupBy({
-      by: ["assignedToGhlId"],
-      where: {
-        isActive: true,
-        status: "won",
-        assignedToGhlId: { not: null },
-        lastStatusChangeAt: { gte: period.start, lt: period.end },
-      },
-      _count: { _all: true },
-    });
+    const entries = repIds.length
+      ? await prisma.commandRepActivity.findMany({
+          where: { repId: { in: repIds }, periodMonth },
+          orderBy: [{ repId: "asc" }, { source: "asc" }],
+        })
+      : [];
     const wonCounts = new Map(wonByGhlUser.map((row) => [row.assignedToGhlId, row._count._all]));
+    // Grouped once instead of re-scanned per rep inside the map below.
+    const entriesByRepId = new Map<string, typeof entries>();
+    for (const entry of entries) {
+      const list = entriesByRepId.get(entry.repId) ?? [];
+      list.push(entry);
+      entriesByRepId.set(entry.repId, list);
+    }
 
     const rows = reps.map((rep) => {
-      const sources = entries.filter((entry) => entry.repId === rep.id);
+      const sources = entriesByRepId.get(rep.id) ?? [];
       const effective = sources.find((entry) => entry.source === "manual") ?? sources.find((entry) => entry.source === "ghl_sync") ?? null;
       const counts = effective ?? { calls: 0, connects: 0, meetingsBooked: 0, meetingsHeld: 0 };
       const closes = rep.ghlUserId ? wonCounts.get(rep.ghlUserId) ?? 0 : 0;

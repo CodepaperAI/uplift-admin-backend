@@ -9,6 +9,18 @@ function positiveInteger(value: unknown): number | null {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
+/**
+ * A ceiling on `page`, because `skip` becomes a SQL OFFSET.
+ *
+ * `pageSize` was always clamped; `page` was not, so `?page=999999999` produced
+ * an offset of a quarter of a trillion. PostgreSQL answers that by walking and
+ * discarding every row up to the offset, and at a large enough page the
+ * multiplication leaves the safe-integer range and stops being an integer at
+ * all. Ten thousand pages is far past any real roster and keeps the offset
+ * bounded no matter what arrives in the query string.
+ */
+const MAX_PAGE = 10_000;
+
 export function parseCommandPagination(input: {
   page?: unknown;
   pageSize?: unknown;
@@ -20,7 +32,7 @@ export function parseCommandPagination(input: {
     maxPageSize,
     Math.max(1, input.defaultPageSize ?? 50),
   );
-  const page = positiveInteger(input.page) ?? 1;
+  const page = Math.min(MAX_PAGE, positiveInteger(input.page) ?? 1);
   const pageSize = Math.min(
     maxPageSize,
     positiveInteger(input.pageSize) ?? defaultPageSize,

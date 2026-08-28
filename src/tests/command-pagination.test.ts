@@ -45,3 +45,40 @@ describe("Command pagination", () => {
     ).toEqual({ page: 1, pageSize: 50, total: 0, totalPages: 1 });
   });
 });
+
+describe("parseCommandPagination page ceiling", () => {
+  it("clamps an absurd page so the offset stays bounded", () => {
+    const { page, skip } = parseCommandPagination({
+      page: "999999999",
+      pageSize: "250",
+      maxPageSize: 500,
+    });
+    expect(page).toBe(10_000);
+    expect(skip).toBe(9_999 * 250);
+    expect(Number.isSafeInteger(skip)).toBe(true);
+  });
+
+  it("leaves a realistic page alone", () => {
+    expect(parseCommandPagination({ page: "3", pageSize: "50" })).toEqual({
+      page: 3,
+      pageSize: 50,
+      skip: 100,
+    });
+  });
+
+  it("still rejects a non-numeric or negative page", () => {
+    expect(parseCommandPagination({ page: "-4" }).page).toBe(1);
+    expect(parseCommandPagination({ page: "abc" }).page).toBe(1);
+    expect(parseCommandPagination({ page: "0" }).page).toBe(1);
+  });
+
+  it("keeps skip an integer at the ceiling with the largest page size", () => {
+    const { skip } = parseCommandPagination({
+      page: String(Number.MAX_SAFE_INTEGER),
+      pageSize: "500",
+      maxPageSize: 500,
+    });
+    expect(Number.isSafeInteger(skip)).toBe(true);
+    expect(skip).toBe(9_999 * 500);
+  });
+});
