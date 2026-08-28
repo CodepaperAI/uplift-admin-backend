@@ -4,6 +4,7 @@ import { z } from "zod";
 import Stripe from "stripe";
 import type { AuthenticatedRequest } from "../middleware/require-backend-auth";
 import { prisma } from "../config/db.config";
+import { createSingleFlightMemo } from "../utils/single-flight-memo";
 import { getCoreInngestMetrics } from "../services/admin-inngest-metrics-relay.service";
 import { estimateUsdFromStoredUsage } from "../services/llm-usage.service";
 import { sendError, sendSuccess } from "../utils/response.utils";
@@ -495,28 +496,29 @@ type MetricsUsersDataset = {
   };
 };
 
-async function loadMetricsUsersDataset(input: {
-  page: number;
-  limit: number;
+/**
+ * Every user the filters admit, normalised, plus the summary over them.
+ *
+ * Independent of `page` and `limit` on purpose. The status and onboarding
+ * filters and the whole summary are computed here in TypeScript rather than in
+ * SQL — `subscriptionStatus` is derived from a trial date, a website status and
+ * a website subscription together, and the onboarding state from a session
+ * history — so the rows have to be built before they can be counted or
+ * filtered. That is why a page of a hundred costs the whole table.
+ *
+ * Given that, the answer is not to do it per page. Paging is a slice of this,
+ * and `metricsUsersDatasetMemo` below makes the twenty-page corpus walk pay for
+ * it once.
+ */
+async function computeMetricsUsersDataset(input: {
   search?: string;
   status?: UserSubscriptionStatus;
   onboarding?: AdminOnboardingFilter;
   maxRows?: number;
-}): Promise<MetricsUsersDataset> {
-  const page = Math.max(1, input.page);
-  // The 100 clamp existed to stop a caller asking for the whole table through
-  // a paginated endpoint. The validator now caps the public surface at 2000, so
-  // this clamps to the same number rather than silently returning a hundred
-  // rows to a caller that asked for five hundred — a silent short page is
-  // worse than a rejected request.
-  const limit =
-    input.maxRows !== undefined
-      ? Math.max(1, input.limit)
-      : Math.min(2000, Math.max(1, input.limit));
+}) {
   const search = input.search?.trim() ?? "";
   const statusFilter = input.status;
   const onboardingFilter = input.onboarding;
-  const skip = (page - 1) * limit;
   const now = new Date();
 
   const where: Prisma.UserWhereInput = {};
@@ -786,6 +788,59 @@ async function loadMetricsUsersDataset(input: {
       }
     }
   }
+
+  return { filteredUsers, summary };
+}
+
+/**
+ * Twenty seconds, which is what a corpus walk plus a reader moving between the
+ * panel pages that share it occupies. Long enough to collapse the walk, short
+ * enough that a superadmin who just changed something sees it on their next
+ * look rather than wondering why the list is stale.
+ *
+ * Four keys: the filter combinations one reader realistically has open at once.
+ */
+const metricsUsersDatasetMemo = createSingleFlightMemo<
+  Awaited<ReturnType<typeof computeMetricsUsersDataset>>
+>({ ttlMs: 20_000, maxEntries: 4 });
+
+async function loadMetricsUsersDataset(input: {
+  page: number;
+  limit: number;
+  search?: string;
+  status?: UserSubscriptionStatus;
+  onboarding?: AdminOnboardingFilter;
+  maxRows?: number;
+}): Promise<MetricsUsersDataset> {
+  const page = Math.max(1, input.page);
+  // The 100 clamp existed to stop a caller asking for the whole table through
+  // a paginated endpoint. The validator now caps the public surface at 2000, so
+  // this clamps to the same number rather than silently returning a hundred
+  // rows to a caller that asked for five hundred — a silent short page is
+  // worse than a rejected request.
+  const limit =
+    input.maxRows !== undefined
+      ? Math.max(1, input.limit)
+      : Math.min(2000, Math.max(1, input.limit));
+  const skip = (page - 1) * limit;
+  const filters = {
+    search: input.search?.trim() ?? "",
+    status: input.status,
+    onboarding: input.onboarding,
+    maxRows: input.maxRows,
+  };
+  /**
+   * The export path takes its own row cap and is a one-off download, so it does
+   * not share a key with the paginated reads and does not want to be held for
+   * twenty seconds either.
+   */
+  const { filteredUsers, summary } =
+    input.maxRows !== undefined
+      ? await computeMetricsUsersDataset(filters)
+      : await metricsUsersDatasetMemo.get(
+          JSON.stringify([filters.search, filters.status ?? "", filters.onboarding ?? ""]),
+          () => computeMetricsUsersDataset(filters),
+        );
 
   const items = filteredUsers
     .slice(skip, skip + limit)

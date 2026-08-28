@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { requireAdminSession } from "../middleware/require-admin-session";
 import { requireSuperAdmin } from "../middleware/require-superadmin";
+import { cacheJsonResponse } from "../middleware/cache-json-response";
 import {
   listAgencies,
   createAgency,
@@ -60,6 +61,11 @@ import {
   retryRewardfulWebhookEvent,
 } from "../controllers/rewardful.controller";
 
+/**
+ * Ninety seconds, matching the Command panel's own analytics reads.
+ */
+const SUPERADMIN_ANALYTICS_TTL_SECONDS = 90;
+
 const SuperAdminRouter: Router = Router();
 
 SuperAdminRouter.use(requireAdminSession);
@@ -70,23 +76,87 @@ SuperAdminRouter.post("/", createAgency);
 
 SuperAdminRouter.get("/audit-log", getAdminAuditLog);
 
-SuperAdminRouter.get("/metrics/overview", getMetricsOverview);
+/**
+ * Response caching for the platform analytics reads.
+ *
+ * Every route below answers the same question for every superadmin — these are
+ * platform-wide figures, and the caller appears nowhere in the response — so the
+ * URL is a complete cache key. That is the precondition `cacheJsonResponse`
+ * documents, and it is asserted here per route rather than mounted on the router
+ * so that adding a caller-dependent endpoint cannot inherit caching by accident.
+ *
+ * Ninety seconds. These back trend charts, not operational alarms; the panel's
+ * freshness indicators come from the sync-run tables, which are not cached here.
+ *
+ * Deliberately not cached:
+ * - `/metrics/inngest`, which reports live infrastructure state.
+ * - `/audit-log`, which someone reads precisely to see what just happened.
+ * - the two `/export` routes, which are one-off CSV downloads, not JSON.
+ * - `/metrics/users`, which is memoised inside the controller instead: the
+ *   panel pages through it, so the win there is collapsing the concurrent pages
+ *   of one walk onto a single computation, which needs the in-flight promise and
+ *   not a finished payload.
+ */
+const cacheAnalytics = (name: string) =>
+  cacheJsonResponse({ name, ttlSeconds: SUPERADMIN_ANALYTICS_TTL_SECONDS });
+
+SuperAdminRouter.get(
+  "/metrics/overview",
+  cacheAnalytics("overview"),
+  getMetricsOverview,
+);
 SuperAdminRouter.get("/metrics/revenue-summary", getMetricsRevenueSummary);
-SuperAdminRouter.get("/metrics/attribution", getMetricsAttribution);
+SuperAdminRouter.get(
+  "/metrics/attribution",
+  cacheAnalytics("attribution"),
+  getMetricsAttribution,
+);
 SuperAdminRouter.get("/metrics/inngest", getMetricsInngest);
 SuperAdminRouter.get("/metrics/llm-usage/export", exportMetricsLlmUsageCsv);
-SuperAdminRouter.get("/metrics/llm-usage", getMetricsLlmUsage);
-SuperAdminRouter.get("/metrics/api-tokens", getMetricsApiTokens);
-SuperAdminRouter.get("/metrics/blogs/daily", getMetricsBlogsDaily);
-SuperAdminRouter.get("/metrics/payments/daily", getMetricsPaymentsDaily);
-SuperAdminRouter.get("/metrics/blog-generation", getMetricsBlogGeneration);
+SuperAdminRouter.get(
+  "/metrics/llm-usage",
+  cacheAnalytics("llm-usage"),
+  getMetricsLlmUsage,
+);
+SuperAdminRouter.get(
+  "/metrics/api-tokens",
+  cacheAnalytics("api-tokens"),
+  getMetricsApiTokens,
+);
+SuperAdminRouter.get(
+  "/metrics/blogs/daily",
+  cacheAnalytics("blogs-daily"),
+  getMetricsBlogsDaily,
+);
+SuperAdminRouter.get(
+  "/metrics/payments/daily",
+  cacheAnalytics("payments-daily"),
+  getMetricsPaymentsDaily,
+);
+SuperAdminRouter.get(
+  "/metrics/blog-generation",
+  cacheAnalytics("blog-generation"),
+  getMetricsBlogGeneration,
+);
 SuperAdminRouter.get("/metrics/users", getMetricsUsers);
-SuperAdminRouter.get("/metrics/monthly-performance", getMetricsMonthlyPerformance);
-SuperAdminRouter.get("/metrics/users/daily", getMetricsUsersDaily);
+SuperAdminRouter.get(
+  "/metrics/monthly-performance",
+  cacheAnalytics("monthly-performance"),
+  getMetricsMonthlyPerformance,
+);
+SuperAdminRouter.get(
+  "/metrics/users/daily",
+  cacheAnalytics("users-daily"),
+  getMetricsUsersDaily,
+);
 SuperAdminRouter.get("/metrics/users/export", exportMetricsUsers);
 SuperAdminRouter.get("/metrics/users/:userId", getMetricsUserDetail);
 
-SuperAdminRouter.get("/rewardful/summary", getRewardfulAdminSummary);
+SuperAdminRouter.get(
+  "/rewardful/summary",
+  cacheAnalytics("rewardful-summary"),
+  getRewardfulAdminSummary,
+);
 SuperAdminRouter.get("/rewardful/attributions", listRewardfulAttributions);
 SuperAdminRouter.get("/rewardful/events", listRewardfulWebhookEvents);
 SuperAdminRouter.get("/rewardful/sales", listRewardfulSalesAndConversions);
