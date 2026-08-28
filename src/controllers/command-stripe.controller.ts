@@ -2730,28 +2730,32 @@ export async function getCommandStripeMonthMovement(
     /**
      * The three reads that need something the wave above produced.
      *
-     * Signups per month, counted rather than transferred. This was
-     * `prisma.user.findMany` over the entire table — five fields per account —
-     * so a loop here could bucket them by month and add them up. Counting is an
-     * aggregate: the transfer grew with every signup while the answer stayed at
-     * most twenty-four numbers.
+     * Signup dates, one column, bucketed by the same `commandMonthForDate` the
+     * rest of this chart uses. This read used to carry five fields per account —
+     * name, email and phone as well — because it doubled as the identity source
+     * for the churn call list. Those now come from the scoped read beside it, so
+     * only the date is left.
      *
-     * One `count` per month in the span, using the same `commandMonthRange` that
-     * produces every other boundary on this chart. A single grouped query would
-     * mean expressing a Toronto month boundary in SQL — `createdAt` is
-     * `TIMESTAMP(3)`, naive UTC, so that is a double `AT TIME ZONE` conversion
-     * whose correctness across a DST change cannot be checked without a
-     * PostgreSQL to run it against. Reusing the tested helper cannot be wrong
-     * about the boundary, the span is hard-capped at
-     * MOVEMENT_HISTORY_MAX_MONTHS, and these are indexed counts that return a
-     * number each.
+     * It is deliberately still one scan rather than a `count` per month. There
+     * is no index on `user.createdAt` — the only index on that table is the
+     * unique one on email, checked against the generated DDL — so twenty-four
+     * range counts would be twenty-four sequential scans where this is one, and
+     * this repository does not own the schema to add the index. A single
+     * `date_trunc` GROUP BY would also be one scan, but a Toronto month boundary
+     * in SQL means a double `AT TIME ZONE` conversion over a `TIMESTAMP(3)`
+     * column, and there is no PostgreSQL here to prove that correct across a DST
+     * change. One scan of one column, bucketed by the tested helper, is the
+     * version that is both cheap and provably right.
+     *
+     * If `@@index([createdAt])` ever lands on User in the canonical schema, the
+     * per-month counts become the better shape and this becomes a two-line
+     * change. Recorded in docs/command-panel/backend-asks.md.
      *
      * Names and numbers for the call list, for the accounts that can reach it —
      * not for every account on record. The identity loop below reads these maps
      * only by the ids carried on `snapshots`, a few hundred subscriptions, and
      * both tables used to be read whole to build them.
      */
-    const historyMonths = commandMonthSpan(historyFrom, month);
     const identityUserIds = [
       ...new Set(
         snapshots.flatMap((snapshot) => (snapshot.userId ? [snapshot.userId] : [])),
@@ -2764,17 +2768,9 @@ export async function getCommandStripeMonthMovement(
         ),
       ),
     ];
-    const [signupCountEntries, userRows, businessRows, upliftPlanNames] =
+    const [signupDateRows, userRows, businessRows, upliftPlanNames] =
       await Promise.all([
-        Promise.all(
-          historyMonths.map(async (historyMonth) => {
-            const monthRange = commandMonthRange(historyMonth);
-            const count = await prisma.user.count({
-              where: { createdAt: { gte: monthRange.start, lt: monthRange.end } },
-            });
-            return [historyMonth, count] as const;
-          }),
-        ),
+        prisma.user.findMany({ select: { createdAt: true } }),
         identityUserIds.length
           ? prisma.user.findMany({
               where: { id: { in: identityUserIds } },
@@ -2789,7 +2785,6 @@ export async function getCommandStripeMonthMovement(
           : Promise.resolve([]),
         getUpliftPlanDefinitions(),
       ]);
-    const signupCountsByMonth = new Map(signupCountEntries);
     /**
      * GHL payments, net of refunds, minus anything that is the same money twice.
      *
@@ -2831,7 +2826,7 @@ export async function getCommandStripeMonthMovement(
       cancellations,
       failedInvoices,
       ghlCollected,
-      signupCountsByMonth,
+      signups: signupDateRows.map((row) => ({ at: row.createdAt })),
       collected: settledInvoiceRows.flatMap((row) =>
         row.paidAt
           ? [
