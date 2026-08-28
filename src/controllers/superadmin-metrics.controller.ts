@@ -67,6 +67,19 @@ const LLM_USAGE_QUERY = PAGINATION_QUERY.extend({
   userId: z.string().uuid().optional(),
 });
 
+/**
+ * The window used when a caller names neither end of the range. Thirty days
+ * matches the window `metrics/overview` already reads for its usage summary.
+ */
+const LLM_USAGE_DEFAULT_WINDOW_DAYS = 30;
+
+/**
+ * How many events one request will load. Well above the twenty-five a page
+ * shows and above a normal month, so truncation is an unusual-density signal
+ * rather than a routine one.
+ */
+const LLM_USAGE_MAX_ROWS = 20_000;
+
 const LLM_USAGE_EXPORT_QUERY = z.object({
   from: z.string().optional(),
   to: z.string().optional(),
@@ -1194,8 +1207,29 @@ export async function getMetricsLlmUsage(
       return;
     }
     const { page, limit, purpose, model, businessId, userId } = q.data;
-    const from = parseOptionalDate(q.data.from);
+    /**
+     * A window, always.
+     *
+     * `LlmUsageEvent` gets a row per model call, so it is the fastest-growing
+     * table here by a wide margin — and this read loads every matching row, with
+     * its JSON metadata and a joined user and business, before slicing out a
+     * page of twenty-five. It has to: the summary and the image/AI-visibility
+     * classification are derived from that metadata in TypeScript, so the rows
+     * must exist before they can be counted.
+     *
+     * With both dates absent that was the entire table. The panel always sends a
+     * range, so the UI never reached it, but the route is relayed and one
+     * parameterless request could take the service down. Defaulting the window
+     * makes the unparameterised answer bounded and honest — the response says
+     * which window it used.
+     */
+    const requestedFrom = parseOptionalDate(q.data.from);
     const to = parseOptionalDate(q.data.to);
+    const from =
+      requestedFrom ??
+      (to === undefined
+        ? new Date(Date.now() - LLM_USAGE_DEFAULT_WINDOW_DAYS * 24 * 60 * 60 * 1000)
+        : undefined);
     const skip: number = (page - 1) * limit;
 
     const baseWhere = buildLlmUsageWhere({
@@ -1213,10 +1247,20 @@ export async function getMetricsLlmUsage(
       userId,
     });
 
-    const [allRows, modelOptions, customerOptions] = await Promise.all([
+    const [allRows, matchingCount, modelOptions, customerOptions] =
+      await Promise.all([
       prisma.llmUsageEvent.findMany({
         where: filteredWhere,
         orderBy: { createdAt: "desc" },
+        /**
+         * A ceiling underneath the window, in case the window is dense.
+         *
+         * Newest-first, so a truncated read keeps the rows a reader is most
+         * likely to want. The count beside it is the real total, so `truncated`
+         * below can say the summary covers part of the window rather than
+         * quietly reporting a smaller business than there is.
+         */
+        take: LLM_USAGE_MAX_ROWS,
         select: {
           id: true,
           createdAt: true,
@@ -1247,6 +1291,7 @@ export async function getMetricsLlmUsage(
           },
         },
       }),
+      prisma.llmUsageEvent.count({ where: filteredWhere }),
       prisma.llmUsageEvent.groupBy({
         by: ["model"],
         where: baseWhere,
@@ -1376,7 +1421,23 @@ export async function getMetricsLlmUsage(
       {
         page,
         limit,
-        total: allRows.length,
+        total: matchingCount,
+        /**
+         * Whether the figures below cover the whole window.
+         *
+         * `total` is the real count and the summary is computed over the rows
+         * actually loaded. When those differ, every aggregate here is a floor,
+         * not a total, and the reader is told so rather than shown a number that
+         * looks complete.
+         */
+        truncated: matchingCount > allRows.length,
+        loadedRowCount: allRows.length,
+        window: {
+          from: from?.toISOString() ?? null,
+          to: to?.toISOString() ?? null,
+          defaultedFrom: q.data.from === undefined && to === undefined,
+          defaultWindowDays: LLM_USAGE_DEFAULT_WINDOW_DAYS,
+        },
         aggregate: {
           eventCount: aggregate.eventCount,
           sumEstimatedUsd: aggregate.sumEstimatedUsd.toFixed(6),
