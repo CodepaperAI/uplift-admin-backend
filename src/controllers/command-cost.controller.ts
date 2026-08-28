@@ -4,9 +4,19 @@ import { aggregateCostMetrics } from "../command/cost-metrics";
 import { COMMAND_COST_INPUT } from "../command/cost-input";
 import {
   commandMonthRange,
+  commandMonthsEndingAt,
   currentCommandMonth,
 } from "../command/toronto-period";
+
+/**
+ * The window the cost trend shows, so a sync fills exactly what the
+ * profit-and-loss table can display.
+ */
+const LLM_COST_DEFAULT_MONTHS = 6;
+/** A ceiling, so one request cannot walk the entire event history. */
+const LLM_COST_MAX_MONTHS = 24;
 import { prisma } from "../config/db.config";
+import { syncLlmUsageCosts } from "../command/llm-cost-sync.service";
 import { inngest } from "../inngest/admin-client";
 import { isProviderManagedCostSource } from "../command/cost-source-policy";
 import {
@@ -343,6 +353,61 @@ export async function deleteCommandCost(
     sendSuccess(res, { id: existing.id }, "Cost entry deleted");
   } catch (error) {
     sendError(res, "Failed to delete cost entry", 500, error);
+  }
+}
+
+/**
+ * Records model spend into the cost ledger for a range of months.
+ *
+ * Synchronous, unlike the Meta Ads sync beside it, because that one calls an
+ * external API and this one is three grouped queries per month against a table
+ * we own. Queueing it would add a round trip and a place for the result to get
+ * lost, for no benefit.
+ *
+ * Defaults to the six months the cost trend displays, so the profit-and-loss
+ * table fills in rather than reporting "not recorded" for every month before
+ * costs were first kept by hand.
+ */
+export async function refreshCommandLlmCosts(
+  req: Request,
+  res: Response,
+): Promise<void> {
+  const requestedMonths = Array.isArray(req.body?.months)
+    ? req.body.months.filter((value: unknown): value is string => typeof value === "string")
+    : typeof req.body?.month === "string"
+      ? [req.body.month]
+      : commandMonthsEndingAt(currentCommandMonth(), LLM_COST_DEFAULT_MONTHS);
+  if (requestedMonths.length === 0 || requestedMonths.length > LLM_COST_MAX_MONTHS) {
+    sendError(
+      res,
+      `Request between 1 and ${LLM_COST_MAX_MONTHS} months`,
+      400,
+    );
+    return;
+  }
+  try {
+    for (const month of requestedMonths) commandMonthRange(month);
+    const months = await syncLlmUsageCosts({
+      months: requestedMonths,
+      actorUserId: req.authUserId ?? null,
+    });
+    // Cost figures are cached, and a sync that leaves the panel showing the old
+    // number reads as a sync that did not work.
+    await invalidateCommandCache();
+    sendSuccess(
+      res,
+      {
+        months,
+        totalsUsd: months
+          .reduce((sum, month) => sum + Number(month.totalUsd), 0)
+          .toFixed(2),
+      },
+      "LLM costs recorded",
+    );
+  } catch (error) {
+    const status =
+      error instanceof Error && error.message.includes("YYYY-MM") ? 400 : 500;
+    sendError(res, "Failed to record LLM costs", status, error);
   }
 }
 

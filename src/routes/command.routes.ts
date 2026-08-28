@@ -31,6 +31,7 @@ import {
   createCommandCost,
   deleteCommandCost,
   getCommandCosts,
+  refreshCommandLlmCosts,
   requestCommandMetaAdsSync,
   updateCommandCost,
 } from "../controllers/command-cost.controller";
@@ -174,6 +175,11 @@ CommandRouter.post(
   "/costs/meta-ads/sync",
   requireCommandCapability("edit.costs"),
   requestCommandMetaAdsSync,
+);
+CommandRouter.post(
+  "/costs/llm-usage/sync",
+  requireCommandCapability("edit.costs"),
+  refreshCommandLlmCosts,
 );
 CommandRouter.post(
   "/costs",
