@@ -4,6 +4,22 @@ import {
 } from "./command-cache";
 
 /**
+ * Where the envelope is kept. Injectable because the Command panel and the
+ * superadmin metrics use different cache scopes, and the policy above is the
+ * same for both.
+ */
+export type ProviderCacheStore = {
+  read: (namespace: string) => Promise<unknown>;
+  write: (namespace: string, value: unknown, ttlSeconds: number) => Promise<void>;
+};
+
+const commandProviderStore: ProviderCacheStore = {
+  read: (namespace) => readCommandProviderCache<unknown>(namespace),
+  write: (namespace, value, ttlSeconds) =>
+    writeCommandProviderCache(namespace, value, ttlSeconds),
+};
+
+/**
  * Stale-while-revalidate for third-party reads that take seconds.
  *
  * A plain TTL cache still makes somebody wait. The Command overview's Stripe
@@ -108,10 +124,13 @@ export async function readThroughProviderCache<T>(input: {
   compute: () => Promise<T>;
   /** Rejects an entry whose shape no longer matches, so it is refetched. */
   validate?: (value: unknown) => boolean;
+  /** Defaults to the Command provider scope. */
+  store?: ProviderCacheStore;
   now?: () => number;
 }): Promise<T> {
   const clock = input.now ?? (() => Date.now());
-  const cached = await readCommandProviderCache<unknown>(input.namespace);
+  const store = input.store ?? commandProviderStore;
+  const cached = await store.read(input.namespace);
 
   const write = async (value: T): Promise<void> => {
     const envelope: Envelope<T> = {
@@ -119,11 +138,7 @@ export async function readThroughProviderCache<T>(input: {
       value,
       softUntil: clock() + input.softTtlSeconds * 1000,
     };
-    await writeCommandProviderCache(
-      input.namespace,
-      envelope,
-      input.hardTtlSeconds,
-    );
+    await store.write(input.namespace, envelope, input.hardTtlSeconds);
   };
 
   const fetchAndStore = async (): Promise<T> => {
