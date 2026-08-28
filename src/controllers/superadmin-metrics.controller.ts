@@ -6,6 +6,7 @@ import type { AuthenticatedRequest } from "../middleware/require-backend-auth";
 import { prisma } from "../config/db.config";
 import { escapeLikePattern } from "../utils/like-pattern";
 import { createSingleFlightMemo } from "../utils/single-flight-memo";
+import { resilientBatchRead } from "../utils/resilient-batch-read";
 import { getCoreInngestMetrics } from "../services/admin-inngest-metrics-relay.service";
 import { estimateUsdFromStoredUsage } from "../services/llm-usage.service";
 import { sendError, sendSuccess } from "../utils/response.utils";
@@ -508,6 +509,7 @@ type MetricsUsersDataset = {
     totalOnboardingFailed: number;
     totalNeedsFollowUp: number;
   };
+  unreadableUserIds?: string[];
 };
 
 /**
@@ -591,12 +593,47 @@ async function computeMetricsUsersDataset(input: {
   });
 
   const userIds = users.map((user) => user.id);
-  const [quickScrapeSessions, trialAnalytics, onboardingBusinesses] =
+  /**
+   * These three reads go through `resilientBatchRead`.
+   *
+   * A single row Prisma cannot deserialise throws for the whole query, and one
+   * such row in production took `metrics/users` down entirely — every panel that
+   * reads the user corpus rendered zero, including the Customer Analysis
+   * onboarding chart, for 2,480 accounts because of one signup. The schema here
+   * is a hash-pinned mirror of the canonical seo-be schema, so the column cannot
+   * be corrected in this repository.
+   *
+   * The fast path is unchanged: one query each. Only if a query throws does the
+   * reader bisect the id list, return every row it can read, and report the ids
+   * it cannot — which the response then surfaces so the bad row can be found and
+   * fixed at the source rather than guessed at.
+   */
+  const unreadableUserIds = new Set<string>();
+  const noteUnreadable = (table: string) => (id: string, error: unknown) => {
+    unreadableUserIds.add(id);
+    console.error(
+      JSON.stringify({
+        level: "error",
+        service: "superadmin-metrics",
+        event: "row_unreadable",
+        table,
+        userId: id,
+        message: error instanceof Error ? error.message : String(error),
+        impact: "row omitted; the rest of the dataset is returned",
+      }),
+    );
+  };
+
+  const [quickScrapeRead, trialAnalyticsRead, onboardingBusinessRead] =
     userIds.length > 0
       ? await Promise.all([
-          prisma.quickScrapeBusiness.findMany({
-            where: { userId: { in: userIds } },
-            select: {
+          resilientBatchRead({
+            ids: userIds,
+            onRowFailure: noteUnreadable("quick_scrape_business"),
+            read: (ids) =>
+              prisma.quickScrapeBusiness.findMany({
+                where: { userId: { in: ids } },
+                select: {
               id: true,
               userId: true,
               businessName: true,
@@ -621,10 +658,15 @@ async function computeMetricsUsersDataset(input: {
               createdAt: true,
               updatedAt: true,
             },
+              }),
           }),
-          prisma.trialAnalytics.findMany({
-            where: { userId: { in: userIds } },
-            select: {
+          resilientBatchRead({
+            ids: userIds,
+            onRowFailure: noteUnreadable("trial_analytics"),
+            read: (ids) =>
+              prisma.trialAnalytics.findMany({
+                where: { userId: { in: ids } },
+                select: {
               userId: true,
               onboardingStartedAt: true,
               onboardingCompletedAt: true,
@@ -632,10 +674,15 @@ async function computeMetricsUsersDataset(input: {
               servicesSelectedAt: true,
               trialEnrolledAt: true,
             },
+              }),
           }),
-          prisma.business.findMany({
-            where: { userId: { in: userIds } },
-            select: {
+          resilientBatchRead({
+            ids: userIds,
+            onRowFailure: noteUnreadable("business"),
+            read: (ids) =>
+              prisma.business.findMany({
+                where: { userId: { in: ids } },
+                select: {
               id: true,
               userId: true,
               businessName: true,
@@ -656,9 +703,17 @@ async function computeMetricsUsersDataset(input: {
               createdAt: true,
               updatedAt: true,
             },
+              }),
           }),
         ])
-      : [[], [], []];
+      : [
+          { rows: [], failedIds: [], cleanRead: true },
+          { rows: [], failedIds: [], cleanRead: true },
+          { rows: [], failedIds: [], cleanRead: true },
+        ];
+  const quickScrapeSessions = quickScrapeRead.rows;
+  const trialAnalytics = trialAnalyticsRead.rows;
+  const onboardingBusinesses = onboardingBusinessRead.rows;
 
   const sessionsByUser = new Map<string, typeof quickScrapeSessions>();
   for (const session of quickScrapeSessions) {
@@ -807,7 +862,7 @@ async function computeMetricsUsersDataset(input: {
     }
   }
 
-  return { filteredUsers, summary };
+  return { filteredUsers, summary, unreadableUserIds: [...unreadableUserIds] };
 }
 
 /**
@@ -852,7 +907,7 @@ async function loadMetricsUsersDataset(input: {
    * not share a key with the paginated reads and does not want to be held for
    * twenty seconds either.
    */
-  const { filteredUsers, summary } =
+  const { filteredUsers, summary, unreadableUserIds } =
     input.maxRows !== undefined
       ? await computeMetricsUsersDataset(filters)
       : await metricsUsersDatasetMemo.get(
@@ -870,6 +925,14 @@ async function loadMetricsUsersDataset(input: {
     page,
     limit,
     summary,
+    /**
+     * Accounts omitted because a row belonging to them could not be read.
+     *
+     * Reported rather than swallowed: the figures above are then known to be
+     * short by exactly this many, and the ids are what someone needs to find the
+     * column that drifted. Empty in the normal case.
+     */
+    unreadableUserIds,
   };
 }
 
@@ -2308,9 +2371,42 @@ export async function getMetricsUserDetail(req: Request, res: Response) {
       return res.status(404).json({ success: false, message: "User not found", data: null, timestamp: new Date().toISOString() });
     }
 
+    /**
+     * Each of these degrades on its own.
+     *
+     * The same unreadable-row problem that took out the user list also 500s this
+     * page for the one account it belongs to — and a detail page that cannot show
+     * an onboarding history is still worth rendering for the email, the plan and
+     * the businesses. `onboardingDataUnavailable` on the response says the
+     * history is missing rather than empty.
+     */
+    const onboardingReadFailures: string[] = [];
+    const readOrDegrade = async <T>(
+      table: string,
+      read: () => Promise<T>,
+      fallback: T,
+    ): Promise<T> => {
+      try {
+        return await read();
+      } catch (error) {
+        onboardingReadFailures.push(table);
+        console.error(
+          JSON.stringify({
+            level: "error",
+            service: "superadmin-metrics",
+            event: "row_unreadable",
+            table,
+            userId,
+            message: error instanceof Error ? error.message : String(error),
+            impact: "detail page rendered without this section",
+          }),
+        );
+        return fallback;
+      }
+    };
     const [quickScrapeSessions, trialAnalytics, onboardingBusinesses] =
       await Promise.all([
-        prisma.quickScrapeBusiness.findMany({
+        readOrDegrade("quick_scrape_business", () => prisma.quickScrapeBusiness.findMany({
           where: { userId },
           orderBy: { updatedAt: "desc" },
           select: {
@@ -2337,8 +2433,8 @@ export async function getMetricsUserDetail(req: Request, res: Response) {
             createdAt: true,
             updatedAt: true,
           },
-        }),
-        prisma.trialAnalytics.findUnique({
+        }), []),
+        readOrDegrade("trial_analytics", () => prisma.trialAnalytics.findUnique({
           where: { userId },
           select: {
             onboardingStartedAt: true,
@@ -2377,8 +2473,8 @@ export async function getMetricsUserDetail(req: Request, res: Response) {
             createdAt: true,
             updatedAt: true,
           },
-        }),
-        prisma.business.findMany({
+        }), null),
+        readOrDegrade("business", () => prisma.business.findMany({
           where: { userId },
           orderBy: { createdAt: "desc" },
           select: {
@@ -2401,7 +2497,7 @@ export async function getMetricsUserDetail(req: Request, res: Response) {
             createdAt: true,
             updatedAt: true,
           },
-        }),
+        }), []),
       ]);
 
     const now = new Date();
@@ -2439,6 +2535,14 @@ export async function getMetricsUserDetail(req: Request, res: Response) {
       success: true,
       message: "User detail retrieved",
       data: {
+        /**
+         * Which sections could not be read for this account, if any.
+         *
+         * Empty in the normal case. Non-empty means a row belonging to this user
+         * cannot be deserialised against the pinned schema, so the page shows
+         * what it has instead of returning a 500 for the whole account.
+         */
+        unreadableTables: onboardingReadFailures,
         user: {
           id: user.id,
           email: user.email,
