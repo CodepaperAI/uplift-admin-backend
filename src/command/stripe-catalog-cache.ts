@@ -163,8 +163,29 @@ export function upliftPriceSetKey(priceIds: Iterable<string>): string {
 export const PLAN_DEFINITION_TTL_SECONDS = 60 * 60;
 
 /**
+ * How long a plan definition stays usable while a refresh runs behind a
+ * response. Generous, because a stale plan *label* is a cosmetic problem and
+ * waiting on four HTTP round trips is not — and because keeping the last good
+ * value through a Stripe outage is better than reverting to
+ * "Uplift AI legacy plan" across three endpoints.
+ */
+export const PLAN_DEFINITION_HARD_TTL_SECONDS = 24 * 60 * 60;
+
+/**
  * Discounts do change by hand, so this stays short. It only has to be long
  * enough that the 60-second response cache stops re-walking Stripe's entire
  * subscription list underneath it — which is where the seconds actually went.
  */
 export const SUBSCRIPTION_BILLING_TTL_SECONDS = 5 * 60;
+
+/**
+ * The billing projection stays servable for an hour past its soft age.
+ *
+ * The soft age is what governs freshness in practice: past it, the value is
+ * still returned but a refresh starts behind the response, so a reader sees data
+ * at most one soft period old and never waits. This longer clock only decides
+ * how much traffic-free time it takes before someone has to pay the ~3.8 s
+ * Stripe walk again — an hour means that is effectively only the first load
+ * after a deploy.
+ */
+export const SUBSCRIPTION_BILLING_HARD_TTL_SECONDS = 60 * 60;

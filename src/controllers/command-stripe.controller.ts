@@ -55,12 +55,13 @@ import { currencyExponent } from "../command/money";
 import {
   invalidateCommandProviderCache,
   readCommandCache,
-  readCommandProviderCache,
   writeCommandCache,
-  writeCommandProviderCache,
 } from "../utils/command-cache";
+import { readThroughProviderCache } from "../utils/provider-cache";
 import {
+  PLAN_DEFINITION_HARD_TTL_SECONDS,
   PLAN_DEFINITION_TTL_SECONDS,
+  SUBSCRIPTION_BILLING_HARD_TTL_SECONDS,
   SUBSCRIPTION_BILLING_TTL_SECONDS,
   deserializePlanDefinitions,
   deserializeSubscriptionBilling,
@@ -140,11 +141,37 @@ async function getUpliftPlanDefinitions(): Promise<UpliftPlanDefinition[]> {
     if (row.stripePriceId) priceIds.add(row.stripePriceId);
   }
 
-  const cacheKey = `stripe-plan-definitions-v1:${upliftPriceSetKey(priceIds)}`;
-  const cached = deserializePlanDefinitions(await readCommandProviderCache(cacheKey));
-  if (cached) return cached;
+  const cacheKey = `stripe-plan-definitions-v2:${upliftPriceSetKey(priceIds)}`;
+  if (!isStripeConfigured) {
+    return [...priceIds].map((priceId) => ({
+      priceId,
+      ...(configured.get(priceId) ?? {
+        name: "Uplift AI legacy plan",
+        billingPeriod: "Recurring",
+        currency: null,
+        unitAmountMinor: null,
+      }),
+    }));
+  }
+  return readThroughProviderCache<UpliftPlanDefinition[]>({
+    namespace: cacheKey,
+    softTtlSeconds: PLAN_DEFINITION_TTL_SECONDS,
+    hardTtlSeconds: PLAN_DEFINITION_HARD_TTL_SECONDS,
+    validate: (value) => deserializePlanDefinitions(value) !== null,
+    compute: () => fetchUpliftPlanDefinitions(priceIds, configured),
+  });
+}
 
-  const definitions = await Promise.all(
+/**
+ * The provider half, separated so the cache wrapper above owns the policy and
+ * this owns only the Stripe calls. One `prices.retrieve` per price, with the
+ * product expanded.
+ */
+async function fetchUpliftPlanDefinitions(
+  priceIds: ReadonlySet<string>,
+  configured: Map<string, Omit<UpliftPlanDefinition, "priceId">>,
+): Promise<UpliftPlanDefinition[]> {
+  return Promise.all(
     [...priceIds].map(async (priceId) => {
       const fallback = configured.get(priceId) ?? {
         name: "Uplift AI legacy plan",
@@ -185,17 +212,6 @@ async function getUpliftPlanDefinitions(): Promise<UpliftPlanDefinition[]> {
       }
     }),
   );
-  // Only worth storing when Stripe actually answered. Caching a page of
-  // fallbacks for an hour would turn one bad minute into an hour of
-  // "Uplift AI legacy plan" across three endpoints.
-  if (isStripeConfigured) {
-    await writeCommandProviderCache(
-      cacheKey,
-      definitions,
-      PLAN_DEFINITION_TTL_SECONDS,
-    );
-  }
-  return definitions;
 }
 
 function stripeObjectId(value: unknown): string | null {
@@ -279,83 +295,16 @@ async function loadAllLiveSubscriptionBilling(
   upliftPriceIds: ReadonlySet<string>,
 ): Promise<Map<string, UpliftSubscriptionPlanBilling[]> | null> {
   if (!isStripeConfigured) return null;
-  const cacheKey = `stripe-live-subscription-billing-v1:${upliftPriceSetKey(upliftPriceIds)}`;
-  const cached = deserializeSubscriptionBilling(
-    await readCommandProviderCache(cacheKey),
-  );
-  if (cached) return cached;
+  const cacheKey = `stripe-live-subscription-billing-v2:${upliftPriceSetKey(upliftPriceIds)}`;
   try {
-    const subscriptions = new Map<string, Stripe.Subscription>();
-    const statuses = ["active", "trialing", "past_due"] as const;
-    await Promise.all(
-      statuses.map(async (status) => {
-        for await (const subscription of stripe.subscriptions.list({
-          status,
-          limit: 100,
-          expand: ["data.discounts", "data.items.data.discounts"],
-        })) {
-          subscriptions.set(subscription.id, subscription);
-        }
-      }),
-    );
-
-    const discounts = [...subscriptions.values()].flatMap(
-      expandedSubscriptionDiscounts,
-    );
-    const couponIds = new Set(
-      discounts.flatMap((discount) => {
-        const id = stripeObjectId(discount.source.coupon);
-        return id ? [id] : [];
-      }),
-    );
-    const promotionCodeIds = new Set(
-      discounts.flatMap((discount) => {
-        const id = stripeObjectId(discount.promotion_code);
-        return id ? [id] : [];
-      }),
-    );
-    const [couponsById, promotionCodesById] = await Promise.all([
-      retrieveStripeCoupons(couponIds),
-      retrieveStripePromotionCodes(promotionCodeIds),
-    ]);
-    const discountsById = new Map<string, ResolvedStripeDiscount>();
-    for (const discount of discounts) {
-      const rawCoupon = discount.source.coupon;
-      const coupon =
-        typeof rawCoupon === "string"
-          ? (couponsById.get(rawCoupon) ?? null)
-          : rawCoupon && !rawCoupon.deleted
-            ? rawCoupon
-            : null;
-      const rawPromotionCode = discount.promotion_code;
-      const promotionCode =
-        typeof rawPromotionCode === "string"
-          ? (promotionCodesById.get(rawPromotionCode) ?? null)
-          : rawPromotionCode;
-      const resolved = resolveStripeDiscount({
-        discount,
-        coupon,
-        promotionCode,
-      });
-      if (resolved) discountsById.set(resolved.id, resolved);
-    }
-
-    const bySubscriptionId = new Map(
-      [...subscriptions.entries()].map(([subscriptionId, subscription]) => [
-        subscriptionId,
-        projectUpliftSubscriptionPlanBilling({
-          subscription,
-          upliftPriceIds,
-          discountsById,
-        }),
-      ]),
-    );
-    await writeCommandProviderCache(
-      cacheKey,
-      serializeSubscriptionBilling(bySubscriptionId),
-      SUBSCRIPTION_BILLING_TTL_SECONDS,
-    );
-    return bySubscriptionId;
+    const wire = await readThroughProviderCache({
+      namespace: cacheKey,
+      softTtlSeconds: SUBSCRIPTION_BILLING_TTL_SECONDS,
+      hardTtlSeconds: SUBSCRIPTION_BILLING_HARD_TTL_SECONDS,
+      validate: (value) => deserializeSubscriptionBilling(value) !== null,
+      compute: () => fetchAllLiveSubscriptionBilling(upliftPriceIds),
+    });
+    return deserializeSubscriptionBilling(wire);
   } catch (error) {
     console.error(
       "[command-stripe] Could not load live subscription discounts",
@@ -363,6 +312,82 @@ async function loadAllLiveSubscriptionBilling(
     );
     return null;
   }
+}
+
+/**
+ * The provider half: three paginated walks of Stripe's subscription list plus
+ * every distinct coupon and promotion code. Returns the wire shape, because the
+ * cache stores what crosses Redis and the caller rehydrates.
+ */
+async function fetchAllLiveSubscriptionBilling(
+  upliftPriceIds: ReadonlySet<string>,
+): Promise<ReturnType<typeof serializeSubscriptionBilling>> {
+  const subscriptions = new Map<string, Stripe.Subscription>();
+  const statuses = ["active", "trialing", "past_due"] as const;
+  await Promise.all(
+    statuses.map(async (status) => {
+      for await (const subscription of stripe.subscriptions.list({
+        status,
+        limit: 100,
+        expand: ["data.discounts", "data.items.data.discounts"],
+      })) {
+        subscriptions.set(subscription.id, subscription);
+      }
+    }),
+  );
+
+  const discounts = [...subscriptions.values()].flatMap(
+    expandedSubscriptionDiscounts,
+  );
+  const couponIds = new Set(
+    discounts.flatMap((discount) => {
+      const id = stripeObjectId(discount.source.coupon);
+      return id ? [id] : [];
+    }),
+  );
+  const promotionCodeIds = new Set(
+    discounts.flatMap((discount) => {
+      const id = stripeObjectId(discount.promotion_code);
+      return id ? [id] : [];
+    }),
+  );
+  const [couponsById, promotionCodesById] = await Promise.all([
+    retrieveStripeCoupons(couponIds),
+    retrieveStripePromotionCodes(promotionCodeIds),
+  ]);
+  const discountsById = new Map<string, ResolvedStripeDiscount>();
+  for (const discount of discounts) {
+    const rawCoupon = discount.source.coupon;
+    const coupon =
+      typeof rawCoupon === "string"
+        ? (couponsById.get(rawCoupon) ?? null)
+        : rawCoupon && !rawCoupon.deleted
+          ? rawCoupon
+          : null;
+    const rawPromotionCode = discount.promotion_code;
+    const promotionCode =
+      typeof rawPromotionCode === "string"
+        ? (promotionCodesById.get(rawPromotionCode) ?? null)
+        : rawPromotionCode;
+    const resolved = resolveStripeDiscount({
+      discount,
+      coupon,
+      promotionCode,
+    });
+    if (resolved) discountsById.set(resolved.id, resolved);
+  }
+
+  const bySubscriptionId = new Map(
+    [...subscriptions.entries()].map(([subscriptionId, subscription]) => [
+      subscriptionId,
+      projectUpliftSubscriptionPlanBilling({
+        subscription,
+        upliftPriceIds,
+        discountsById,
+      }),
+    ]),
+  );
+  return serializeSubscriptionBilling(bySubscriptionId);
 }
 
 /**
