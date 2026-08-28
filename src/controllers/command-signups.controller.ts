@@ -69,7 +69,29 @@ export async function getCommandDailySignups(
       return;
     }
     const { range } = parsed;
-    const cacheKey = `command-signups-v4:${range.from}:${range.to}`;
+    const stageFilter = typeof req.query.stage === "string" ? req.query.stage : null;
+    const planFilter = typeof req.query.plan === "string" ? req.query.plan : null;
+    const countryFilter =
+      typeof req.query.country === "string" ? req.query.country : null;
+
+    /**
+     * The filters are part of the key, because the response is filtered.
+     *
+     * They were not, and the two directions of that are both wrong: a filtered
+     * request served the unfiltered payload from cache — which is how a page
+     * asking for `stage=churned` came back with 500 unfiltered rows and
+     * `appliedFilters.stage: null` — and, worse, a filtered request landing
+     * first would serve its narrow list to every unfiltered reader for the next
+     * minute.
+     */
+    const cacheKey = [
+      "command-signups-v5",
+      range.from,
+      range.to,
+      stageFilter ?? "-",
+      planFilter ?? "-",
+      countryFilter ?? "-",
+    ].join(":");
     const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
     if (cached) {
       sendSuccess(res, cached, "Command daily signups");
@@ -95,10 +117,6 @@ export async function getCommandDailySignups(
      * the current book — a couple of thousand rows — it is cheaper than the
      * second count query it replaces.
      */
-    const stageFilter = typeof req.query.stage === "string" ? req.query.stage : null;
-    const planFilter = typeof req.query.plan === "string" ? req.query.plan : null;
-    const countryFilter =
-      typeof req.query.country === "string" ? req.query.country : null;
 
     const rangeUsers = await prisma.user.findMany({
       where,
@@ -215,6 +233,7 @@ export async function getCommandDailySignups(
         businessCountry: string | null;
       }[]
     >();
+    const coveredBusinessUserIds = new Set(userIds);
     for (const business of businesses) {
       const list = businessesByUser.get(business.userId) ?? [];
       list.push({
@@ -223,6 +242,45 @@ export async function getCommandDailySignups(
         businessCountry: business.businessCountry,
       });
       businessesByUser.set(business.userId, list);
+    }
+
+    /**
+     * Business details for subscription-holders that the capped page missed.
+     *
+     * `businesses` above is scoped to the newest 500 signups, and the rows the
+     * filters actually need are the subscription-holders — who, on a busy range,
+     * are mostly older than that. Without this top-up a churned row comes back
+     * with no business name, no site and no country, which is precisely the row
+     * a rep is trying to act on.
+     *
+     * Skipped entirely unless the cap bit, and even then it is a handful of ids:
+     * subscription-holders in range number in the tens, not the thousands.
+     */
+    const capBit = signupsInRange > users.length;
+    const uncoveredSubscribedIds = capBit
+      ? [...new Set(snapshots.flatMap((row) => (row.userId ? [row.userId] : [])))]
+          .filter((id) => rangeUserIds.has(id) && !coveredBusinessUserIds.has(id))
+      : [];
+    if (uncoveredSubscribedIds.length > 0) {
+      const extra = await prisma.business.findMany({
+        where: { userId: { in: uncoveredSubscribedIds } },
+        select: {
+          userId: true,
+          businessName: true,
+          businessWebsiteUrl: true,
+          businessCountry: true,
+        },
+        orderBy: { createdAt: "asc" },
+      });
+      for (const business of extra) {
+        const list = businessesByUser.get(business.userId) ?? [];
+        list.push({
+          businessName: business.businessName,
+          businessWebsiteUrl: business.businessWebsiteUrl,
+          businessCountry: business.businessCountry,
+        });
+        businessesByUser.set(business.userId, list);
+      }
     }
 
     const subscriptionsByUser = new Map<string, SignupSubscriptionFact[]>();
@@ -290,6 +348,40 @@ export async function getCommandDailySignups(
         .length,
     };
 
+    /**
+     * Filter first, cap second. The other way round is a lie.
+     *
+     * `rows` covers the newest 500 signups in the range and `classified.rows`
+     * covers every signup that holds a subscription, uncapped — so the two
+     * together are every row that could possibly match a stage or plan filter,
+     * because a signup with no subscription can only ever be `signed_up` /
+     * `none`.
+     *
+     * It used to filter `rows` alone, which meant the cap discarded candidates
+     * before the filter ever saw them. That is not a rounding error on a busy
+     * range, it is systematically worst for exactly the segment worth looking
+     * at: churn is old by construction — you sign up, then cancel days later —
+     * so churned rows sit at the bottom of a newest-first list and are the first
+     * thing a cap throws away. Measured on a 7-day range of 625 signups: the
+     * pill said 5 churned and the list could show none of them.
+     */
+    const byUserId = new Map<string, (typeof rows)[number]>();
+    for (const row of [...classified.rows, ...rows]) {
+      // Identical for a user in both sets — same builder, same maps — so first
+      // write wins and the uncapped set is preferred.
+      if (!byUserId.has(row.userId)) byUserId.set(row.userId, row);
+    }
+    const matching = [...byUserId.values()]
+      .filter(
+        (row) =>
+          (stageFilter === null || row.stage === stageFilter) &&
+          (planFilter === null || row.planTag === planFilter) &&
+          (countryFilter === null || row.country === countryFilter),
+      )
+      // Newest first, as the table promises. Merging two sorted lists does not
+      // preserve the order, so it is restored here rather than assumed.
+      .sort((left, right) => right.signedUpAt.localeCompare(left.signedUpAt));
+
     const payload = {
       day: {
         date: range.from,
@@ -300,12 +392,13 @@ export async function getCommandDailySignups(
         endExclusive: range.end.toISOString(),
         timeZone: COMMAND_TIME_ZONE,
       },
-      rows: rows.filter(
-        (row) =>
-          (stageFilter === null || row.stage === stageFilter) &&
-          (planFilter === null || row.planTag === planFilter) &&
-          (countryFilter === null || row.country === countryFilter),
-      ),
+      rows: matching.slice(0, SIGNUP_ROW_CAP),
+      /**
+       * How many rows match in the whole range, before the cap. The panel needs
+       * this to say "5 of 5" honestly instead of reporting the length of what it
+       * happens to be holding.
+       */
+      matchingInRange: matching.length,
       appliedFilters: {
         stage: stageFilter,
         plan: planFilter,
@@ -319,7 +412,13 @@ export async function getCommandDailySignups(
        */
       signupsInRange,
       rowCap: SIGNUP_ROW_CAP,
-      truncated: signupsInRange > rows.length,
+      /**
+       * True when the range holds more signups than the page carries. Derived
+       * from the *unfiltered* page, not from the returned rows: with a filter
+       * applied the returned list is legitimately short, and calling that
+       * truncated would put a warning on a complete answer.
+       */
+      truncated: capBit,
       /**
        * Stage, plan and country counts over the whole range.
        *
