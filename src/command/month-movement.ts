@@ -297,6 +297,16 @@ export function buildMovementHistory(input: {
   failedInvoices: readonly FailedInvoiceFact[];
   /** When each account was created, for the per-month signup count. */
   signups?: readonly { at: Date }[];
+  /**
+   * The same signup count, already bucketed by Toronto month.
+   *
+   * Preferred over `signups` when present, because counting signups does not
+   * need the rows. The caller used to read every user in the database to produce
+   * `[{ at }]` for this loop, which is an aggregate paid for by transferring the
+   * whole table; PostgreSQL can group it and return one row per month. `signups`
+   * stays for tests and for any caller that already holds the rows.
+   */
+  signupCountsByMonth?: ReadonlyMap<string, number>;
   /** Settled invoices, for the per-month collected figure. */
   collected?: readonly { at: Date; currency: string; amountMinor: string }[];
   /**
@@ -351,10 +361,19 @@ export function buildMovementHistory(input: {
   // one day are two signups. That is the opposite of the churn buckets above,
   // where three failed retries for one customer is one customer in trouble.
   const signupsByMonth = new Map<string, number>();
-  for (const signup of input.signups ?? []) {
-    const month = commandMonthForDate(signup.at);
-    if (!monthIndex.has(month)) continue;
-    signupsByMonth.set(month, (signupsByMonth.get(month) ?? 0) + 1);
+  if (input.signupCountsByMonth) {
+    // Already grouped, and still filtered to the requested span so a
+    // pre-bucketed input cannot widen the chart.
+    for (const [month, count] of input.signupCountsByMonth) {
+      if (!monthIndex.has(month)) continue;
+      signupsByMonth.set(month, (signupsByMonth.get(month) ?? 0) + count);
+    }
+  } else {
+    for (const signup of input.signups ?? []) {
+      const month = commandMonthForDate(signup.at);
+      if (!monthIndex.has(month)) continue;
+      signupsByMonth.set(month, (signupsByMonth.get(month) ?? 0) + 1);
+    }
   }
 
   // Summed as integers in minor units. These are amounts in cents, so there is

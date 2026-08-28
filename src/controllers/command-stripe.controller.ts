@@ -2487,8 +2487,6 @@ export async function getCommandStripeMonthMovement(
       deletedEventRows,
       failedInvoiceRows,
       oldestRealEvent,
-      userRows,
-      businessRows,
       settledInvoiceRows,
       ghlTransactionRows,
     ] = await Promise.all([
@@ -2556,26 +2554,6 @@ export async function getCommandStripeMonthMovement(
         },
         select: { occurredAt: true },
         orderBy: { occurredAt: "asc" },
-      }),
-      // Every account, serving two purposes so it is one read rather than two:
-      // `createdAt` gives the per-month signup count, and the contact fields
-      // give the churn call list a name and a number to ring.
-      //
-      // Months are bucketed in Toronto here rather than by the database,
-      // because a timezone-aware truncation is not portable through Prisma and
-      // the arrivals beside it are already bucketed by the same helper — two
-      // different month boundaries on one chart would be worse than this read.
-      prisma.user.findMany({
-        select: {
-          id: true,
-          name: true,
-          email: true,
-          phone: true,
-          createdAt: true,
-        },
-      }),
-      prisma.business.findMany({
-        select: { id: true, businessName: true, businessPhone: true },
       }),
       // Every settled invoice, for the per-month collected figure. Subscription
       // invoices *and* one-off invoices: that is what makes the number "revenue
@@ -2727,6 +2705,70 @@ export async function getCommandStripeMonthMovement(
       commandMonthSpan(firstArrivalMonth, month).length <= MOVEMENT_HISTORY_MAX_MONTHS
         ? firstArrivalMonth
         : commandMonthsEndingAt(month, MOVEMENT_HISTORY_MAX_MONTHS).at(-1)!;
+
+    /**
+     * The three reads that need something the wave above produced.
+     *
+     * Signups per month, counted rather than transferred. This was
+     * `prisma.user.findMany` over the entire table — five fields per account —
+     * so a loop here could bucket them by month and add them up. Counting is an
+     * aggregate: the transfer grew with every signup while the answer stayed at
+     * most twenty-four numbers.
+     *
+     * One `count` per month in the span, using the same `commandMonthRange` that
+     * produces every other boundary on this chart. A single grouped query would
+     * mean expressing a Toronto month boundary in SQL — `createdAt` is
+     * `TIMESTAMP(3)`, naive UTC, so that is a double `AT TIME ZONE` conversion
+     * whose correctness across a DST change cannot be checked without a
+     * PostgreSQL to run it against. Reusing the tested helper cannot be wrong
+     * about the boundary, the span is hard-capped at
+     * MOVEMENT_HISTORY_MAX_MONTHS, and these are indexed counts that return a
+     * number each.
+     *
+     * Names and numbers for the call list, for the accounts that can reach it —
+     * not for every account on record. The identity loop below reads these maps
+     * only by the ids carried on `snapshots`, a few hundred subscriptions, and
+     * both tables used to be read whole to build them.
+     */
+    const historyMonths = commandMonthSpan(historyFrom, month);
+    const identityUserIds = [
+      ...new Set(
+        snapshots.flatMap((snapshot) => (snapshot.userId ? [snapshot.userId] : [])),
+      ),
+    ];
+    const identityBusinessIds = [
+      ...new Set(
+        snapshots.flatMap((snapshot) =>
+          snapshot.businessId ? [snapshot.businessId] : [],
+        ),
+      ),
+    ];
+    const [signupCountEntries, userRows, businessRows, upliftPlanNames] =
+      await Promise.all([
+        Promise.all(
+          historyMonths.map(async (historyMonth) => {
+            const monthRange = commandMonthRange(historyMonth);
+            const count = await prisma.user.count({
+              where: { createdAt: { gte: monthRange.start, lt: monthRange.end } },
+            });
+            return [historyMonth, count] as const;
+          }),
+        ),
+        identityUserIds.length
+          ? prisma.user.findMany({
+              where: { id: { in: identityUserIds } },
+              select: { id: true, name: true, email: true, phone: true },
+            })
+          : Promise.resolve([]),
+        identityBusinessIds.length
+          ? prisma.business.findMany({
+              where: { id: { in: identityBusinessIds } },
+              select: { id: true, businessName: true, businessPhone: true },
+            })
+          : Promise.resolve([]),
+        getUpliftPlanDefinitions(),
+      ]);
+    const signupCountsByMonth = new Map(signupCountEntries);
     /**
      * GHL payments, net of refunds, minus anything that is the same money twice.
      *
@@ -2768,7 +2810,7 @@ export async function getCommandStripeMonthMovement(
       cancellations,
       failedInvoices,
       ghlCollected,
-      signups: userRows.map((row) => ({ at: row.createdAt })),
+      signupCountsByMonth,
       collected: settledInvoiceRows.flatMap((row) =>
         row.paidAt
           ? [
@@ -2793,7 +2835,6 @@ export async function getCommandStripeMonthMovement(
      */
     const businessById = new Map(businessRows.map((row) => [row.id, row]));
     const userById = new Map(userRows.map((row) => [row.id, row]));
-    const upliftPlanNames = await getUpliftPlanDefinitions();
     const planNameByPriceId = new Map(
       upliftPlanNames.map((plan) => [plan.priceId, plan.name]),
     );
