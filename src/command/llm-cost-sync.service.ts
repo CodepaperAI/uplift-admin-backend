@@ -153,6 +153,64 @@ export async function syncLlmUsageCostsForMonth(input: {
   };
 }
 
+/**
+ * Refreshes the current month if its entry has gone stale, and says whether it
+ * did.
+ *
+ * This service can only *emit* Inngest events — the entrypoint guard forbids
+ * registering worker functions, and the functions live in the core backend — so
+ * there is no cron here to keep a running month up to date. Without one, the
+ * August figure would be whatever it was the last time somebody pressed a
+ * button, silently ageing while spend continued.
+ *
+ * Refreshing on read is the version that works inside those constraints. It is a
+ * materialised-view refresh, not a side effect on a GET: the entry is derived,
+ * idempotent, and keyed so a concurrent double-refresh writes the same row
+ * twice rather than two rows. It runs at most once per interval, only for the
+ * month being viewed, and only when that month is the current one — history does
+ * not change, so re-deriving it on every read would be work for nothing.
+ *
+ * A failure here must never take the costs endpoint down with it: the caller
+ * reports the figures it has and the entry simply stays stale.
+ */
+export const LLM_COST_REFRESH_INTERVAL_MS = 30 * 60 * 1000;
+
+export async function refreshLlmCostsIfStale(input: {
+  month: string;
+  currentMonth: string;
+  now?: Date;
+}): Promise<{ refreshed: boolean; syncedAt: Date | null }> {
+  if (input.month !== input.currentMonth) {
+    return { refreshed: false, syncedAt: null };
+  }
+  const now = input.now ?? new Date();
+  try {
+    const existing = await prisma.commandCostEntry.findUnique({
+      where: { sourceExternalId: llmCostSourceExternalId(input.month) },
+      select: { updatedAt: true, deletedAt: true },
+    });
+    const fresh =
+      existing !== null &&
+      existing.deletedAt === null &&
+      now.getTime() - existing.updatedAt.getTime() < LLM_COST_REFRESH_INTERVAL_MS;
+    if (fresh) return { refreshed: false, syncedAt: existing.updatedAt };
+    await syncLlmUsageCostsForMonth({ month: input.month });
+    return { refreshed: true, syncedAt: now };
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        level: "error",
+        service: "llm-cost-sync",
+        event: "refresh_failed",
+        month: input.month,
+        message: error instanceof Error ? error.message : String(error),
+        impact: "costs are reported without a refreshed LLM figure",
+      }),
+    );
+    return { refreshed: false, syncedAt: null };
+  }
+}
+
 export async function syncLlmUsageCosts(input: {
   months: readonly string[];
   actorUserId?: string | null;

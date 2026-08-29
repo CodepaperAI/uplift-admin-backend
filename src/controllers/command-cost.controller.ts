@@ -16,7 +16,11 @@ const LLM_COST_DEFAULT_MONTHS = 6;
 /** A ceiling, so one request cannot walk the entire event history. */
 const LLM_COST_MAX_MONTHS = 24;
 import { prisma } from "../config/db.config";
-import { syncLlmUsageCosts } from "../command/llm-cost-sync.service";
+import {
+  LLM_COST_REFRESH_INTERVAL_MS,
+  refreshLlmCostsIfStale,
+  syncLlmUsageCosts,
+} from "../command/llm-cost-sync.service";
 import { inngest } from "../inngest/admin-client";
 import { isProviderManagedCostSource } from "../command/cost-source-policy";
 import {
@@ -42,12 +46,24 @@ export async function getCommandCosts(
 ): Promise<void> {
   try {
     const period = commandMonthRange(requestedMonth(req));
-    const cacheKey = `costs-v1:${period.month}`;
+    const cacheKey = `costs-v2:${period.month}`;
     const cached = await readCommandCache<Record<string, unknown>>(cacheKey);
     if (cached) {
       sendSuccess(res, cached, "Command costs");
       return;
     }
+    /**
+     * Before anything is aggregated, so the figures include it.
+     *
+     * Only fires past the response cache and only for the running month, so a
+     * viewer of August gets a figure at most half an hour old while March is
+     * never re-derived. A failure is swallowed inside the helper: stale costs
+     * beat no costs page.
+     */
+    const llmCostRefresh = await refreshLlmCostsIfStale({
+      month: period.month,
+      currentMonth: currentCommandMonth(),
+    });
     const analyticsMonths = commandMonthSequence(period.month, 6);
     const analyticsStart = commandMonthRange(analyticsMonths[0]!).start;
     const [entries, invoices, metaAdsRun, analyticsEntries] = await Promise.all([
@@ -95,6 +111,18 @@ export async function getCommandCosts(
           ...entry,
           amountMinor: entry.amountMinor.toString(),
         })),
+        /**
+         * When the derived LLM figure was last brought up to date, and whether
+         * this request is what did it. Reported so a reader can tell a spend of
+         * zero from a sync that has not run.
+         */
+        llmCosts: {
+          refreshedThisRequest: llmCostRefresh.refreshed,
+          syncedAt: llmCostRefresh.syncedAt?.toISOString() ?? null,
+          refreshIntervalMinutes: Math.round(
+            LLM_COST_REFRESH_INTERVAL_MS / 60_000,
+          ),
+        },
         integrations: {
           metaAds: {
             configured:
