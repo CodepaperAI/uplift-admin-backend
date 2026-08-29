@@ -183,6 +183,7 @@ export async function getCommandDailySignups(
           discounted: 0,
           pending: 0,
           cancelled: 0,
+          payment_failed: 0,
           none: 0,
           reachable: 0,
         },

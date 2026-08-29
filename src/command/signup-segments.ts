@@ -24,7 +24,16 @@ export type SignupStage =
   /** Subscription exists, nothing billed yet. Usually an intro period. */
   | "unbilled"
   /** Had a subscription; it has ended. */
-  | "churned";
+  | "churned"
+  /**
+   * Live subscription whose payment is failing — past due or unpaid.
+   *
+   * Kept apart from `churned` even though both count toward churn on the
+   * signups page, because they need opposite calls: a cancellation is a
+   * decision already made, a failed card is usually a card, and the second is
+   * recoverable in a way the first is not.
+   */
+  | "payment_failed";
 
 /** The product they are on, once they have a subscription at all. */
 export type PlanTag =
@@ -46,6 +55,7 @@ export type PaymentStateForStage =
   | "discounted"
   | "pending"
   | "cancelled"
+  | "payment_failed"
   | "none";
 
 /**
@@ -103,6 +113,8 @@ export function stageFromPaymentState(
       return isIntroPeriod(daysToNextBill) ? "trial" : "unbilled";
     case "cancelled":
       return "churned";
+    case "payment_failed":
+      return "payment_failed";
   }
 }
 
@@ -185,6 +197,7 @@ export const SIGNUP_STAGE_KEYS: SignupStage[] = [
   "trial",
   "active",
   "unbilled",
+  "payment_failed",
   "churned",
 ];
 
@@ -206,7 +219,14 @@ export type SegmentTotals = {
 
 export function emptySegmentTotals(): SegmentTotals {
   return {
-    stage: { signed_up: 0, trial: 0, active: 0, unbilled: 0, churned: 0 },
+    stage: {
+      signed_up: 0,
+      trial: 0,
+      active: 0,
+      unbilled: 0,
+      payment_failed: 0,
+      churned: 0,
+    },
     plan: {
       trial: 0,
       core_monthly: 0,

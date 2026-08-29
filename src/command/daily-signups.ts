@@ -48,6 +48,21 @@ export type SignupPaymentState =
   | "pending"
   /** Subscribed and already ended. Signed up and cancelled the same day. */
   | "cancelled"
+  /**
+   * Live subscription whose payment is failing — Stripe `past_due` or `unpaid`.
+   *
+   * Its own state rather than folded into `paid`. These accounts had reached a
+   * settled invoice at some point, so the entry-path classifier read them as
+   * customers and the Active tile counted them as revenue that is arriving. It
+   * is not arriving: the card is being declined right now. Counting a declining
+   * card as active revenue is how a churn problem stays invisible until the
+   * subscription is gone, and it is precisely who a rep should ring today.
+   *
+   * Distinct from `pending`, which is a subscription whose first charge has not
+   * come due yet. That distinction is the whole reason `nextBillAt` is carried,
+   * and it survives here: `pending` is waiting, this has already failed.
+   */
+  | "payment_failed"
   /** No Stripe subscription at all. The bulk of any day's signups. */
   | "none";
 
@@ -104,6 +119,16 @@ const ENDED_STATUSES = new Set([
   "cancelled",
   "incomplete_expired",
 ]);
+
+/**
+ * Stripe statuses that mean the money is not arriving.
+ *
+ * `past_due` is a renewal whose charge failed and is still being retried;
+ * `unpaid` is one Stripe has stopped retrying. Neither is ended, so both stay
+ * live for `decidingSubscription` — someone who re-subscribed after a failure
+ * is still a customer, and the live row should win.
+ */
+const PAYMENT_FAILED_STATUSES = new Set(["past_due", "unpaid"]);
 
 /**
  * The subscription that decides a signup's state.
@@ -181,13 +206,19 @@ export function buildDailySignups(input: {
         ? "none"
         : ENDED_STATUSES.has(subscription.status)
           ? "cancelled"
-          : entry === null || entry.route === "none" || entry.route === "unknown"
-            ? "pending"
-            : entry.reachedFullPrice
-              ? "paid"
-              : entry.route === "trial"
-                ? "trial"
-                : "discounted";
+          : // Checked before the entry path, deliberately. A failing card
+            // usually belongs to someone who *has* paid before, so the entry
+            // classifier would read them as a customer and the failure would
+            // never surface.
+            PAYMENT_FAILED_STATUSES.has(subscription.status)
+            ? "payment_failed"
+            : entry === null || entry.route === "none" || entry.route === "unknown"
+              ? "pending"
+              : entry.reachedFullPrice
+                ? "paid"
+                : entry.route === "trial"
+                  ? "trial"
+                  : "discounted";
 
       // The country of the first business they built, falling back to their
       // dialling code. A business with no country set is not an answer, so the
@@ -252,6 +283,7 @@ export function buildDailySignups(input: {
     discounted: 0,
     pending: 0,
     cancelled: 0,
+    payment_failed: 0,
     none: 0,
     // Someone a rep can actually contact today. An email always exists, so this
     // counts the ones with a number, which is what a call list needs.

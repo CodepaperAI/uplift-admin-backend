@@ -282,3 +282,114 @@ describe("the first bill date", () => {
     expect(rows[0]?.daysToNextBill).toBeNull();
   });
 });
+
+describe("payment_failed state", () => {
+  const user = {
+    id: "u1",
+    name: "Ramesh",
+    email: "ramesh@example.com",
+    phone: "+14165550101",
+    createdAt: new Date("2026-08-10T14:00:00.000Z"),
+  };
+
+  function build(status: string, invoices: InvoiceFact[]) {
+    return buildDailySignups({
+      users: [user],
+      businessesByUser: new Map(),
+      subscriptionsByUser: new Map([
+        [
+          "u1",
+          [
+            {
+              userId: "u1",
+              status,
+              monthlyRecurringMinor: new Prisma.Decimal("9900"),
+              currency: "usd",
+              stripeSubscriptionId: "sub_1",
+              currentPeriodEnd: new Date("2026-09-10T14:00:00.000Z"),
+              stripePriceIds: ["price_core_m"],
+            },
+          ],
+        ],
+      ]),
+      invoicesBySubscription: new Map([["sub_1", invoices]]),
+    });
+  }
+
+  // A settled full-price opening invoice, so the entry classifier reads this
+  // account as a paying customer. That is the whole point of the fixture: the
+  // failure has to win over a genuine payment history.
+  const settled: InvoiceFact[] = [
+    {
+      stripeSubscriptionId: "sub_1",
+      currency: "usd",
+      amountPaidMinor: new Prisma.Decimal("9900"),
+      billingReason: "subscription_create",
+      paidAt: new Date("2026-08-10T14:05:00.000Z"),
+      providerCreatedAt: new Date("2026-08-10T14:05:00.000Z"),
+    },
+  ];
+
+  test("a past_due subscription that has paid before is not counted as paid", () => {
+    // The regression this exists for: the entry classifier sees a settled
+    // full-price invoice and reads the account as a customer, so a card being
+    // declined right now was counted as active revenue.
+    const { rows, totals } = build("past_due", settled);
+    expect(rows[0]?.state).toBe("payment_failed");
+    expect(rows[0]?.stage).toBe("payment_failed");
+    expect(totals.paid).toBe(0);
+    expect(totals.payment_failed).toBe(1);
+  });
+
+  test("unpaid counts the same as past_due", () => {
+    expect(build("unpaid", settled).rows[0]?.state).toBe("payment_failed");
+  });
+
+  test("a cancelled subscription still reads as cancelled, not payment_failed", () => {
+    expect(build("canceled", settled).rows[0]?.state).toBe("cancelled");
+  });
+
+  test("an active subscription is unaffected", () => {
+    const { rows, totals } = build("active", settled);
+    expect(rows[0]?.state).toBe("paid");
+    expect(totals.payment_failed).toBe(0);
+  });
+
+  test("a past_due subscription with no settled invoice is still payment_failed", () => {
+    // Not `pending`. Pending means the first charge has not come due; this one
+    // has already failed, and the two need opposite responses.
+    expect(build("past_due", []).rows[0]?.state).toBe("payment_failed");
+  });
+
+  test("a live past_due row outranks an older cancelled one", () => {
+    const { rows } = buildDailySignups({
+      users: [user],
+      businessesByUser: new Map(),
+      subscriptionsByUser: new Map([
+        [
+          "u1",
+          [
+            {
+              userId: "u1",
+              status: "canceled",
+              monthlyRecurringMinor: new Prisma.Decimal("9900"),
+              currency: "usd",
+              stripeSubscriptionId: "sub_old",
+              currentPeriodEnd: null,
+            },
+            {
+              userId: "u1",
+              status: "past_due",
+              monthlyRecurringMinor: new Prisma.Decimal("14900"),
+              currency: "usd",
+              stripeSubscriptionId: "sub_new",
+              currentPeriodEnd: new Date("2026-09-10T14:00:00.000Z"),
+            },
+          ],
+        ],
+      ]),
+      invoicesBySubscription: new Map(),
+    });
+    expect(rows[0]?.state).toBe("payment_failed");
+  });
+});

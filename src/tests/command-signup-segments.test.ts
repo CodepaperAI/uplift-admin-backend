@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
   INTRO_PERIOD_MAX_DAYS,
+  SIGNUP_STAGE_KEYS,
   classifyCountry,
   classifyPlanTag,
+  emptySegmentTotals,
   isIntroPeriod,
   stageFromPaymentState,
   tallySegments,
@@ -191,5 +193,30 @@ describe("tallySegments", () => {
     expect(totals.stage).toMatchObject({ active: 2, signed_up: 1, trial: 1, churned: 0 });
     expect(totals.plan).toMatchObject({ social_monthly: 1, core_monthly: 1, none: 1, trial: 1 });
     expect(totals.country).toEqual({ india: 2, rest_of_world: 1, unknown: 1 });
+  });
+});
+
+describe("payment_failed stage", () => {
+  test("maps to its own stage rather than to churned", () => {
+    // Both count toward churn on the signups page, but they need opposite
+    // calls: a cancellation is a decision, a failed card is usually a card.
+    expect(stageFromPaymentState("payment_failed", null)).toBe("payment_failed");
+    expect(stageFromPaymentState("cancelled", null)).toBe("churned");
+  });
+
+  test("ignores the billing window, unlike pending", () => {
+    // `pending` splits on how far off the first bill is, because a short window
+    // is an opening period. A failure has already happened; nothing about the
+    // next bill date changes that.
+    for (const days of [null, 0, 3, 31, 365]) {
+      expect(stageFromPaymentState("payment_failed", days)).toBe(
+        "payment_failed",
+      );
+    }
+  });
+
+  test("is one of the stage keys, so segment totals allocate it", () => {
+    expect(SIGNUP_STAGE_KEYS).toContain("payment_failed");
+    expect(emptySegmentTotals().stage.payment_failed).toBe(0);
   });
 });
