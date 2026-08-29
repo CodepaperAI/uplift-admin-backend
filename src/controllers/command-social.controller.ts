@@ -142,7 +142,7 @@ export async function getCommandSocialPosts(
       coverage,
       connectedAccounts,
       clientPlatformRows,
-      duplicateSuppressed,
+      duplicates,
     ] = await Promise.all([
       /**
        * Narrow select on purpose. A wide read of this table pulls unbounded
@@ -245,7 +245,11 @@ export async function getCommandSocialPosts(
        * figure makes a healthy pipeline read as a broken one and buries the
        * genuine failures under a number ten times their size.
        */
-      prisma.socialPublishAttempt.count({
+      prisma.socialPublishAttempt.aggregate({
+        _count: { _all: true },
+        // When the most recent one happened, which is the difference between a
+        // live problem and one that was fixed and is ageing out of the window.
+        _max: { createdAt: true },
         where: {
           ...where,
           status: "FAILED",
@@ -338,9 +342,12 @@ export async function getCommandSocialPosts(
               count: row._count._all,
             })),
           );
+          const duplicateSuppressed = duplicates._count._all;
           return {
             ...totals,
             duplicateSuppressed,
+            duplicateSuppressedLastAt:
+              duplicates._max.createdAt?.toISOString() ?? null,
             /** Failures that actually cost the client a post. */
             deliveryFailed: Math.max(0, totals.failed - duplicateSuppressed),
           };
