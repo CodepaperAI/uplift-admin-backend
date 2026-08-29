@@ -194,23 +194,22 @@ export function rollUpSocialClients(input: {
     );
 }
 
-export const SOCIAL_CAPTION_PREVIEW_LENGTH = 240;
-
 /**
- * A caption short enough for a table cell.
+ * A ceiling on caption text, so one pathological row cannot bloat a page.
  *
- * Captions are unbounded text, and a page of fifty carousel captions is a
- * payload nobody reads in a column that fits a line. Cut on the character, not
- * on a word boundary — a boundary search on adversarial input is a needless
- * scan, and the flag tells the reader there is more either way.
+ * Generous on purpose. This used to cut at 240 characters for the table cell,
+ * which was right until the post preview needed the caption the client will
+ * actually read — a preview showing two thirds of a caption is worse than no
+ * preview, because it looks complete. The API returns the caption; the table
+ * decides how much of it to show.
  */
-export function previewCaption(
-  caption: string | null | undefined,
-  maxLength: number = SOCIAL_CAPTION_PREVIEW_LENGTH,
-): { text: string; truncated: boolean } {
+export const SOCIAL_CAPTION_MAX_LENGTH = 4_000;
+
+export function boundedCaption(caption: string | null | undefined): string {
   const value = (caption ?? "").trim();
-  if (value.length <= maxLength) return { text: value, truncated: false };
-  return { text: `${value.slice(0, maxLength)}…`, truncated: true };
+  return value.length <= SOCIAL_CAPTION_MAX_LENGTH
+    ? value
+    : `${value.slice(0, SOCIAL_CAPTION_MAX_LENGTH)}…`;
 }
 
 /**

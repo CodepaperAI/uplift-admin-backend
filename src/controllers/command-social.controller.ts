@@ -14,7 +14,7 @@ import {
 import {
   parseSocialPlatformFilter,
   parseSocialStatusFilter,
-  previewCaption,
+  boundedCaption,
   rollUpSocialClients,
   rollUpSocialPlatforms,
   summariseAttemptStatuses,
@@ -176,6 +176,12 @@ export async function getCommandSocialPosts(
           caption: true,
           hashtags: true,
           mediaUrl: true,
+          // Carousels place several slides in one post, so a preview showing
+          // only the first would misrepresent what the client received.
+          mediaItems: {
+            select: { position: true, mediaUrl: true },
+            orderBy: { position: "asc" },
+          },
           externalPostId: true,
           externalStatus: true,
           externalPostUrl: true,
@@ -390,7 +396,6 @@ export async function getCommandSocialPosts(
         },
         pagination: commandPaginationResult({ page, pageSize, total }),
         posts: attempts.map((attempt) => {
-          const caption = previewCaption(attempt.caption);
           return {
             id: attempt.id,
             runId: attempt.runId,
@@ -412,10 +417,13 @@ export async function getCommandSocialPosts(
               : null,
             status: attempt.status,
             mode: attempt.mode,
-            caption: caption.text,
-            captionTruncated: caption.truncated,
+            caption: boundedCaption(attempt.caption),
             hashtags: attempt.hashtags,
             mediaUrl: attempt.mediaUrl,
+            media: attempt.mediaItems.map((item) => ({
+              position: item.position,
+              url: item.mediaUrl,
+            })),
             postUrl: attempt.externalPostUrl,
             externalPostId: attempt.externalPostId,
             externalStatus: attempt.externalStatus,

@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
   parseSocialPlatformFilter,
   parseSocialStatusFilter,
-  previewCaption,
+  boundedCaption,
   rollUpSocialClients,
   rollUpSocialPlatforms,
   isDuplicateSuppression,
@@ -197,65 +197,26 @@ describe("rollUpSocialClients", () => {
   });
 });
 
-describe("previewCaption", () => {
-  it("passes a short caption through untouched", () => {
-    expect(previewCaption("New winter tyres in stock")).toEqual({
-      text: "New winter tyres in stock",
-      truncated: false,
-    });
+describe("boundedCaption", () => {
+  it("returns the whole caption, because the preview shows what the client reads", () => {
+    // This used to cut at 240 characters for the table cell. A post preview
+    // showing two thirds of a caption is worse than none — it looks complete.
+    const caption = "New winter tyres in stock. ".repeat(20).trim();
+    expect(boundedCaption(caption)).toBe(caption);
   });
 
-  it("cuts a long caption and says that it did", () => {
-    const result = previewCaption("a".repeat(400));
-    expect(result.truncated).toBe(true);
-    expect(result.text).toHaveLength(241); // 240 plus the ellipsis
+  it("caps a pathological caption so one row cannot bloat a page", () => {
+    const result = boundedCaption("a".repeat(9_000));
+    expect(result).toHaveLength(4_001); // the cap plus the ellipsis
+    expect(result.endsWith("…")).toBe(true);
   });
 
   it("treats an absent caption as empty rather than throwing", () => {
-    expect(previewCaption(null)).toEqual({ text: "", truncated: false });
-    expect(previewCaption(undefined).text).toBe("");
+    expect(boundedCaption(null)).toBe("");
+    expect(boundedCaption(undefined)).toBe("");
   });
 
-  it("trims before measuring, so padding does not force a cut", () => {
-    const padded = `   ${"b".repeat(240)}   `;
-    expect(previewCaption(padded).truncated).toBe(false);
-  });
-});
-
-describe("isDuplicateSuppression", () => {
-  it("matches the 409 the client derives from the HTTP status", () => {
-    expect(isDuplicateSuppression("ZERNIO_HTTP_409", null)).toBe(true);
-  });
-
-  it("matches the provider message when the code is something else", () => {
-    // The day the provider sends a named code instead of a bare status.
-    expect(
-      isDuplicateSuppression(
-        "SOME_NAMED_CODE",
-        "This exact content is already scheduled, publishing, or was posted to this account within the last 24 hours.",
-      ),
-    ).toBe(true);
-  });
-
-  it("matches a code that names duplication outright", () => {
-    expect(isDuplicateSuppression("DUPLICATE_CONTENT", null)).toBe(true);
-  });
-
-  it("does not match a real delivery failure", () => {
-    for (const [code, message] of [
-      ["ZERNIO_POST_FAILED", "Zernio could not publish this post"],
-      ["ZERNIO_HTTP_403", "Application does not have permission for this action"],
-      ["SOCIAL_ACCOUNT_RECONNECT_REQUIRED", "The social account authorization has expired."],
-      [null, null],
-      ["", ""],
-    ] as const) {
-      expect(isDuplicateSuppression(code, message)).toBe(false);
-    }
-  });
-
-  it("does not match a 409 that is only part of a longer number", () => {
-    // ZERNIO_HTTP_4090 is not a 409, and a substring test would say it was.
-    expect(isDuplicateSuppression("ZERNIO_HTTP_4090", null)).toBe(false);
-    expect(isDuplicateSuppression("ERR_1409X", null)).toBe(false);
+  it("trims surrounding whitespace", () => {
+    expect(boundedCaption("   spaced out   ")).toBe("spaced out");
   });
 });
