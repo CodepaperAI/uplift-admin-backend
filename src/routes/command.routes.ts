@@ -25,6 +25,11 @@ import {
 import { getCommandSocialPosts } from "../controllers/command-social.controller";
 import { getCommandClients } from "../controllers/command-clients.controller";
 import {
+  getCommandClientBlogs,
+  getCommandClientOverview,
+  getCommandClientResults,
+} from "../controllers/command-client-detail.controller";
+import {
   getCommandGhlOverview,
   getCommandPipeline,
   updateCommandPipelineStage,
@@ -179,6 +184,21 @@ CommandRouter.get(
   "/clients",
   requireCommandCapability("view.team.all"),
   getCommandClients,
+);
+CommandRouter.get(
+  "/clients/:businessId",
+  requireCommandCapability("view.team.all"),
+  getCommandClientOverview,
+);
+CommandRouter.get(
+  "/clients/:businessId/blogs",
+  requireCommandCapability("view.team.all"),
+  getCommandClientBlogs,
+);
+CommandRouter.get(
+  "/clients/:businessId/results",
+  requireCommandCapability("view.team.all"),
+  getCommandClientResults,
 );
 CommandRouter.patch(
   "/pipeline/:id/stage",

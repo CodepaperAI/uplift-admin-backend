@@ -100,6 +100,16 @@ export async function getCommandSocialPosts(
   const status = parseSocialStatusFilter(req.query.status);
   const platform = parseSocialPlatformFilter(req.query.platform);
   const client = text(req.query.client);
+  // An exact account, for the per-client view. Distinct from `client`, which is
+  // a name search: two businesses can share a name, and the account view must
+  // show one of them rather than both.
+  const businessId =
+    typeof req.query.businessId === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      req.query.businessId,
+    )
+      ? req.query.businessId
+      : null;
   const { page, pageSize, skip } = parseCommandPagination({
     page: req.query.page,
     pageSize: req.query.pageSize,
@@ -128,6 +138,7 @@ export async function getCommandSocialPosts(
     createdAt: { gte: range.start, lt: range.end },
     ...(status ? { status } : {}),
     ...(platform ? { platform } : {}),
+    ...(businessId ? { businessId } : {}),
     ...(clientWhere ?? {}),
   };
 
@@ -333,6 +344,7 @@ export async function getCommandSocialPosts(
           status,
           platform,
           client,
+          businessId,
           statusOptions: [...SOCIAL_ATTEMPT_STATUSES],
         },
         totals: (() => {
