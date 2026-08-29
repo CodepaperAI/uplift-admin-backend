@@ -142,6 +142,7 @@ export async function getCommandSocialPosts(
       coverage,
       connectedAccounts,
       clientPlatformRows,
+      duplicateSuppressed,
     ] = await Promise.all([
       /**
        * Narrow select on purpose. A wide read of this table pulls unbounded
@@ -235,6 +236,28 @@ export async function getCommandSocialPosts(
         where,
         _count: { _all: true },
       }),
+      /**
+       * Failures the provider refused as duplicates, counted separately.
+       *
+       * On a live month these are the large majority of everything marked
+       * FAILED, and they are not undelivered posts — the content is already on
+       * the account or already queued for it. Folding them into the failure
+       * figure makes a healthy pipeline read as a broken one and buries the
+       * genuine failures under a number ten times their size.
+       */
+      prisma.socialPublishAttempt.count({
+        where: {
+          ...where,
+          status: "FAILED",
+          OR: [
+            { lastErrorCode: { endsWith: "_409" } },
+            { lastErrorCode: { contains: "duplicate", mode: "insensitive" } },
+            { lastErrorMessage: { contains: "already scheduled", mode: "insensitive" } },
+            { lastErrorMessage: { contains: "already posted", mode: "insensitive" } },
+            { lastErrorMessage: { contains: "already publishing", mode: "insensitive" } },
+          ],
+        },
+      }),
     ]);
 
     // Which platforms each client posted to, folded from the grouped read
@@ -308,12 +331,20 @@ export async function getCommandSocialPosts(
           client,
           statusOptions: [...SOCIAL_ATTEMPT_STATUSES],
         },
-        totals: summariseAttemptStatuses(
-          statusCounts.map((row) => ({
-            status: row.status,
-            count: row._count._all,
-          })),
-        ),
+        totals: (() => {
+          const totals = summariseAttemptStatuses(
+            statusCounts.map((row) => ({
+              status: row.status,
+              count: row._count._all,
+            })),
+          );
+          return {
+            ...totals,
+            duplicateSuppressed,
+            /** Failures that actually cost the client a post. */
+            deliveryFailed: Math.max(0, totals.failed - duplicateSuppressed),
+          };
+        })(),
         byPlatform: rollUpSocialPlatforms(
           platformCounts.map((row) => ({
             platform: row.platform,

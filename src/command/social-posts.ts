@@ -212,3 +212,29 @@ export function previewCaption(
   if (value.length <= maxLength) return { text: value, truncated: false };
   return { text: `${value.slice(0, maxLength)}…`, truncated: true };
 }
+
+/**
+ * Whether a failed attempt was the provider refusing a duplicate.
+ *
+ * This matters more than it looks. The publisher rejects content already
+ * scheduled, publishing, or posted to the same account within 24 hours, and on a
+ * live month those rejections are the large majority of everything marked
+ * FAILED. They are not undelivered posts — the content is already on the account
+ * or already queued for it — so counting them as delivery failures makes a
+ * healthy pipeline read as a broken one, and hides the genuine failures
+ * underneath a number ten times their size.
+ *
+ * Matched on the 409 the client derives from the HTTP status, with the message
+ * as a fallback for the day the provider starts sending a named code instead.
+ */
+export function isDuplicateSuppression(
+  code: string | null | undefined,
+  message: string | null | undefined,
+): boolean {
+  if (typeof code === "string" && /(^|_)409$/.test(code.trim())) return true;
+  if (typeof code === "string" && /duplicate/i.test(code)) return true;
+  return (
+    typeof message === "string" &&
+    /already (scheduled|publishing|posted)/i.test(message)
+  );
+}
