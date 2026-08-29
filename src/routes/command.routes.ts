@@ -23,6 +23,7 @@ import {
   requestCommandStripeReconciliation,
 } from "../controllers/command-stripe.controller";
 import { getCommandSocialPosts } from "../controllers/command-social.controller";
+import { getCommandClients } from "../controllers/command-clients.controller";
 import {
   getCommandGhlOverview,
   getCommandPipeline,
@@ -172,6 +173,12 @@ CommandRouter.get(
   "/social/posts",
   requireCommandCapability("view.team.all"),
   getCommandSocialPosts,
+);
+/** The searchable client index behind the per-client account view. */
+CommandRouter.get(
+  "/clients",
+  requireCommandCapability("view.team.all"),
+  getCommandClients,
 );
 CommandRouter.patch(
   "/pipeline/:id/stage",
