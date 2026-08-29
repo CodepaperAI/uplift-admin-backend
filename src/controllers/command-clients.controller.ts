@@ -39,7 +39,28 @@ export async function getCommandClients(
     maxPageSize: 200,
   });
 
-  const where: Prisma.BusinessWhereInput = search
+  /**
+   * Whether to show every account or only the ones that have been served.
+   *
+   * Applied in the query, not after it. Filtering a page of results is the same
+   * mistake as capping before filtering: nearly every one of the 2,000+
+   * accounts is a signup holding the blog we generate during onboarding, so a
+   * page of the newest fifty contains one served client and the rest are
+   * hidden — leaving the reader to page through forty screens to find the
+   * accounts they actually opened this view for.
+   */
+  const scope = req.query.scope === "all" ? "all" : "served";
+  const servedWhere: Prisma.BusinessWhereInput =
+    scope === "served"
+      ? {
+          OR: [
+            { Blog: { some: { status: "PUBLISH" } } },
+            { socialPublishAttempts: { some: {} } },
+          ],
+        }
+      : {};
+
+  const searchWhere: Prisma.BusinessWhereInput = search
     ? {
         OR: [
           { businessName: { contains: search, mode: "insensitive" } },
@@ -49,6 +70,11 @@ export async function getCommandClients(
         ],
       }
     : {};
+
+  // AND rather than a merged OR: two OR blocks at the same level would widen
+  // the result set instead of narrowing it, and a search would quietly start
+  // returning unserved accounts.
+  const where: Prisma.BusinessWhereInput = { AND: [servedWhere, searchWhere] };
 
   try {
     const [businesses, total] = await Promise.all([
@@ -206,6 +232,7 @@ export async function getCommandClients(
       {
         pagination: commandPaginationResult({ page, pageSize, total }),
         search,
+        scope,
         clients: rows,
         /**
          * Coverage across the whole client base, not the page. It answers the
