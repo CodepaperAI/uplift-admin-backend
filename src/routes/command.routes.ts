@@ -22,6 +22,7 @@ import {
   getCommandStripeSyncRuns,
   requestCommandStripeReconciliation,
 } from "../controllers/command-stripe.controller";
+import { getCommandSocialPosts } from "../controllers/command-social.controller";
 import {
   getCommandGhlOverview,
   getCommandPipeline,
@@ -161,6 +162,17 @@ CommandRouter.post(
   requestCommandGhlPaymentSync,
 );
 CommandRouter.get("/pipeline", requireCommandPanel, getCommandPipeline);
+/**
+ * Every client's social publishing output, so gated on the all-accounts
+ * capability rather than on panel access. A sales rep is scoped to their own
+ * book everywhere else on this router; this feed carries other clients'
+ * captions and account handles, and has no per-rep scoping to fall back on.
+ */
+CommandRouter.get(
+  "/social/posts",
+  requireCommandCapability("view.team.all"),
+  getCommandSocialPosts,
+);
 CommandRouter.patch(
   "/pipeline/:id/stage",
   requireCommandCapability("edit.leads"),
