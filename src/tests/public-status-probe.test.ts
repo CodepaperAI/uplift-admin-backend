@@ -15,7 +15,7 @@ function prismaMock(overrides: Record<string, unknown> = {}): PrismaClient {
     socialPublisherProfile: {
       findFirst: async () => ({ externalProfileId: "profile-1" }),
     },
-    socialPublishAttempt: { count: async () => 0 },
+    socialPublishAttempt: { count: async () => 0, findMany: async () => [] },
     googleMyBusiness: {
       findMany: async () => [{ lastSyncAt: now, lastSyncError: null }],
     },
@@ -61,12 +61,41 @@ describe("public status probes", () => {
 
   it("does not turn customer reconnect errors into a platform social outage", async () => {
     const result = await runPublicStatusProbe("social-media-publishing", {
-      prisma: prismaMock(),
+      prisma: prismaMock({
+        socialPublishAttempt: {
+          count: async () => 0,
+          findMany: async () =>
+            Array.from({ length: 8 }, () => ({
+              lastErrorCode: null,
+              lastErrorMessage:
+                "Failed to create media container 1: HTTP error! status: 403 - Application does not have permission for this action",
+            })),
+        },
+      }),
       now: () => now,
       fetchImpl: fetch,
       zernioClient: { listAccounts: async () => [{ _id: "a", platform: "linkedin" }] },
     });
     expect(result.ok).toBe(true);
+  });
+
+  it("reports a platform social outage for repeated provider/server failures", async () => {
+    const result = await runPublicStatusProbe("social-media-publishing", {
+      prisma: prismaMock({
+        socialPublishAttempt: {
+          count: async () => 0,
+          findMany: async () =>
+            Array.from({ length: 5 }, () => ({
+              lastErrorCode: "ZERNIO_SERVER_ERROR",
+              lastErrorMessage: "HTTP 500 from publishing provider",
+            })),
+        },
+      }),
+      now: () => now,
+      fetchImpl: fetch,
+      zernioClient: { listAccounts: async () => [{ _id: "a", platform: "instagram" }] },
+    });
+    expect(result.ok).toBe(false);
   });
 
   it("requires at least one recently synchronized real GMB connection", async () => {

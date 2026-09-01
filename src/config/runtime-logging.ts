@@ -17,7 +17,7 @@ export function isVerboseBackendLoggingEnabled(
 /**
  * The backend historically accumulated hundreds of per-request and per-item
  * console.log calls. Disable that informational stream by default so provider
- * payload formatting and stdout/PM2 writes cannot consume request CPU or disk.
+ * payload formatting and stdout writes cannot consume request CPU or disk.
  * Warnings and errors remain untouched. Set BACKEND_VERBOSE_LOGGING=true only
  * for a short, targeted debugging session.
  */

@@ -76,14 +76,16 @@ async function checkAi(deps: Dependencies, now: Date): Promise<boolean> {
 }
 
 async function checkDashboardAuthentication(deps: Dependencies): Promise<boolean> {
-  const frontendUrl = (process.env.FRONTEND_URL ?? "https://dashboard.upliftai.co").replace(
-    /\/+$/,
-    "",
-  );
-  const backendUrl = (process.env.BACKEND_URL ?? "https://api.upliftai.co").replace(
-    /\/+$/,
-    "",
-  );
+  const frontendUrl = (
+    process.env.STATUS_DASHBOARD_URL ??
+    process.env.FRONTEND_URL ??
+    "https://dashboard.upliftai.co"
+  ).replace(/\/+$/, "");
+  const backendUrl = (
+    process.env.STATUS_CORE_API_URL ??
+    process.env.CORE_BACKEND_URL ??
+    "https://api.upliftai.co"
+  ).replace(/\/+$/, "");
   const [dashboard, session] = await Promise.all([
     fetchWithTimeout(deps.fetchImpl, `${frontendUrl}/sign-in`, {
       method: "GET",
@@ -117,13 +119,6 @@ async function checkBlogPublishing(deps: Dependencies, now: Date): Promise<boole
   return stuck < 2 && !ratioIsSystemic(failed, published + failed);
 }
 
-const USER_CONNECTION_ERROR_CODES = [
-  "SOCIAL_ACCOUNT_RECONNECT_REQUIRED",
-  "ZERNIO_ACCOUNT_NOT_CONNECTED",
-  "ZERNIO_ACCOUNT_INACTIVE",
-  "ZERNIO_INVALID_TOKEN",
-];
-
 async function checkSocialPublishing(deps: Dependencies, now: Date): Promise<boolean> {
   const profile = await deps.prisma.socialPublisherProfile.findFirst({
     where: {
@@ -137,20 +132,19 @@ async function checkSocialPublishing(deps: Dependencies, now: Date): Promise<boo
   if (!profile?.externalProfileId) return false;
 
   const since = hoursBefore(now, 24);
-  const [remoteAccounts, published, failed, stuck] = await Promise.all([
+  const [remoteAccounts, published, failedAttempts, stuck] = await Promise.all([
     deps.zernioClient.listAccounts(profile.externalProfileId),
     deps.prisma.socialPublishAttempt.count({
       where: { createdAt: { gte: since }, status: "PUBLISHED" },
     }),
-    deps.prisma.socialPublishAttempt.count({
+    deps.prisma.socialPublishAttempt.findMany({
       where: {
         createdAt: { gte: since },
         status: "FAILED",
-        OR: [
-          { lastErrorCode: null },
-          { lastErrorCode: { notIn: USER_CONNECTION_ERROR_CODES } },
-        ],
       },
+      select: { lastErrorCode: true, lastErrorMessage: true },
+      orderBy: { createdAt: "desc" },
+      take: 500,
     }),
     deps.prisma.socialPublishAttempt.count({
       where: {
@@ -160,7 +154,17 @@ async function checkSocialPublishing(deps: Dependencies, now: Date): Promise<boo
       },
     }),
   ]);
-  return remoteAccounts.length > 0 && stuck < 2 && !ratioIsSystemic(failed, published + failed);
+  const systemicFailures = failedAttempts.filter((attempt) => {
+    const details = [attempt.lastErrorCode, attempt.lastErrorMessage]
+      .filter(Boolean)
+      .join(" ");
+    return !isCustomerConnectionError(details);
+  }).length;
+  return (
+    remoteAccounts.length > 0 &&
+    stuck < 2 &&
+    !ratioIsSystemic(systemicFailures, published + systemicFailures)
+  );
 }
 
 function isCustomerConnectionError(message: string | null): boolean {
