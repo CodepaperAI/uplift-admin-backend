@@ -47,7 +47,6 @@ import { mergeMajorCurrencyBucketsIntoMinor } from "../command/money";
 import { aggregateCommandUnitEconomics } from "../command/unit-economics";
 import { activityRatios } from "../command/activity-metrics";
 import { getCommandStripeMonthlyMovement } from "../command/stripe-monthly-rollup.service";
-import { calculateLifetimeValue } from "../command/lifetime-value";
 import {
   aggregateTrailingRevenueChurn,
   calculateGrowthEconomics,
@@ -429,17 +428,6 @@ export async function getCommandStripeOverview(
   try {
     const period = commandMonthRange(currentCommandMonth());
     /**
-     * The three months lifetime value is measured over — the same months the
-     * trailing revenue churn uses, so the margin and the churn it divides by
-     * describe one window rather than two.
-     */
-    const TRAILING_MONTHS = 3;
-    const trailingMonthKeys = commandMonthsEndingAt(period.month, TRAILING_MONTHS);
-    const trailingWindow = {
-      start: commandMonthRange(trailingMonthKeys[trailingMonthKeys.length - 1]!).start,
-      end: period.end,
-    };
-    /**
      * A ceiling high enough that the roster arrives in one page.
      *
      * This endpoint computes the entire Command payload — nineteen parallel
@@ -523,8 +511,6 @@ export async function getCommandStripeOverview(
       allTimeOneOffPaidGroups,
       allTimeGhlTransactions,
       monthlyCostGroups,
-      trailingDeliveryCostGroups,
-      planTierByPriceRows,
       monthlyMovements,
       ghlRevenueTransactions,
       knownStripeSubscriptionIds,
@@ -643,39 +629,6 @@ export async function getCommandStripeOverview(
           occurredAt: { gte: period.start, lt: period.end },
         },
         _sum: { amountMinor: true },
-      }),
-      /**
-       * Delivery cost over the trailing window the churn rate is measured
-       * across, for the lifetime-value margin.
-       *
-       * Separate from the current-month rollup above, which is a month-to-date
-       * view and correct for what it is. Lifetime value cannot use it: on the
-       * second of a month it holds two days, so an LTV built on it would swing
-       * through the first week and vanish at each boundary when collections were
-       * briefly nought. Same window as the churn it divides by.
-       */
-      prisma.commandCostEntry.groupBy({
-        by: ["currency"],
-        where: {
-          deletedAt: null,
-          category: "delivery",
-          occurredAt: { gte: trailingWindow.start, lt: trailingWindow.end },
-        },
-        _sum: { amountMinor: true },
-      }),
-      /**
-       * Which entitlement tier each sold price grants.
-       *
-       * Read from the subscription rows rather than matched on plan names: a
-       * rename in Stripe once emptied a whole plan line, and the four price ids
-       * in configuration cover only four of the seven prices actually sold.
-       * `planTier` is the product's own answer to "does this include social",
-       * and it is what gates the feature at runtime.
-       */
-      prisma.websiteSubscription.findMany({
-        where: { stripePriceId: { not: null } },
-        distinct: ["stripePriceId"],
-        select: { stripePriceId: true, planTier: true },
       }),
       Promise.all(
         commandMonthsEndingAt(period.month, 3).map((month) =>
@@ -1403,11 +1356,7 @@ export async function getCommandStripeOverview(
      * snapshot block. Total collected across *everything* Stripe has settled,
      * one-off invoices included, is `paidToDateMinorByCurrency` further down.
      */
-    const [
-      upliftMonthlyPaidGroups,
-      upliftAllTimePaidGroups,
-      upliftTrailingPaidGroups,
-    ] =
+    const [upliftMonthlyPaidGroups, upliftAllTimePaidGroups] =
       upliftSubscriptionIds.length
         ? await Promise.all([
             prisma.commandStripeInvoice.groupBy({
@@ -1428,20 +1377,8 @@ export async function getCommandStripeOverview(
               },
               _sum: { amountPaidMinor: true },
             }),
-            // The trailing window the lifetime-value margin is measured over,
-            // scoped to Uplift plans like the two above it so the margin, the
-            // MRR and the subscription count all describe one book.
-            prisma.commandStripeInvoice.groupBy({
-              by: ["currency"],
-              where: {
-                status: "paid",
-                paidAt: { gte: trailingWindow.start, lt: trailingWindow.end },
-                stripeSubscriptionId: { in: upliftSubscriptionIds },
-              },
-              _sum: { amountPaidMinor: true },
-            }),
           ])
-        : [[], [], []];
+        : [[], []];
     const upliftMrrByCurrency = new Map<string, Prisma.Decimal>();
     const upliftPlanBuckets = new Map<
       string,
@@ -1616,123 +1553,6 @@ export async function getCommandStripeOverview(
     const customersWithMultipleSubscriptionsCount = [
       ...upliftSubscriptionCountByCustomerId.values(),
     ].filter((subscriptionCount) => subscriptionCount > 1).length;
-    /**
-     * Lifetime value, per currency, with no commission run required.
-     *
-     * `growthEconomics` further down is discarded unless a commission run is
-     * locked, because CAC needs the rep payouts a locked run carries. LTV needs
-     * ARPU, gross margin and churn — none of which come from a commission run —
-     * so gating it behind one hid a figure that was computable all along.
-     *
-     * Uplift product plans only, matching the card it sits on: the same MRR and
-     * the same subscription count the snapshot already shows, so the figures
-     * reconcile rather than quietly using different bases.
-     */
-    const upliftPayingUnitsByCurrency = new Map<string, number>();
-    for (const subscription of upliftSubscriptions) {
-      if (!subscription.currency) continue;
-      const key = subscription.currency.toLowerCase();
-      upliftPayingUnitsByCurrency.set(
-        key,
-        (upliftPayingUnitsByCurrency.get(key) ?? 0) + 1,
-      );
-    }
-    const trailingCollectedMinorByCurrency = new Map<string, Prisma.Decimal>();
-    for (const row of upliftTrailingPaidGroups) {
-      const key = (row.currency ?? "").toLowerCase();
-      if (!key) continue;
-      trailingCollectedMinorByCurrency.set(
-        key,
-        (trailingCollectedMinorByCurrency.get(key) ?? new Prisma.Decimal(0)).add(
-          row._sum.amountPaidMinor ?? 0,
-        ),
-      );
-    }
-    const trailingDeliveryMinorByCurrency = new Map<string, Prisma.Decimal>();
-    for (const row of trailingDeliveryCostGroups) {
-      const key = (row.currency ?? "").toLowerCase();
-      if (!key) continue;
-      trailingDeliveryMinorByCurrency.set(
-        key,
-        (trailingDeliveryMinorByCurrency.get(key) ?? new Prisma.Decimal(0)).add(
-          row._sum.amountMinor ?? 0,
-        ),
-      );
-    }
-    const lifetimeValueByCurrency = Object.fromEntries(
-      [...upliftMrrByCurrency.entries()]
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([currency, mrr]) => [
-          currency,
-          calculateLifetimeValue({
-            mrrMinor: mrr,
-            payingUnits: upliftPayingUnitsByCurrency.get(currency) ?? 0,
-            collectedMinor:
-              trailingCollectedMinorByCurrency.get(currency) ??
-              new Prisma.Decimal(0),
-            deliveryCostMinor:
-              trailingDeliveryMinorByCurrency.get(currency) ??
-              new Prisma.Decimal(0),
-            monthlyChurnPercent:
-              trailingRevenueChurn.revenueChurnPercentByCurrency[currency] ??
-              null,
-            churnWindowMonths: TRAILING_MONTHS,
-          }),
-        ]),
-    );
-
-    /**
-     * How many paying customers get social, and how many only get SEO.
-     *
-     * Counted per customer rather than per subscription, because the question
-     * is about customers and a customer holding two plans is one of them — and
-     * two of the 172 hold more than one subscription, so the distinction is not
-     * hypothetical.
-     *
-     * The tier comes from `WebsiteSubscription.planTier`, which is what gates
-     * the feature at runtime, mapped price by price. Not a name match: a rename
-     * in Stripe once emptied a whole plan line, and the four price ids in
-     * configuration cover only four of the seven prices actually sold.
-     *
-     * There is no "social only" bucket because the product does not sell one —
-     * the entitlement enum holds exactly SEO and SEO_SOCIAL, so every social
-     * customer also has SEO. A bucket that can only ever read nought would
-     * imply the question had been answered when it had not.
-     */
-    const tierByPriceId = new Map<string, string>();
-    for (const row of planTierByPriceRows) {
-      if (row.stripePriceId) tierByPriceId.set(row.stripePriceId, row.planTier);
-    }
-    const planAccess = {
-      seoOnly: 0,
-      seoAndSocial: 0,
-      unclassified: 0,
-    };
-    const unclassifiedPriceIds = new Set<string>();
-    for (const customerId of payingUpliftCustomerIds) {
-      const held = upliftSubscriptions.filter(
-        (subscription) => subscription.stripeCustomerId === customerId,
-      );
-      let hasSocial = false;
-      let hasSeo = false;
-      let hasUnknown = false;
-      for (const subscription of held) {
-        for (const priceId of subscription.stripePriceIds) {
-          if (!upliftPlanByPriceId.has(priceId)) continue;
-          const tier = tierByPriceId.get(priceId);
-          if (tier === "SEO_SOCIAL") hasSocial = true;
-          else if (tier === "SEO") hasSeo = true;
-          else {
-            hasUnknown = true;
-            unclassifiedPriceIds.add(priceId);
-          }
-        }
-      }
-      if (hasSocial) planAccess.seoAndSocial += 1;
-      else if (hasSeo) planAccess.seoOnly += 1;
-      else if (hasUnknown) planAccess.unclassified += 1;
-    }
-
     const counts = {
       accounts: accountRows.length,
       subscriptions: subscriptionCount,
@@ -1816,29 +1636,6 @@ export async function getCommandStripeOverview(
             liveUpliftBilling?.missingSubscriptionCount ??
             upliftSubscriptions.length,
           mrrMinorByCurrency: upliftMrrMinorByCurrency,
-          /**
-           * Lifetime value beside the MRR and ARPU it is built from, so the
-           * three reconcile on the card instead of coming from three bases.
-           */
-          lifetimeValue: {
-            byCurrency: lifetimeValueByCurrency,
-            trailingMonths: trailingMonthKeys,
-            window: {
-              start: trailingWindow.start.toISOString(),
-              end: trailingWindow.end.toISOString(),
-            },
-          },
-          /**
-           * Paying customers split by what their plan actually entitles them
-           * to. `socialOnlySold: false` states that the product has no
-           * social-only tier, so a reader does not wait for a bucket that will
-           * never appear.
-           */
-          planAccess: {
-            ...planAccess,
-            socialOnlySold: false,
-            unclassifiedPriceIds: [...unclassifiedPriceIds],
-          },
           collectedThisMonthMinorByCurrency:
             upliftCollectedThisMonthMinorByCurrency,
           collectedAllTimeMinorByCurrency:
