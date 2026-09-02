@@ -524,6 +524,8 @@ export async function getCommandStripeOverview(
       allTimeGhlTransactions,
       monthlyCostGroups,
       trailingDeliveryCostGroups,
+      socialTierPriceRows,
+      seoTierPriceRows,
       monthlyMovements,
       ghlRevenueTransactions,
       knownStripeSubscriptionIds,
@@ -661,6 +663,31 @@ export async function getCommandStripeOverview(
           occurredAt: { gte: trailingWindow.start, lt: trailingWindow.end },
         },
         _sum: { amountMinor: true },
+      }),
+      /**
+       * Which prices grant social, and which grant SEO alone.
+       *
+       * One query per known tier, filtering on `planTier` and never selecting
+       * it. `seo-be` owns migrations while this schema is hash-pinned, so the
+       * live column can hold a tier this enum does not have — and selecting it
+       * makes Prisma decode every row, which throws on the first unknown value
+       * and takes the query with it. Filtering compares in SQL instead, so an
+       * unknown tier simply matches neither query and its prices surface as
+       * unclassified rather than as a 500.
+       *
+       * Read from subscription rows rather than matched on plan names: a rename
+       * in Stripe once emptied a whole plan line, and the four price ids in
+       * configuration cover only four of the seven prices actually sold.
+       */
+      prisma.websiteSubscription.findMany({
+        where: { stripePriceId: { not: null }, planTier: "SEO_SOCIAL" },
+        distinct: ["stripePriceId"],
+        select: { stripePriceId: true },
+      }),
+      prisma.websiteSubscription.findMany({
+        where: { stripePriceId: { not: null }, planTier: "SEO" },
+        distinct: ["stripePriceId"],
+        select: { stripePriceId: true },
       }),
       Promise.all(
         commandMonthsEndingAt(period.month, 3).map((month) =>
@@ -1666,6 +1693,65 @@ export async function getCommandStripeOverview(
         ]),
     );
 
+    /**
+     * How many paying customers get social, and how many only get SEO.
+     *
+     * Counted per customer rather than per subscription, because the question
+     * is about customers and a customer holding two plans is one of them — two
+     * of the 172 hold more than one, so the distinction is not hypothetical.
+     *
+     * There is no "social only" bucket because the product does not sell one:
+     * the entitlement enum holds SEO and SEO_SOCIAL, so every social customer
+     * also has SEO. `socialOnlySold: false` says that outright rather than
+     * shipping a bucket that can only ever read nought, which would imply the
+     * question had been answered when it had not. Should a social-only tier ever
+     * appear in the database, its prices land in `unclassified` and are named,
+     * which is the signal to revisit this.
+     */
+    const socialPriceIdSet = new Set(
+      socialTierPriceRows.flatMap((row) =>
+        row.stripePriceId ? [row.stripePriceId] : [],
+      ),
+    );
+    const seoPriceIdSet = new Set(
+      seoTierPriceRows.flatMap((row) =>
+        row.stripePriceId ? [row.stripePriceId] : [],
+      ),
+    );
+    const planAccess = { seoOnly: 0, seoAndSocial: 0, unclassified: 0 };
+    const unclassifiedPriceIds = new Set<string>();
+    const upliftSubscriptionsByCustomerId = new Map<
+      string,
+      typeof upliftSubscriptions
+    >();
+    for (const subscription of upliftSubscriptions) {
+      if (!subscription.stripeCustomerId) continue;
+      const bucket =
+        upliftSubscriptionsByCustomerId.get(subscription.stripeCustomerId) ?? [];
+      bucket.push(subscription);
+      upliftSubscriptionsByCustomerId.set(subscription.stripeCustomerId, bucket);
+    }
+    for (const customerId of payingUpliftCustomerIds) {
+      let hasSocial = false;
+      let hasSeo = false;
+      let hasUnknown = false;
+      for (const subscription of
+        upliftSubscriptionsByCustomerId.get(customerId) ?? []) {
+        for (const priceId of subscription.stripePriceIds) {
+          if (!upliftPlanByPriceId.has(priceId)) continue;
+          if (socialPriceIdSet.has(priceId)) hasSocial = true;
+          else if (seoPriceIdSet.has(priceId)) hasSeo = true;
+          else {
+            hasUnknown = true;
+            unclassifiedPriceIds.add(priceId);
+          }
+        }
+      }
+      if (hasSocial) planAccess.seoAndSocial += 1;
+      else if (hasSeo) planAccess.seoOnly += 1;
+      else if (hasUnknown) planAccess.unclassified += 1;
+    }
+
     const counts = {
       accounts: accountRows.length,
       subscriptions: subscriptionCount,
@@ -1760,6 +1846,12 @@ export async function getCommandStripeOverview(
               start: trailingWindow.start.toISOString(),
               end: trailingWindow.end.toISOString(),
             },
+          },
+          /** Paying customers split by what their plan entitles them to. */
+          planAccess: {
+            ...planAccess,
+            socialOnlySold: false,
+            unclassifiedPriceIds: [...unclassifiedPriceIds],
           },
           collectedThisMonthMinorByCurrency:
             upliftCollectedThisMonthMinorByCurrency,
