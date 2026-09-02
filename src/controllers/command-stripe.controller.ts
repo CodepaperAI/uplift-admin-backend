@@ -47,6 +47,7 @@ import { mergeMajorCurrencyBucketsIntoMinor } from "../command/money";
 import { aggregateCommandUnitEconomics } from "../command/unit-economics";
 import { activityRatios } from "../command/activity-metrics";
 import { getCommandStripeMonthlyMovement } from "../command/stripe-monthly-rollup.service";
+import { calculateLifetimeValue } from "../command/lifetime-value";
 import {
   aggregateTrailingRevenueChurn,
   calculateGrowthEconomics,
@@ -428,6 +429,17 @@ export async function getCommandStripeOverview(
   try {
     const period = commandMonthRange(currentCommandMonth());
     /**
+     * The three months lifetime value is measured over — the same months the
+     * trailing revenue churn uses, so the margin and the churn it divides by
+     * describe one window rather than two.
+     */
+    const TRAILING_MONTHS = 3;
+    const trailingMonthKeys = commandMonthsEndingAt(period.month, TRAILING_MONTHS);
+    const trailingWindow = {
+      start: commandMonthRange(trailingMonthKeys[trailingMonthKeys.length - 1]!).start,
+      end: period.end,
+    };
+    /**
      * A ceiling high enough that the roster arrives in one page.
      *
      * This endpoint computes the entire Command payload — nineteen parallel
@@ -511,6 +523,7 @@ export async function getCommandStripeOverview(
       allTimeOneOffPaidGroups,
       allTimeGhlTransactions,
       monthlyCostGroups,
+      trailingDeliveryCostGroups,
       monthlyMovements,
       ghlRevenueTransactions,
       knownStripeSubscriptionIds,
@@ -627,6 +640,25 @@ export async function getCommandStripeOverview(
         where: {
           deletedAt: null,
           occurredAt: { gte: period.start, lt: period.end },
+        },
+        _sum: { amountMinor: true },
+      }),
+      /**
+       * Delivery cost over the trailing window the churn rate is measured
+       * across, for the lifetime-value margin.
+       *
+       * Separate from the current-month rollup above, which is a month-to-date
+       * view and correct for what it is. Lifetime value cannot use it: on the
+       * second of a month it holds two days, so an LTV built on it would swing
+       * through the first week and vanish at each boundary when collections were
+       * briefly nought. Same window as the churn it divides by.
+       */
+      prisma.commandCostEntry.groupBy({
+        by: ["currency"],
+        where: {
+          deletedAt: null,
+          category: "delivery",
+          occurredAt: { gte: trailingWindow.start, lt: trailingWindow.end },
         },
         _sum: { amountMinor: true },
       }),
@@ -1356,7 +1388,11 @@ export async function getCommandStripeOverview(
      * snapshot block. Total collected across *everything* Stripe has settled,
      * one-off invoices included, is `paidToDateMinorByCurrency` further down.
      */
-    const [upliftMonthlyPaidGroups, upliftAllTimePaidGroups] =
+    const [
+      upliftMonthlyPaidGroups,
+      upliftAllTimePaidGroups,
+      upliftTrailingPaidGroups,
+    ] =
       upliftSubscriptionIds.length
         ? await Promise.all([
             prisma.commandStripeInvoice.groupBy({
@@ -1377,8 +1413,20 @@ export async function getCommandStripeOverview(
               },
               _sum: { amountPaidMinor: true },
             }),
+            // The trailing window the lifetime-value margin is measured over,
+            // scoped to Uplift plans like the two above it so the margin, the
+            // MRR and the subscription count all describe one book.
+            prisma.commandStripeInvoice.groupBy({
+              by: ["currency"],
+              where: {
+                status: "paid",
+                paidAt: { gte: trailingWindow.start, lt: trailingWindow.end },
+                stripeSubscriptionId: { in: upliftSubscriptionIds },
+              },
+              _sum: { amountPaidMinor: true },
+            }),
           ])
-        : [[], []];
+        : [[], [], []];
     const upliftMrrByCurrency = new Map<string, Prisma.Decimal>();
     const upliftPlanBuckets = new Map<
       string,
@@ -1553,6 +1601,71 @@ export async function getCommandStripeOverview(
     const customersWithMultipleSubscriptionsCount = [
       ...upliftSubscriptionCountByCustomerId.values(),
     ].filter((subscriptionCount) => subscriptionCount > 1).length;
+    /**
+     * Lifetime value, per currency, with no commission run required.
+     *
+     * `growthEconomics` further down is discarded unless a commission run is
+     * locked, because CAC needs the rep payouts a locked run carries. LTV needs
+     * ARPU, gross margin and churn — none of which come from a commission run —
+     * so gating it behind one hid a figure that was computable all along.
+     *
+     * Uplift product plans only, matching the card it sits on: the same MRR and
+     * the same subscription count the snapshot already shows, so the figures
+     * reconcile rather than quietly using different bases.
+     */
+    const upliftPayingUnitsByCurrency = new Map<string, number>();
+    for (const subscription of upliftSubscriptions) {
+      if (!subscription.currency) continue;
+      const key = subscription.currency.toLowerCase();
+      upliftPayingUnitsByCurrency.set(
+        key,
+        (upliftPayingUnitsByCurrency.get(key) ?? 0) + 1,
+      );
+    }
+    const trailingCollectedMinorByCurrency = new Map<string, Prisma.Decimal>();
+    for (const row of upliftTrailingPaidGroups) {
+      const key = (row.currency ?? "").toLowerCase();
+      if (!key) continue;
+      trailingCollectedMinorByCurrency.set(
+        key,
+        (trailingCollectedMinorByCurrency.get(key) ?? new Prisma.Decimal(0)).add(
+          row._sum.amountPaidMinor ?? 0,
+        ),
+      );
+    }
+    const trailingDeliveryMinorByCurrency = new Map<string, Prisma.Decimal>();
+    for (const row of trailingDeliveryCostGroups) {
+      const key = (row.currency ?? "").toLowerCase();
+      if (!key) continue;
+      trailingDeliveryMinorByCurrency.set(
+        key,
+        (trailingDeliveryMinorByCurrency.get(key) ?? new Prisma.Decimal(0)).add(
+          row._sum.amountMinor ?? 0,
+        ),
+      );
+    }
+    const lifetimeValueByCurrency = Object.fromEntries(
+      [...upliftMrrByCurrency.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([currency, mrr]) => [
+          currency,
+          calculateLifetimeValue({
+            mrrMinor: mrr,
+            payingUnits: upliftPayingUnitsByCurrency.get(currency) ?? 0,
+            collectedMinor:
+              trailingCollectedMinorByCurrency.get(currency) ??
+              new Prisma.Decimal(0),
+            deliveryCostMinor:
+              trailingDeliveryMinorByCurrency.get(currency) ??
+              new Prisma.Decimal(0),
+            monthlyChurnPercent:
+              trailingRevenueChurn.revenueChurnPercentByCurrency[currency] ??
+              null,
+            churnWindowMonths: TRAILING_MONTHS,
+          }),
+        ]),
+    );
+
     const counts = {
       accounts: accountRows.length,
       subscriptions: subscriptionCount,
@@ -1636,6 +1749,18 @@ export async function getCommandStripeOverview(
             liveUpliftBilling?.missingSubscriptionCount ??
             upliftSubscriptions.length,
           mrrMinorByCurrency: upliftMrrMinorByCurrency,
+          /**
+           * Lifetime value beside the MRR and ARPU it is built from, so the
+           * three reconcile on the card instead of coming from three bases.
+           */
+          lifetimeValue: {
+            byCurrency: lifetimeValueByCurrency,
+            trailingMonths: trailingMonthKeys,
+            window: {
+              start: trailingWindow.start.toISOString(),
+              end: trailingWindow.end.toISOString(),
+            },
+          },
           collectedThisMonthMinorByCurrency:
             upliftCollectedThisMonthMinorByCurrency,
           collectedAllTimeMinorByCurrency:
