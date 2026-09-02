@@ -171,11 +171,31 @@ export async function getCommandPayingChurn(
       histories: fullPriceHistories,
       cohorts: fullPriceCohorts,
     });
+    /**
+     * Recurring revenue from exactly the customers the denominator counts.
+     *
+     * The first version divided *all* live recurring revenue by full-price
+     * paying customers only, which is two different populations either side of
+     * the divide: the numerator carried trialing subscriptions, failing cards
+     * and customers who never reached full price, the denominator did not. It
+     * reported ARPU of $167.69 where the honest figure is nearer $130, and ARPU
+     * is a direct multiplier on lifetime value.
+     *
+     * Both sides now come from the same set: customers who reached full price
+     * and are collecting today.
+     */
+    const payingFullPriceCustomerIds = new Set(
+      fullPriceHistories
+        .filter((history) => history.state === "paying")
+        .map((history) => history.stripeCustomerId),
+    );
     const liveMrrByCurrency = new Map<string, Prisma.Decimal>();
+    const payingCustomerIdsByCurrency = new Map<string, Set<string>>();
     for (const row of consideredSubscriptions) {
-      if (!row.currency) continue;
-      if (!["trialing", "active", "past_due"].includes(row.status)) continue;
+      if (!row.currency || !row.stripeCustomerId) continue;
+      if (row.status !== "active") continue;
       if (row.pauseCollectionBehavior !== null) continue;
+      if (!payingFullPriceCustomerIds.has(row.stripeCustomerId)) continue;
       const key = row.currency.toLowerCase();
       liveMrrByCurrency.set(
         key,
@@ -183,6 +203,10 @@ export async function getCommandPayingChurn(
           row.monthlyRecurringMinor,
         ),
       );
+      const customers =
+        payingCustomerIdsByCurrency.get(key) ?? new Set<string>();
+      customers.add(row.stripeCustomerId);
+      payingCustomerIdsByCurrency.set(key, customers);
     }
     const marginCollectedByCurrency = new Map<string, Prisma.Decimal>();
     for (const invoice of consideredInvoices) {
@@ -209,15 +233,6 @@ export async function getCommandPayingChurn(
         ),
       );
     }
-    const payingCustomersByCurrency = new Map<string, number>();
-    for (const history of fullPriceHistories) {
-      if (history.state !== "paying") continue;
-      const key = history.currency.toLowerCase();
-      payingCustomersByCurrency.set(
-        key,
-        (payingCustomersByCurrency.get(key) ?? 0) + 1,
-      );
-    }
     const lifetimeValueByCurrency = Object.fromEntries(
       [...liveMrrByCurrency.entries()]
         .sort(([left], [right]) => left.localeCompare(right))
@@ -225,7 +240,8 @@ export async function getCommandPayingChurn(
           currency,
           calculateLifetimeValueFromCohorts({
             mrrMinor: mrr,
-            payingCustomers: payingCustomersByCurrency.get(currency) ?? 0,
+            payingCustomers:
+              payingCustomerIdsByCurrency.get(currency)?.size ?? 0,
             collectedMinor:
               marginCollectedByCurrency.get(currency) ?? new Prisma.Decimal(0),
             deliveryCostMinor:
@@ -252,6 +268,8 @@ export async function getCommandPayingChurn(
           "Holds a subscription Stripe reports as active. A past-due card is reported separately as at risk, because it is neither paying nor certainly lost.",
         method:
           "Cohort survival read at today's date, from settled invoices and current subscription status. Nothing is inferred from the event log, so nothing depends on when that log begins.",
+        arpuPopulation:
+          "Recurring revenue from customers who reached full price and are collecting today, divided by that same count. Narrower than the snapshot's ARPU, which spreads all recurring revenue across every paying subscription.",
         caveat:
           "Each cohort's survival is observed once, now, so age and cohort quality are entangled: March's customers differ from August's in more than age. Lifetime is summed only across ages actually observed, never extrapolated.",
       },
