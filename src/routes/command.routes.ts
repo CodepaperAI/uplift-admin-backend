@@ -24,6 +24,7 @@ import {
 } from "../controllers/command-stripe.controller";
 import { getCommandSocialPosts } from "../controllers/command-social.controller";
 import { getCommandClients } from "../controllers/command-clients.controller";
+import { getCommandPayingChurn } from "../controllers/command-paying-churn.controller";
 import {
   getCommandClientBlogs,
   getCommandClientOverview,
@@ -131,6 +132,12 @@ CommandRouter.get(
   "/stripe/health",
   requireCommandCapability("view.financials"),
   getCommandStripeHealth,
+);
+/** Cohort survival among customers who actually paid. Feeds lifetime value. */
+CommandRouter.get(
+  "/stripe/paying-churn",
+  requireCommandCapability("view.financials"),
+  getCommandPayingChurn,
 );
 CommandRouter.post(
   "/stripe/reconcile",
