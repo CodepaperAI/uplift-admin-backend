@@ -4,6 +4,8 @@ import {
   EXTRAPOLATION_WARNING_FACTOR,
   MAX_LIFETIME_MONTHS,
   calculateLifetimeValue,
+  calculateLifetimeValueRange,
+  cumulativeMonthlyChurnPercent,
 } from "../command/lifetime-value";
 
 /** The live USD figures, so the maths can be checked against the panel. */
@@ -144,5 +146,123 @@ describe("calculateLifetimeValue", () => {
     });
     expect(() => result).not.toThrow();
     expect(result.ltvMinor).toBeNull();
+  });
+});
+
+describe("cumulativeMonthlyChurnPercent", () => {
+  test("compounds the loss across the months observed", () => {
+    // The live figures: USD 15,236.50 of MRR lost against 20,008.45 live, which
+    // is 43.2% of everything ever won, spread over six months of trading.
+    const rate = cumulativeMonthlyChurnPercent({
+      churnedMinor: "1523650",
+      liveMinor: "2000845.1666666666667",
+      monthsObserved: 6,
+    });
+    expect(Number(rate)).toBeCloseTo(9.0, 1);
+  });
+
+  test("compounds rather than divides", () => {
+    // Losing 43% over six months is not 7.2% a month — survival multiplies.
+    // Getting this wrong understates churn and so overstates lifetime value.
+    const rate = Number(
+      cumulativeMonthlyChurnPercent({
+        churnedMinor: "1523650",
+        liveMinor: "2000845.1666666666667",
+        monthsObserved: 6,
+      }),
+    );
+    expect(rate).toBeGreaterThan(43.2 / 6);
+  });
+
+  test("half lost over one month is fifty percent", () => {
+    expect(
+      cumulativeMonthlyChurnPercent({
+        churnedMinor: "1000",
+        liveMinor: "1000",
+        monthsObserved: 1,
+      }),
+    ).toBe("50.0000");
+  });
+
+  test("reports nothing when no revenue has churned yet", () => {
+    // A young book, not permanence. Projecting an infinite life from it would
+    // be the same mistake as dividing by a zero churn rate.
+    expect(
+      cumulativeMonthlyChurnPercent({
+        churnedMinor: "0",
+        liveMinor: "500000",
+        monthsObserved: 6,
+      }),
+    ).toBeNull();
+  });
+
+  test("reports nothing when everything ever won has churned", () => {
+    expect(
+      cumulativeMonthlyChurnPercent({
+        churnedMinor: "500000",
+        liveMinor: "0",
+        monthsObserved: 6,
+      }),
+    ).toBeNull();
+  });
+
+  test("reports nothing before any revenue exists or any time has passed", () => {
+    expect(
+      cumulativeMonthlyChurnPercent({ churnedMinor: 0, liveMinor: 0, monthsObserved: 6 }),
+    ).toBeNull();
+    expect(
+      cumulativeMonthlyChurnPercent({
+        churnedMinor: "100",
+        liveMinor: "100",
+        monthsObserved: 0,
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("calculateLifetimeValueRange", () => {
+  const base = {
+    mrrMinor: "2000845.1666666666667",
+    payingUnits: 170,
+    collectedMinor: "2757499",
+    deliveryCostMinor: "23598",
+    monthlyChurnPercent: "1.3682",
+    cumulativeChurnPercent: "9.0000",
+    monthsObserved: 6,
+    marginMonth: "2026-08",
+  };
+
+  test("the conservative end is far below the optimistic one", () => {
+    const range = calculateLifetimeValueRange(base);
+    const low = Number(range.low!.ltvMinor);
+    const high = Number(range.high!.ltvMinor);
+    expect(low).toBeGreaterThan(0);
+    expect(high).toBeGreaterThan(low);
+    // The spread is the honest content of this metric: two measurements of the
+    // same thing that disagree several times over.
+    expect(high / low).toBeGreaterThan(3);
+  });
+
+  test("names the method behind each end", () => {
+    const range = calculateLifetimeValueRange(base);
+    expect(range.basis.lowMethod).toBe("cumulative_revenue_churn");
+    expect(range.basis.highMethod).toBe("monthly_revenue_churn");
+    expect(range.basis.lowChurnPercent).toBe("9.0000");
+    expect(range.basis.marginMonth).toBe("2026-08");
+  });
+
+  test("the conservative end is not capped, because real churn is not tiny", () => {
+    const range = calculateLifetimeValueRange(base);
+    expect(range.low!.blockers).not.toContain("lifetime_capped");
+    expect(Number(range.low!.expectedLifetimeMonths)).toBeCloseTo(11.1, 0);
+  });
+
+  test("survives either measurement being absent", () => {
+    expect(
+      calculateLifetimeValueRange({ ...base, cumulativeChurnPercent: null }).low,
+    ).toBeNull();
+    expect(
+      calculateLifetimeValueRange({ ...base, monthlyChurnPercent: null }).high,
+    ).toBeNull();
   });
 });

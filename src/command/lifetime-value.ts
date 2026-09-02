@@ -165,3 +165,117 @@ export const LIFETIME_VALUE_BLOCKER_TEXT: Record<string, string> = {
   projection_exceeds_history:
     "The projected lifetime is many times longer than the history it was measured from, so treat it as an estimate rather than a measurement.",
 };
+
+/**
+ * A monthly churn rate derived from everything ever won and lost.
+ *
+ * The second of the two measurements the lifetime-value range is built from,
+ * and the one worth planning against.
+ *
+ * The monthly measure this replaces reads 1.37% a month, which cannot be
+ * reconciled with the account history: 81 subscriptions left in August against
+ * an opening base of about 108. The monthly figure is computed from opening and
+ * churned MRR per month, and churned MRR is under-captured — the Stripe event
+ * log only begins on 2026-08-18, every earlier cancellation is inferred from
+ * subscription records, seven have no date at all and fifty-two subscriptions
+ * cannot be dated. So it understates, and lifetime value is one divided by it.
+ *
+ * This measure sidesteps all of that. It asks what share of the recurring
+ * revenue ever won has since been lost, which needs no month attribution and no
+ * event log, then spreads that loss geometrically across the months the
+ * business has actually been earning. Compounding rather than dividing, because
+ * losing 43% over six months is not 7.2% a month — survival multiplies.
+ */
+export function cumulativeMonthlyChurnPercent(input: {
+  /** MRR on subscriptions that have ended, minor units. */
+  churnedMinor: Prisma.Decimal | string | number;
+  /** MRR still live, minor units. */
+  liveMinor: Prisma.Decimal | string | number;
+  /** Months the business has been earning recurring revenue. */
+  monthsObserved: number;
+}): string | null {
+  const churned = decimal(input.churnedMinor);
+  const live = decimal(input.liveMinor);
+  const everWon = churned.add(live);
+  if (everWon.lte(0) || input.monthsObserved <= 0) return null;
+  // Nothing lost yet is a young book, not permanence. Reported as null so the
+  // caller says "not measurable" rather than projecting an infinite life.
+  if (churned.lte(0)) return null;
+  const survivingShare = live.div(everWon).toNumber();
+  // Everything ever won has churned. A rate cannot be spread across months from
+  // that, and the honest answer is that no lifetime can be projected.
+  if (survivingShare <= 0) return null;
+  const monthlyRetention = Math.pow(survivingShare, 1 / input.monthsObserved);
+  const monthlyChurn = 1 - monthlyRetention;
+  if (!Number.isFinite(monthlyChurn) || monthlyChurn <= 0) return null;
+  return (monthlyChurn * 100).toFixed(4);
+}
+
+export type LifetimeValueRange = {
+  /** The conservative end, from cumulative churn. Plan against this one. */
+  low: LifetimeValue | null;
+  /** The optimistic end, from the monthly revenue-churn measurement. */
+  high: LifetimeValue | null;
+  /** Which measurement drove each end, so the spread can be interrogated. */
+  basis: {
+    lowChurnPercent: string | null;
+    lowMethod: "cumulative_revenue_churn";
+    highChurnPercent: string | null;
+    highMethod: "monthly_revenue_churn";
+    monthsObserved: number;
+    marginMonth: string | null;
+  };
+};
+
+/**
+ * Lifetime value as a range, because a single figure would be a false precision.
+ *
+ * The two ends are two measurements of the same thing that disagree by a factor
+ * of six. That disagreement is the honest content of this metric right now, and
+ * collapsing it to one number — either one — would hide the only thing a reader
+ * needs to know before spending against it.
+ */
+export function calculateLifetimeValueRange(input: {
+  mrrMinor: Prisma.Decimal | string | number;
+  payingUnits: number;
+  collectedMinor: Prisma.Decimal | string | number;
+  deliveryCostMinor: Prisma.Decimal | string | number;
+  monthlyChurnPercent: string | null;
+  cumulativeChurnPercent: string | null;
+  monthsObserved: number;
+  marginMonth: string | null;
+}): LifetimeValueRange {
+  const shared = {
+    mrrMinor: input.mrrMinor,
+    payingUnits: input.payingUnits,
+    collectedMinor: input.collectedMinor,
+    deliveryCostMinor: input.deliveryCostMinor,
+    churnWindowMonths: Math.max(1, input.monthsObserved),
+  };
+  const low =
+    input.cumulativeChurnPercent === null
+      ? null
+      : calculateLifetimeValue({
+          ...shared,
+          monthlyChurnPercent: input.cumulativeChurnPercent,
+        });
+  const high =
+    input.monthlyChurnPercent === null
+      ? null
+      : calculateLifetimeValue({
+          ...shared,
+          monthlyChurnPercent: input.monthlyChurnPercent,
+        });
+  return {
+    low,
+    high,
+    basis: {
+      lowChurnPercent: input.cumulativeChurnPercent,
+      lowMethod: "cumulative_revenue_churn",
+      highChurnPercent: input.monthlyChurnPercent,
+      highMethod: "monthly_revenue_churn",
+      monthsObserved: input.monthsObserved,
+      marginMonth: input.marginMonth,
+    },
+  };
+}
