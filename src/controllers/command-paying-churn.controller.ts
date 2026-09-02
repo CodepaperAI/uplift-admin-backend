@@ -2,7 +2,13 @@ import type { Request, Response } from "express";
 import { prisma } from "../config/db.config";
 import { sendError, sendSuccess } from "../utils/response.utils";
 import { readCommandCache, writeCommandCache } from "../utils/command-cache";
-import { currentCommandMonth } from "../command/toronto-period";
+import {
+  commandMonthRange,
+  commandMonthsEndingAt,
+  currentCommandMonth,
+} from "../command/toronto-period";
+import { calculateLifetimeValueFromCohorts } from "../command/lifetime-value";
+import { Prisma } from "@prisma/client";
 import { upliftPriceSets } from "../command/uplift-prices";
 import {
   buildCohorts,
@@ -49,7 +55,18 @@ export async function getCommandPayingChurn(
       ...prices.socialPriceIds,
     ];
 
-    const [invoices, subscriptions] = await Promise.all([
+    /**
+     * The last complete month, for the margin behind lifetime value.
+     *
+     * Not the current one, which is partial, and not a trailing blend: July's
+     * delivery cost was fourteen times August's after the model migration, so
+     * blending reports a margin for a cost structure no longer in force.
+     */
+    const currentMonthKey = currentCommandMonth();
+    const marginMonth = commandMonthsEndingAt(currentMonthKey, 2)[1]!;
+    const marginWindow = commandMonthRange(marginMonth);
+
+    const [invoices, subscriptions, marginDeliveryCosts] = await Promise.all([
       /**
        * Every settled invoice, narrowly selected.
        *
@@ -74,7 +91,22 @@ export async function getCommandPayingChurn(
           monthlyRecurringMinor: true,
           currency: true,
           stripePriceIds: true,
+          pauseCollectionBehavior: true,
         },
+      }),
+      /**
+       * The only extra read lifetime value needs. Everything else it wants —
+       * recurring revenue, collections, the paying customer count — is already
+       * in memory from the two reads above.
+       */
+      prisma.commandCostEntry.groupBy({
+        by: ["currency"],
+        where: {
+          deletedAt: null,
+          category: "delivery",
+          occurredAt: { gte: marginWindow.start, lt: marginWindow.end },
+        },
+        _sum: { amountMinor: true },
       }),
     ]);
 
@@ -111,7 +143,7 @@ export async function getCommandPayingChurn(
         )
       : invoices;
 
-    const currentMonth = currentCommandMonth();
+    const currentMonth = currentMonthKey;
     const histories = buildCustomerPaymentHistories({
       invoices: consideredInvoices,
       subscriptions: consideredSubscriptions,
@@ -123,6 +155,89 @@ export async function getCommandPayingChurn(
       histories: fullPriceHistories,
       currentMonth,
     });
+
+    /**
+     * Lifetime value, owned here because this is where the churn is measured.
+     *
+     * The overview used to compute its own from two churn estimates that
+     * disagreed sixfold — a monthly series distorted by an incomplete event log,
+     * and a cumulative rate spread across the months of trading. Both are
+     * superseded by the cohort survival above, and leaving the old block in
+     * place would have left two sources of one number free to drift apart.
+     *
+     * Uplift plans only and per customer, matching the card that reads it.
+     */
+    const fullPriceSummary = summariseChurn({
+      histories: fullPriceHistories,
+      cohorts: fullPriceCohorts,
+    });
+    const liveMrrByCurrency = new Map<string, Prisma.Decimal>();
+    for (const row of consideredSubscriptions) {
+      if (!row.currency) continue;
+      if (!["trialing", "active", "past_due"].includes(row.status)) continue;
+      if (row.pauseCollectionBehavior !== null) continue;
+      const key = row.currency.toLowerCase();
+      liveMrrByCurrency.set(
+        key,
+        (liveMrrByCurrency.get(key) ?? new Prisma.Decimal(0)).add(
+          row.monthlyRecurringMinor,
+        ),
+      );
+    }
+    const marginCollectedByCurrency = new Map<string, Prisma.Decimal>();
+    for (const invoice of consideredInvoices) {
+      if (!invoice.paidAt) continue;
+      if (invoice.paidAt < marginWindow.start || invoice.paidAt >= marginWindow.end) {
+        continue;
+      }
+      const key = invoice.currency.toLowerCase();
+      marginCollectedByCurrency.set(
+        key,
+        (marginCollectedByCurrency.get(key) ?? new Prisma.Decimal(0)).add(
+          invoice.amountPaidMinor,
+        ),
+      );
+    }
+    const marginDeliveryByCurrency = new Map<string, Prisma.Decimal>();
+    for (const row of marginDeliveryCosts) {
+      const key = (row.currency ?? "").toLowerCase();
+      if (!key) continue;
+      marginDeliveryByCurrency.set(
+        key,
+        (marginDeliveryByCurrency.get(key) ?? new Prisma.Decimal(0)).add(
+          row._sum.amountMinor ?? 0,
+        ),
+      );
+    }
+    const payingCustomersByCurrency = new Map<string, number>();
+    for (const history of fullPriceHistories) {
+      if (history.state !== "paying") continue;
+      const key = history.currency.toLowerCase();
+      payingCustomersByCurrency.set(
+        key,
+        (payingCustomersByCurrency.get(key) ?? 0) + 1,
+      );
+    }
+    const lifetimeValueByCurrency = Object.fromEntries(
+      [...liveMrrByCurrency.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([currency, mrr]) => [
+          currency,
+          calculateLifetimeValueFromCohorts({
+            mrrMinor: mrr,
+            payingCustomers: payingCustomersByCurrency.get(currency) ?? 0,
+            collectedMinor:
+              marginCollectedByCurrency.get(currency) ?? new Prisma.Decimal(0),
+            deliveryCostMinor:
+              marginDeliveryByCurrency.get(currency) ?? new Prisma.Decimal(0),
+            floorMonths: fullPriceSummary.observedLifetimeMonths,
+            expectedMonths: fullPriceSummary.impliedLifetimeMonths,
+            monthlyChurnPercent: fullPriceSummary.impliedMonthlyChurnPercent,
+            observedThroughMonths: fullPriceSummary.oldestCohortAgeMonths,
+            marginMonth,
+          }),
+        ]),
+    );
 
     const payload = {
       asOf: new Date().toISOString(),
@@ -140,12 +255,18 @@ export async function getCommandPayingChurn(
         caveat:
           "Each cohort's survival is observed once, now, so age and cohort quality are entangled: March's customers differ from August's in more than age. Lifetime is summed only across ages actually observed, never extrapolated.",
       },
+      /**
+       * Lifetime value, from the full-price cohorts above. Owned here so one
+       * place computes it and the snapshot card cannot disagree with it.
+       */
+      lifetimeValue: {
+        byCurrency: lifetimeValueByCurrency,
+        marginMonth,
+        observedThroughMonths: fullPriceSummary.oldestCohortAgeMonths,
+      },
       /** The population lifetime value should read. */
       fullPricePayers: {
-        summary: summariseChurn({
-          histories: fullPriceHistories,
-          cohorts: fullPriceCohorts,
-        }),
+        summary: fullPriceSummary,
         cohorts: fullPriceCohorts,
       },
       /** Everyone who ever paid anything, trials included. */

@@ -221,8 +221,24 @@ export type ChurnSummary = {
    * ages. A measured lower bound: it cannot see past the oldest cohort.
    */
   observedLifetimeMonths: string | null;
-  /** The monthly rate the oldest reliable cohort implies. */
+  /**
+   * The monthly rate the cohorts imply, weighted by how many customers each
+   * holds.
+   *
+   * Read from every cohort rather than the oldest one. The oldest cohort here
+   * holds three customers, so taking its survival alone let three people set
+   * the rate that lifetime value divides by.
+   */
   impliedMonthlyChurnPercent: string | null;
+  /**
+   * Lifetime implied by that rate, which sees past the observation window.
+   *
+   * `observedLifetimeMonths` is a hard floor and badly truncated — retention is
+   * still above half at the oldest ages, so most of the remaining life falls
+   * outside what can be observed. This extends it at the measured rate, and is
+   * the figure lifetime value should use.
+   */
+  impliedLifetimeMonths: string | null;
   /** How far the observation reaches. Lifetime cannot exceed this yet. */
   oldestCohortAgeMonths: number;
 };
@@ -260,6 +276,7 @@ export function summariseChurn(input: {
       overallRetentionPercent: null,
       observedLifetimeMonths: null,
       impliedMonthlyChurnPercent: null,
+      impliedLifetimeMonths: null,
       oldestCohortAgeMonths: 0,
     };
   }
@@ -289,10 +306,31 @@ export function summariseChurn(input: {
     lifetime += age === 0 ? 1 : lastKnown;
   }
 
-  const oldestSurvival = survivalByAge.get(oldest);
-  const impliedMonthlyChurn =
-    oldest > 0 && oldestSurvival !== undefined && oldestSurvival > 0
-      ? 1 - Math.pow(oldestSurvival, 1 / oldest)
+  /**
+   * The monthly rate, weighted by cohort size.
+   *
+   * Each cohort with any age gives its own rate — one minus its survival taken
+   * to the power of one over its age — and the average is weighted by the
+   * customers behind it. Age-nought cohorts are skipped: they have had no month
+   * in which to churn, so including them would report a rate of zero for the
+   * newest and largest group.
+   */
+  let weightedChurn = 0;
+  let weight = 0;
+  for (const cohort of input.cohorts) {
+    if (cohort.ageMonths <= 0 || cohort.customers === 0) continue;
+    const survival = cohort.paying / cohort.customers;
+    // A cohort with nobody left cannot be raised to a fractional power in a way
+    // that means anything: its rate is total loss over its age.
+    const rate =
+      survival > 0 ? 1 - Math.pow(survival, 1 / cohort.ageMonths) : 1;
+    weightedChurn += rate * cohort.customers;
+    weight += cohort.customers;
+  }
+  const impliedMonthlyChurn = weight > 0 ? weightedChurn / weight : null;
+  const impliedLifetime =
+    impliedMonthlyChurn !== null && impliedMonthlyChurn > 0
+      ? 1 / impliedMonthlyChurn
       : null;
 
   return {
@@ -305,6 +343,10 @@ export function summariseChurn(input: {
     impliedMonthlyChurnPercent:
       impliedMonthlyChurn !== null && Number.isFinite(impliedMonthlyChurn)
         ? (impliedMonthlyChurn * 100).toFixed(4)
+        : null,
+    impliedLifetimeMonths:
+      impliedLifetime !== null && Number.isFinite(impliedLifetime)
+        ? impliedLifetime.toFixed(1)
         : null,
     oldestCohortAgeMonths: oldest,
   };

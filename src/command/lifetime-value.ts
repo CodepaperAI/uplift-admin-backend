@@ -279,3 +279,84 @@ export function calculateLifetimeValueRange(input: {
     },
   };
 }
+
+
+/**
+ * Lifetime value from measured cohort survival, which is what to plan against.
+ *
+ * Replaces the pair of guesses the first range was built from. Both ends are
+ * now measurements of the same customers by the same method, differing only in
+ * how far past the observation window they are willing to look.
+ *
+ * `floorMonths` is the area under the retention curve out to the oldest cohort
+ * — a hard lower bound that extrapolates nothing. It is badly truncated on a
+ * young business: retention is still above half at the oldest ages, so most of
+ * the remaining life falls outside what anyone can yet observe. Useful
+ * precisely because it cannot be argued with.
+ *
+ * `expectedMonths` extends the curve at the size-weighted monthly rate the
+ * cohorts imply. That is the honest central estimate.
+ */
+export function calculateLifetimeValueFromCohorts(input: {
+  mrrMinor: Prisma.Decimal | string | number;
+  payingCustomers: number;
+  collectedMinor: Prisma.Decimal | string | number;
+  deliveryCostMinor: Prisma.Decimal | string | number;
+  /** Area under the observed retention curve, in months. */
+  floorMonths: string | null;
+  /** Lifetime implied by the weighted cohort churn rate, in months. */
+  expectedMonths: string | null;
+  monthlyChurnPercent: string | null;
+  observedThroughMonths: number;
+  marginMonth: string | null;
+}): {
+  floor: { ltvMinor: string | null; months: string | null };
+  expected: { ltvMinor: string | null; months: string | null };
+  arpuMinor: string | null;
+  grossMarginPercent: string | null;
+  monthlyChurnPercent: string | null;
+  observedThroughMonths: number;
+  marginMonth: string | null;
+  blockers: string[];
+} {
+  const blockers: string[] = [];
+  const mrr = decimal(input.mrrMinor);
+  const collected = decimal(input.collectedMinor);
+  const delivery = decimal(input.deliveryCostMinor);
+
+  const arpu = input.payingCustomers > 0 ? mrr.div(input.payingCustomers) : null;
+  if (arpu === null) blockers.push("no_paying_customers");
+
+  const grossMargin = collected.gt(0)
+    ? collected.sub(delivery).div(collected)
+    : null;
+  if (grossMargin === null) blockers.push("no_collections_in_margin_month");
+  if (grossMargin && grossMargin.lte(0)) blockers.push("non_positive_margin");
+
+  const value = (months: string | null) => {
+    if (!arpu || !grossMargin || grossMargin.lte(0) || months === null) {
+      return null;
+    }
+    const parsed = new Prisma.Decimal(months);
+    if (parsed.lte(0)) return null;
+    return arpu.mul(grossMargin).mul(parsed).toFixed(4);
+  };
+
+  if (input.floorMonths === null && input.expectedMonths === null) {
+    blockers.push("no_cohort_measurement");
+  }
+
+  return {
+    floor: { ltvMinor: value(input.floorMonths), months: input.floorMonths },
+    expected: {
+      ltvMinor: value(input.expectedMonths),
+      months: input.expectedMonths,
+    },
+    arpuMinor: arpu ? arpu.toFixed(4) : null,
+    grossMarginPercent: grossMargin ? grossMargin.mul(100).toFixed(2) : null,
+    monthlyChurnPercent: input.monthlyChurnPercent,
+    observedThroughMonths: input.observedThroughMonths,
+    marginMonth: input.marginMonth,
+    blockers,
+  };
+}

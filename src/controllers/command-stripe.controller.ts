@@ -48,10 +48,6 @@ import { aggregateCommandUnitEconomics } from "../command/unit-economics";
 import { activityRatios } from "../command/activity-metrics";
 import { getCommandStripeMonthlyMovement } from "../command/stripe-monthly-rollup.service";
 import {
-  calculateLifetimeValueRange,
-  cumulativeMonthlyChurnPercent,
-} from "../command/lifetime-value";
-import {
   aggregateTrailingRevenueChurn,
   calculateGrowthEconomics,
 } from "../command/growth-economics";
@@ -437,19 +433,6 @@ export async function getCommandStripeOverview(
      * describe one window rather than two.
      */
     /**
-     * The last complete month, for the lifetime-value margin.
-     *
-     * Neither the current month nor a trailing blend. The current month is a
-     * partial one — on the second it held two days and $714 of collections. A
-     * trailing blend is worse in a different way: July's delivery cost was
-     * fourteen times August's, because the model migration cut cost per event
-     * an order of magnitude, so blending reports a margin of 88% for a business
-     * now running at 99%. Lifetime value is forward-looking, so it takes the
-     * most recent complete month and says which one it used.
-     */
-    const marginMonth = commandMonthsEndingAt(period.month, 2)[1]!;
-    const marginWindow = commandMonthRange(marginMonth);
-    /**
      * A ceiling high enough that the roster arrives in one page.
      *
      * This endpoint computes the entire Command payload — nineteen parallel
@@ -533,9 +516,6 @@ export async function getCommandStripeOverview(
       allTimeOneOffPaidGroups,
       allTimeGhlTransactions,
       monthlyCostGroups,
-      marginMonthDeliveryCostGroups,
-      churnedMrrGroups,
-      firstPaidInvoice,
       socialTierPriceRows,
       seoTierPriceRows,
       monthlyMovements,
@@ -667,35 +647,6 @@ export async function getCommandStripeOverview(
        * through the first week and vanish at each boundary when collections were
        * briefly nought. Same window as the churn it divides by.
        */
-      prisma.commandCostEntry.groupBy({
-        by: ["currency"],
-        where: {
-          deletedAt: null,
-          category: "delivery",
-          occurredAt: { gte: marginWindow.start, lt: marginWindow.end },
-        },
-        _sum: { amountMinor: true },
-      }),
-      /**
-       * MRR on every subscription that has ended, by currency.
-       *
-       * The numerator of the cumulative churn rate: what share of the recurring
-       * revenue ever won has since been lost. Needs no month attribution and no
-       * event log, which is exactly why it is trustworthy where the monthly
-       * measure is not.
-       */
-      prisma.commandStripeSubscriptionSnapshot.groupBy({
-        by: ["currency"],
-        where: {
-          status: { in: ["canceled", "cancelled", "incomplete_expired", "unpaid"] },
-        },
-        _sum: { monthlyRecurringMinor: true },
-      }),
-      /** When recurring revenue started, so the loss can be spread over it. */
-      prisma.commandStripeInvoice.aggregate({
-        where: { status: "paid", paidAt: { not: null } },
-        _min: { paidAt: true },
-      }),
       /**
        * Which prices grant social, and which grant SEO alone.
        *
@@ -1447,11 +1398,7 @@ export async function getCommandStripeOverview(
      * snapshot block. Total collected across *everything* Stripe has settled,
      * one-off invoices included, is `paidToDateMinorByCurrency` further down.
      */
-    const [
-      upliftMonthlyPaidGroups,
-      upliftAllTimePaidGroups,
-      upliftMarginMonthPaidGroups,
-    ] =
+    const [upliftMonthlyPaidGroups, upliftAllTimePaidGroups] =
       upliftSubscriptionIds.length
         ? await Promise.all([
             prisma.commandStripeInvoice.groupBy({
@@ -1472,19 +1419,8 @@ export async function getCommandStripeOverview(
               },
               _sum: { amountPaidMinor: true },
             }),
-            // The margin month, scoped to Uplift plans like the two above it,
-            // so the margin, the MRR and the customer count describe one book.
-            prisma.commandStripeInvoice.groupBy({
-              by: ["currency"],
-              where: {
-                status: "paid",
-                paidAt: { gte: marginWindow.start, lt: marginWindow.end },
-                stripeSubscriptionId: { in: upliftSubscriptionIds },
-              },
-              _sum: { amountPaidMinor: true },
-            }),
           ])
-        : [[], [], []];
+        : [[], []];
     const upliftMrrByCurrency = new Map<string, Prisma.Decimal>();
     const upliftPlanBuckets = new Map<
       string,
@@ -1660,107 +1596,6 @@ export async function getCommandStripeOverview(
       ...upliftSubscriptionCountByCustomerId.values(),
     ].filter((subscriptionCount) => subscriptionCount > 1).length;
     /**
-     * Lifetime value, as a range, per currency.
-     *
-     * `growthEconomics` further down is discarded unless a commission run is
-     * locked, because CAC needs the rep payouts a locked run carries. LTV needs
-     * ARPU, gross margin and churn — none of which come from a commission run.
-     *
-     * Reported as a range because the two available churn measurements disagree
-     * by roughly a factor of six, and that disagreement is the honest content of
-     * this metric today. A single figure would be false precision on the one
-     * number a reader would use to decide what a customer is worth acquiring.
-     *
-     * Per customer, not per subscription: lifetime value means customer
-     * lifetime value, and someone holding two plans is one customer worth both.
-     */
-    const upliftPayingCustomersByCurrency = new Map<string, Set<string>>();
-    for (const subscription of upliftSubscriptions) {
-      if (!subscription.currency || !subscription.stripeCustomerId) continue;
-      if (!payingUpliftCustomerIds.has(subscription.stripeCustomerId)) continue;
-      const key = subscription.currency.toLowerCase();
-      const bucket = upliftPayingCustomersByCurrency.get(key) ?? new Set<string>();
-      bucket.add(subscription.stripeCustomerId);
-      upliftPayingCustomersByCurrency.set(key, bucket);
-    }
-    const marginCollectedByCurrency = new Map<string, Prisma.Decimal>();
-    for (const row of upliftMarginMonthPaidGroups) {
-      const key = (row.currency ?? "").toLowerCase();
-      if (!key) continue;
-      marginCollectedByCurrency.set(
-        key,
-        (marginCollectedByCurrency.get(key) ?? new Prisma.Decimal(0)).add(
-          row._sum.amountPaidMinor ?? 0,
-        ),
-      );
-    }
-    const marginDeliveryByCurrency = new Map<string, Prisma.Decimal>();
-    for (const row of marginMonthDeliveryCostGroups) {
-      const key = (row.currency ?? "").toLowerCase();
-      if (!key) continue;
-      marginDeliveryByCurrency.set(
-        key,
-        (marginDeliveryByCurrency.get(key) ?? new Prisma.Decimal(0)).add(
-          row._sum.amountMinor ?? 0,
-        ),
-      );
-    }
-    const churnedMrrByCurrency = new Map<string, Prisma.Decimal>();
-    for (const row of churnedMrrGroups) {
-      const key = (row.currency ?? "").toLowerCase();
-      if (!key) continue;
-      churnedMrrByCurrency.set(
-        key,
-        (churnedMrrByCurrency.get(key) ?? new Prisma.Decimal(0)).add(
-          row._sum.monthlyRecurringMinor ?? 0,
-        ),
-      );
-    }
-    /**
-     * Whole months since the first payment landed, floored at one.
-     *
-     * The denominator the cumulative loss is spread across. A part month counts
-     * as a month rather than a fraction, because a fraction would inflate the
-     * implied monthly rate on a business only weeks old.
-     */
-    const monthsObserved = firstPaidInvoice._min.paidAt
-      ? Math.max(
-          1,
-          Math.round(
-            (period.end.getTime() - firstPaidInvoice._min.paidAt.getTime()) /
-              (30.44 * 86_400_000),
-          ),
-        )
-      : 1;
-    const lifetimeValueByCurrency = Object.fromEntries(
-      [...upliftMrrByCurrency.entries()]
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([currency, mrr]) => [
-          currency,
-          calculateLifetimeValueRange({
-            mrrMinor: mrr,
-            payingUnits:
-              upliftPayingCustomersByCurrency.get(currency)?.size ?? 0,
-            collectedMinor:
-              marginCollectedByCurrency.get(currency) ?? new Prisma.Decimal(0),
-            deliveryCostMinor:
-              marginDeliveryByCurrency.get(currency) ?? new Prisma.Decimal(0),
-            monthlyChurnPercent:
-              trailingRevenueChurn.revenueChurnPercentByCurrency[currency] ??
-              null,
-            cumulativeChurnPercent: cumulativeMonthlyChurnPercent({
-              churnedMinor:
-                churnedMrrByCurrency.get(currency) ?? new Prisma.Decimal(0),
-              liveMinor: mrr,
-              monthsObserved,
-            }),
-            monthsObserved,
-            marginMonth,
-          }),
-        ]),
-    );
-
-    /**
      * How many paying customers get social, and how many only get SEO.
      *
      * Counted per customer rather than per subscription, because the question
@@ -1906,11 +1741,6 @@ export async function getCommandStripeOverview(
            * Lifetime value beside the MRR and ARPU it is built from, so the
            * three reconcile on the card instead of coming from three bases.
            */
-          lifetimeValue: {
-            byCurrency: lifetimeValueByCurrency,
-            marginMonth,
-            monthsObserved,
-          },
           /** Paying customers split by what their plan entitles them to. */
           planAccess: {
             ...planAccess,

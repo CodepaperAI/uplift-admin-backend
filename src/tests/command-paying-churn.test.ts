@@ -192,7 +192,44 @@ describe("summariseChurn", () => {
     expect(summary.oldestCohortAgeMonths).toBe(2);
   });
 
-  test("compounds the oldest cohort's survival into a monthly rate", () => {
+  test("weights the monthly rate by cohort size, not by age", () => {
+    // The bug this exists for: taking the oldest cohort alone let three
+    // customers set the rate that lifetime value divides by.
+    const summary = summariseChurn({
+      histories: Array.from({ length: 103 }, () => ({ state: "paying" as const })) as never,
+      cohorts: [
+        { month: "2026-03", ageMonths: 6, customers: 3, paying: 2, atRisk: 0, churned: 1, retentionPercent: "66.67" },
+        { month: "2026-08", ageMonths: 1, customers: 100, paying: 94, atRisk: 0, churned: 6, retentionPercent: "94.00" },
+      ],
+    });
+    // The hundred-customer cohort at 6% must dominate the three-customer one.
+    expect(Number(summary.impliedMonthlyChurnPercent)).toBeCloseTo(6.1, 0);
+    expect(Number(summary.impliedLifetimeMonths)).toBeGreaterThan(10);
+  });
+
+  test("ignores age-nought cohorts, which have had no month in which to churn", () => {
+    const summary = summariseChurn({
+      histories: Array.from({ length: 60 }, () => ({ state: "paying" as const })) as never,
+      cohorts: [
+        { month: "2026-09", ageMonths: 0, customers: 50, paying: 50, atRisk: 0, churned: 0, retentionPercent: "100.00" },
+        { month: "2026-08", ageMonths: 1, customers: 10, paying: 8, atRisk: 0, churned: 2, retentionPercent: "80.00" },
+      ],
+    });
+    // Including the newest group would report 20% churn as roughly 3%.
+    expect(Number(summary.impliedMonthlyChurnPercent)).toBeCloseTo(20, 0);
+  });
+
+  test("treats a cohort with nobody left as total loss over its age", () => {
+    const summary = summariseChurn({
+      histories: Array.from({ length: 5 }, () => ({ state: "churned" as const })) as never,
+      cohorts: [
+        { month: "2026-06", ageMonths: 3, customers: 5, paying: 0, atRisk: 0, churned: 5, retentionPercent: "0.00" },
+      ],
+    });
+    expect(summary.impliedMonthlyChurnPercent).toBe("100.0000");
+  });
+
+  test("compounds a single cohort's survival into a monthly rate", () => {
     const cohorts = [
       { month: "2026-03", ageMonths: 6, customers: 100, paying: 50, atRisk: 0, churned: 50, retentionPercent: "50.00" },
     ];
