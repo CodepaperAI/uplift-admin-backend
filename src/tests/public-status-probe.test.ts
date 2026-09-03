@@ -161,4 +161,35 @@ describe("public status probes", () => {
       else process.env.INNGEST_SIGNING_KEY = previousSigningKey;
     }
   });
+
+  it("does not cache a failed automation probe across monitoring retries", async () => {
+    const previousBaseUrl = process.env.INNGEST_BASE_URL;
+    const previousSigningKey = process.env.INNGEST_SIGNING_KEY;
+    process.env.INNGEST_BASE_URL = "https://inngest-retry.example.com";
+    process.env.INNGEST_SIGNING_KEY = `signkey-prod-${"b".repeat(64)}`;
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls += 1;
+      return new Response(null, { status: calls === 1 ? 503 : 405 });
+    }) as typeof fetch;
+
+    try {
+      const dependencies = {
+        prisma: prismaMock(),
+        fetchImpl,
+        zernioClient: { listAccounts: async () => [] },
+      };
+      const first = await runPublicStatusProbe("scheduled-automations", dependencies);
+      const retry = await runPublicStatusProbe("scheduled-automations", dependencies);
+
+      expect(first.ok).toBe(false);
+      expect(retry.ok).toBe(true);
+      expect(calls).toBe(2);
+    } finally {
+      if (previousBaseUrl === undefined) delete process.env.INNGEST_BASE_URL;
+      else process.env.INNGEST_BASE_URL = previousBaseUrl;
+      if (previousSigningKey === undefined) delete process.env.INNGEST_SIGNING_KEY;
+      else process.env.INNGEST_SIGNING_KEY = previousSigningKey;
+    }
+  });
 });

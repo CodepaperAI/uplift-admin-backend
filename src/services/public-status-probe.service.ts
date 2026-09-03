@@ -278,6 +278,12 @@ export async function runPublicStatusProbe(
     console.error(`[Public status probe] ${component} failed`, error);
   }
   const result = { component, ok, checkedAt };
-  if (!overrides.now) cache.set(component, { expiresAt: Date.now() + CACHE_MS, result });
+  if (!overrides.now) {
+    // Let Uptime Kuma retries perform a fresh upstream check. Caching a single
+    // failed probe makes every retry replay the same transient failure and can
+    // incorrectly promote a brief provider blip into a confirmed outage.
+    if (result.ok) cache.set(component, { expiresAt: Date.now() + CACHE_MS, result });
+    else cache.delete(component);
+  }
   return result;
 }
