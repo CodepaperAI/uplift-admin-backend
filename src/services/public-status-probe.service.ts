@@ -116,7 +116,11 @@ async function checkBlogPublishing(deps: Dependencies, now: Date): Promise<boole
       },
     }),
   ]);
-  return stuck < 2 && !ratioIsSystemic(failed, published + failed);
+  // Customer-owned publishing destinations can reject a post even while the
+  // platform is healthy. A successful delivery in the same window proves the
+  // publishing path is available, so only call a platform outage when there
+  // are repeated failures, no successes, or work is genuinely stuck.
+  return stuck < 2 && (published > 0 || !ratioIsSystemic(failed, published + failed));
 }
 
 async function checkSocialPublishing(deps: Dependencies, now: Date): Promise<boolean> {
@@ -214,13 +218,14 @@ function buildInngestSigningKeyHash(signingKey: string): string {
 async function checkScheduledAutomations(deps: Dependencies): Promise<boolean> {
   const signingKey = process.env.INNGEST_SIGNING_KEY?.trim() ?? "";
   if (!signingKey) return false;
-  const baseUrl = (process.env.INNGEST_API_BASE_URL ?? "https://api.inngest.com").replace(
-    /\/+$/,
-    "",
-  );
+  const baseUrl = (
+    process.env.INNGEST_BASE_URL ??
+    process.env.INNGEST_API_BASE_URL ??
+    "https://api.inngest.com"
+  ).replace(/\/+$/, "");
   const response = await fetchWithTimeout(
     deps.fetchImpl,
-    `${baseUrl}/v1/events?limit=80`,
+    `${baseUrl}/fn/register`,
     {
       method: "GET",
       headers: {
@@ -229,12 +234,10 @@ async function checkScheduledAutomations(deps: Dependencies): Promise<boolean> {
       },
     },
   );
-  if (!response.ok) return false;
-  const payload = (await response.json()) as { data?: Array<{ name?: string }> };
-  const events = Array.isArray(payload.data) ? payload.data : [];
-  const completed = events.filter((event) => event.name === "inngest/function.finished").length;
-  const failed = events.filter((event) => event.name === "inngest/function.failed").length;
-  return !ratioIsSystemic(failed, completed + failed);
+  // The self-hosted server exposes registration as POST-only. A signed GET
+  // reaching it therefore returns 405; a dead proxy/upstream returns 5xx.
+  // This is a read-only end-to-end liveness check and never enqueues work.
+  return response.ok || response.status === 405;
 }
 
 async function execute(component: PublicStatusComponent, deps: Dependencies): Promise<boolean> {
