@@ -17,6 +17,7 @@
     "js-yaml": "5.2.3",
     "jws": "4.0.1",
     "langsmith": "0.8.10",
+    "mysql2": "3.22.0",
     "path-to-regexp": "8.4.2",
     "protobufjs": "8.7.2",
     "qs": "6.15.3",
@@ -68,7 +69,7 @@
     "dev": "bun --watch index.ts",
     "start": "bun index.ts",
     "prisma:generate": "prisma generate",
-    "test:surface": "bun test tests/*.test.ts src/tests/command-*.test.ts src/tests/single-flight-memo.test.ts src/tests/tenant-response-cache-security.test.ts src/tests/superadmin-daily-metrics.test.ts src/tests/cache-json-response.test.ts src/tests/provider-cache.test.ts src/tests/like-pattern.test.ts"
+    "test:surface": "bun test tests/*.test.ts src/tests/command-*.test.ts src/tests/single-flight-memo.test.ts src/tests/tenant-response-cache-security.test.ts src/tests/superadmin-daily-metrics.test.ts src/tests/cache-json-response.test.ts src/tests/provider-cache.test.ts src/tests/like-pattern.test.ts src/tests/public-status-probe.test.ts"
   },
   "dependencies": {
     "@prisma/adapter-pg": "7.9.1",

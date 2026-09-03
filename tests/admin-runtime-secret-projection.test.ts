@@ -11,6 +11,10 @@ describe("production admin runtime secret projection", () => {
       "STRIPE_SECRET_KEY",
       "REWARDFUL_API_SECRET",
       "INNGEST_EVENT_KEY",
+      "INNGEST_SIGNING_KEY",
+      "OPENAI_API_KEY",
+      "ZERNIO_API_KEY",
+      "STATUS_PROBE_TOKEN",
       "GHL_COMMAND_READ_TOKEN",
       "GHL_COMMAND_LOCATION_ID",
       "GHL_COMMAND_CONTACTS_VERSION",
@@ -26,11 +30,10 @@ describe("production admin runtime secret projection", () => {
     }
   });
 
-  test("does not project core-owned webhook and worker signing credentials", () => {
+  test("does not project core-owned webhook or Inngest UI credentials", () => {
     for (const key of [
       "STRIPE_WEBHOOK_SECRET",
       "REWARDFUL_WEBHOOK_SECRET",
-      "INNGEST_SIGNING_KEY",
       "INNGEST_UI_BASIC_AUTH_HASH",
     ]) {
       expect(projectionScript).not.toContain(`"${key}"`);

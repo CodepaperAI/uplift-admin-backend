@@ -42,7 +42,11 @@ target_json="$(jq -c '
     "WEBSITE_YEARLY_PRICE_ID",
     "REWARDFUL_API_SECRET",
     "INNGEST_EVENT_KEY",
+    "INNGEST_SIGNING_KEY",
     "INNGEST_BASE_URL",
+    "OPENAI_API_KEY",
+    "ZERNIO_API_KEY",
+    "STATUS_PROBE_TOKEN",
     "GHL_COMMAND_READ_TOKEN",
     "GHL_COMMAND_LOCATION_ID",
     "GHL_COMMAND_CONTACTS_VERSION",
@@ -65,6 +69,8 @@ target_json="$(jq -c '
     PORT: "3000",
     BACKEND_URL: "https://admin-api.upliftai.co",
     CORE_BACKEND_URL: "https://api.upliftai.co",
+    STATUS_DASHBOARD_URL: "https://dashboard.upliftai.co",
+    STATUS_CORE_API_URL: "https://api.upliftai.co",
     ADMIN_FRONTEND_URL: "https://admin.upliftai.co",
     COMMAND_FRONTEND_URL: "https://admin.upliftai.co",
     CORS_ALLOWED_ORIGINS: "https://admin.upliftai.co",
@@ -111,7 +117,7 @@ target_json="$(jq -c \
     INNGEST_BASE_URL: $inngestBaseUrl
   }' <<<"${target_json}")"
 
-for required_key in DATABASE_URL REDIS_URL BETTER_AUTH_SECRET STRIPE_SECRET_KEY INNGEST_EVENT_KEY; do
+for required_key in DATABASE_URL REDIS_URL BETTER_AUTH_SECRET STRIPE_SECRET_KEY INNGEST_EVENT_KEY INNGEST_SIGNING_KEY OPENAI_API_KEY ZERNIO_API_KEY STATUS_PROBE_TOKEN; do
   jq -e --arg key "${required_key}" '.[$key] | type == "string" and length > 0' \
     <<<"${target_json}" >/dev/null
 done

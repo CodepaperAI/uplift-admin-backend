@@ -14,6 +14,7 @@ import { adminAuth, ADMIN_AUTH_PATH } from "./src/auth/admin-auth";
 import { prisma } from "./src/config/db.config";
 import { getAdminAuthContext } from "./src/controllers/admin-auth.controller";
 import CommandRouter from "./src/routes/command.routes";
+import PublicStatusProbeRouter from "./src/routes/public-status-probe.routes";
 import SuperAdminRouter from "./src/routes/superadmin.routes";
 import { configuredCorsOrigins } from "./src/admin-api-config";
 import { checkTenantCacheReadiness } from "./src/utils/tenant-response-cache";
@@ -146,6 +147,7 @@ export function createApp(): Application {
   });
 
   app.use("/api/v1/command", CommandRouter);
+  app.use("/api/v1/status/components", PublicStatusProbeRouter);
   app.use("/api/v1/superadmin/agencies", SuperAdminRouter);
 
   app.use((_req, res) => {
